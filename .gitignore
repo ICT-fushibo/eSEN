@@ -3,6 +3,7 @@ wandb
 checkpoints
 results
 logs
+example/md_out/
 *.traj
 experimental
 
