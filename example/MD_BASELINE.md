@@ -57,7 +57,7 @@ python ../MatRIS-09bk/example/generate_structures.py
 ```bash
 CUDA_VISIBLE_DEVICES=1 python -u example/benchmark_md.py \
     --structure ../MatRIS-09bk/example/cif_file/Cu192.cif \
-    --checkpoint checkpoints/esen_30m_oam.pt \
+    --checkpoint esen_30m_oam.pt \
     --system Cu192 \
     --temperature 800 \
     --steps 10 \
@@ -67,7 +67,7 @@ CUDA_VISIBLE_DEVICES=1 python -u example/benchmark_md.py \
 ## Six-system benchmark
 
 ```bash
-CHECKPOINT="$PWD/checkpoints/esen_30m_oam.pt" \
+CHECKPOINT="$PWD/esen_30m_oam.pt" \
 STRUCTURE_DIR="$PWD/../MatRIS-09bk/example/cif_file" \
 GPU=1 STEPS=1000 WARMUP_STEPS=3 REPEATS=3 \
 bash example/run_md_baselines.sh

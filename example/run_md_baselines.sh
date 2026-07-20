@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Required:
-#   CHECKPOINT=/path/to/esen_30m_oam.pt
 # Optional:
-#   STRUCTURE_DIR=/path/to/cif_file GPU=1 STEPS=1000 WARMUP_STEPS=3 REPEATS=3
+#   CHECKPOINT=/path/to/esen_30m_oam.pt STRUCTURE_DIR=/path/to/cif_file
+#   GPU=1 STEPS=1000 WARMUP_STEPS=3 REPEATS=3
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-CHECKPOINT=${CHECKPOINT:-}
+CHECKPOINT=${CHECKPOINT:-"$REPO_ROOT/esen_30m_oam.pt"}
 STRUCTURE_DIR=${STRUCTURE_DIR:-"$REPO_ROOT/../MatRIS-09bk/example/cif_file"}
 OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/example/md_out"}
 GPU=${GPU:-1}
@@ -15,10 +14,6 @@ STEPS=${STEPS:-1000}
 WARMUP_STEPS=${WARMUP_STEPS:-3}
 REPEATS=${REPEATS:-3}
 
-if [[ -z "$CHECKPOINT" ]]; then
-    echo "Set CHECKPOINT to esen_30m_oam.pt" >&2
-    exit 2
-fi
 if [[ ! -f "$CHECKPOINT" ]]; then
     echo "Checkpoint not found: $CHECKPOINT" >&2
     exit 2

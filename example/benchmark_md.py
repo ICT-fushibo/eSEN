@@ -35,7 +35,11 @@ EXPECTED_ATOMS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--structure", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=REPO / "esen_30m_oam.pt",
+    )
     parser.add_argument("--system", required=True, choices=EXPECTED_ATOMS)
     parser.add_argument("--output-dir", type=Path, default=REPO / "example/md_out")
     parser.add_argument("--run-name", default=None)

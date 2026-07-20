@@ -5,7 +5,7 @@ set -euo pipefail
 # owning HF_TOKEN must first accept the facebook/OMAT24 terms in a browser.
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/checkpoints"}
+OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT"}
 
 if [[ -z "${HF_TOKEN:-}" ]]; then
     echo "HF_TOKEN is not set." >&2
