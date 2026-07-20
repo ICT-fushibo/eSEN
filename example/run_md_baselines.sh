@@ -3,13 +3,14 @@ set -euo pipefail
 
 # Optional:
 #   CHECKPOINT=/path/to/esen_30m_oam.pt STRUCTURE_DIR=/path/to/cif_file
-#   GPU=1 STEPS=1000 WARMUP_STEPS=3 REPEATS=3
+#   GPU=6 STEPS=1000 WARMUP_STEPS=3 REPEATS=3
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CHECKPOINT=${CHECKPOINT:-"$REPO_ROOT/esen_30m_oam.pt"}
 STRUCTURE_DIR=${STRUCTURE_DIR:-"$REPO_ROOT/../MatRIS-09bk/example/cif_file"}
-OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/example/md_out"}
-GPU=${GPU:-1}
+RUN_ID=${RUN_ID:-"esen_baseline_$(date '+%Y%m%d_%H%M%S')"}
+OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/example/md_out/$RUN_ID"}
+GPU=${GPU:-6}
 STEPS=${STEPS:-1000}
 WARMUP_STEPS=${WARMUP_STEPS:-3}
 REPEATS=${REPEATS:-3}
@@ -21,39 +22,86 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
-systems=(Cu192 Cu512 Cu1024 H2O192 H2O512 H2O1024)
+systems=(Cu32 Cu64 Cu192 Cu512 Cu1024 H2O32 H2O60 H2O192 H2O512 H2O1024)
+temperatures=(300 800)
 
 for system in "${systems[@]}"; do
     structure="$STRUCTURE_DIR/$system.cif"
     if [[ ! -f "$structure" ]]; then
         echo "Structure not found: $structure" >&2
-        echo "Generate the six CIF files before running this benchmark." >&2
+        echo "Generate all requested CIF files before running this benchmark." >&2
         exit 2
     fi
+done
 
-    if [[ "$system" == Cu* ]]; then
-        temperature=800
-    else
-        temperature=300
-    fi
+STATUS_TSV="$OUTPUT_DIR/run_status.tsv"
+printf 'system\ttemperature_K\trepeat\trun_name\tstatus\texit_code\tprocess_wall_time_s\n' > "$STATUS_TSV"
+failure_count=0
 
-    for repeat in $(seq 1 "$REPEATS"); do
-        run_name="${system}_${temperature}K_${STEPS}step_esen_baseline_r${repeat}"
-        echo "Running $run_name on physical GPU $GPU"
-        CUDA_VISIBLE_DEVICES="$GPU" PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
-            python -u "$REPO_ROOT/example/benchmark_md.py" \
-                --structure "$structure" \
-                --checkpoint "$CHECKPOINT" \
-                --system "$system" \
-                --output-dir "$OUTPUT_DIR" \
-                --run-name "$run_name" \
-                --steps "$STEPS" \
-                --warmup-steps "$WARMUP_STEPS" \
-                --temperature "$temperature" \
-                --timestep 1.0 \
-                --taut 100.0 \
-                --seed 42 \
-                --outputs energy forces \
-            2>&1 | tee "$OUTPUT_DIR/${run_name}.log"
+{
+    echo "run_id=$RUN_ID"
+    echo "started_at=$(date --iso-8601=seconds)"
+    echo "hostname=$(hostname)"
+    echo "repo_commit=$(git -C "$REPO_ROOT" rev-parse HEAD)"
+    echo "checkpoint=$CHECKPOINT"
+    echo "structure_dir=$STRUCTURE_DIR"
+    echo "physical_gpu=$GPU"
+    echo "steps=$STEPS"
+    echo "warmup_steps=$WARMUP_STEPS"
+    echo "repeats=$REPEATS"
+    python -c 'import torch; print(f"python_torch={torch.__version__}"); print(f"torch_cuda={torch.version.cuda}")'
+    nvidia-smi -i "$GPU" --query-gpu=index,name,uuid,driver_version --format=csv,noheader
+} > "$OUTPUT_DIR/run_metadata.txt"
+
+for system in "${systems[@]}"; do
+    structure="$STRUCTURE_DIR/$system.cif"
+    for temperature in "${temperatures[@]}"; do
+        for repeat in $(seq 1 "$REPEATS"); do
+            run_name="${system}_${temperature}K_${STEPS}step_esen_baseline_r${repeat}"
+            echo "Running $run_name on physical GPU $GPU"
+            start_ns=$(date +%s%N)
+            set +e
+            CUDA_VISIBLE_DEVICES="$GPU" PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+                python -u "$REPO_ROOT/example/benchmark_md.py" \
+                    --structure "$structure" \
+                    --checkpoint "$CHECKPOINT" \
+                    --system "$system" \
+                    --output-dir "$OUTPUT_DIR" \
+                    --run-name "$run_name" \
+                    --steps "$STEPS" \
+                    --warmup-steps "$WARMUP_STEPS" \
+                    --temperature "$temperature" \
+                    --timestep 1.0 \
+                    --taut 100.0 \
+                    --seed 42 \
+                    --outputs energy forces \
+                2>&1 | tee "$OUTPUT_DIR/${run_name}.log"
+            exit_code=${PIPESTATUS[0]}
+            set -e
+            end_ns=$(date +%s%N)
+            process_wall_time=$(awk -v start="$start_ns" -v end="$end_ns" \
+                'BEGIN { printf "%.6f", (end - start) / 1000000000 }')
+
+            if [[ $exit_code -eq 0 ]]; then
+                status=success
+            else
+                status=failed
+                ((failure_count += 1))
+                echo "FAILED: $run_name (exit code $exit_code); continuing" >&2
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$system" "$temperature" "$repeat" "$run_name" "$status" \
+                "$exit_code" "$process_wall_time" >> "$STATUS_TSV"
+        done
     done
 done
+
+python "$REPO_ROOT/example/summarize_md_baselines.py" --input-dir "$OUTPUT_DIR"
+echo "finished_at=$(date --iso-8601=seconds)" >> "$OUTPUT_DIR/run_metadata.txt"
+echo "failed_runs=$failure_count" >> "$OUTPUT_DIR/run_metadata.txt"
+echo "Results: $OUTPUT_DIR"
+
+if [[ $failure_count -ne 0 ]]; then
+    echo "$failure_count run(s) failed; see run_status.tsv and per-run logs." >&2
+    exit 1
+fi

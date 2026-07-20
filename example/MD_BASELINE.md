@@ -39,9 +39,13 @@ The expected structures and atom counts are:
 
 | system | atoms |
 | --- | ---: |
+| Cu32 | 32 |
+| Cu64 | 64 |
 | Cu192 | 192 |
 | Cu512 | 512 |
 | Cu1024 | 1024 |
+| H2O32 | 96 |
+| H2O60 | 180 |
 | H2O192 | 576 |
 | H2O512 | 1536 |
 | H2O1024 | 3072 |
@@ -49,7 +53,9 @@ The expected structures and atom counts are:
 Generate the CIF files with the existing MatRIS helper if needed:
 
 ```bash
-python ../MatRIS-09bk/example/generate_structures.py
+python ../MatRIS-09bk/example/generate_structures.py \
+    --systems Cu32 Cu64 Cu192 Cu512 Cu1024 \
+              H2O32 H2O60 H2O192 H2O512 H2O1024
 ```
 
 ## One smoke test
@@ -64,14 +70,15 @@ CUDA_VISIBLE_DEVICES=1 python -u example/benchmark_md.py \
     --warmup-steps 3
 ```
 
-## Six-system benchmark
+## Formal ten-system, two-temperature benchmark
 
 ```bash
 CHECKPOINT="$PWD/esen_30m_oam.pt" \
 STRUCTURE_DIR="$PWD/../MatRIS-09bk/example/cif_file" \
-GPU=1 STEPS=1000 WARMUP_STEPS=3 REPEATS=3 \
+GPU=6 STEPS=1000 WARMUP_STEPS=3 REPEATS=3 \
 bash example/run_md_baselines.sh
 ```
 
-Each repeat runs in a fresh Python process. JSON results and an append-only
-`summary.tsv` are written under `example/md_out` by default.
+Each system is tested at both 300 K and 800 K. Each repeat runs in a fresh
+Python process. JSON results, process status, logs, and median reports are
+written under a timestamped directory in `example/md_out` by default.

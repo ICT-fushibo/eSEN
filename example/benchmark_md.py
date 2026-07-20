@@ -13,6 +13,7 @@ import hashlib
 import importlib.metadata
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -23,9 +24,13 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parent.parent
 EXPECTED_ATOMS = {
+    "Cu32": 32,
+    "Cu64": 64,
     "Cu192": 192,
     "Cu512": 512,
     "Cu1024": 1024,
+    "H2O32": 96,
+    "H2O60": 180,
     "H2O192": 576,
     "H2O512": 1536,
     "H2O1024": 3072,
@@ -226,6 +231,7 @@ def main() -> None:
         "tf32": False,
         "torch_compile": False,
         "cuda_graph": False,
+        "md_wall_time_s": elapsed,
         "elapsed_s": elapsed,
         "seconds_per_step": elapsed / args.steps,
         "milliseconds_per_step": 1000.0 * elapsed / args.steps,
@@ -239,6 +245,7 @@ def main() -> None:
         "final_temperature_K": float(atoms.get_temperature()),
         "cell_volume_A3": float(atoms.get_volume()),
         "gpu": torch.cuda.get_device_name(0),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         "gpu_capability": ".".join(map(str, torch.cuda.get_device_capability(0))),
         "torch_version": torch.__version__,
         "torch_cuda_version": torch.version.cuda,
