@@ -40,6 +40,16 @@ def load_status(path: Path) -> list[dict[str, str]]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, required=True)
+    parser.add_argument(
+        "--backend",
+        default="esen_ocpcalculator_eager",
+        help="Only summarize JSON records produced by this backend",
+    )
+    parser.add_argument(
+        "--report-prefix",
+        default="baseline_report",
+        help="Output filename prefix for the TSV and Markdown reports",
+    )
     args = parser.parse_args()
 
     status_rows = load_status(args.input_dir / "run_status.tsv")
@@ -54,7 +64,7 @@ def main() -> None:
     groups: dict[tuple[str, float], list[dict[str, object]]] = defaultdict(list)
     for path in args.input_dir.glob("*.json"):
         record = json.loads(path.read_text(encoding="utf-8"))
-        if record.get("backend") != "esen_ocpcalculator_eager":
+        if record.get("backend") != args.backend:
             continue
         record["process_wall_time_s"] = process_times.get(path.stem)
         groups[(str(record["system"]), float(record["temperature_K"]))].append(record)
@@ -78,7 +88,13 @@ def main() -> None:
                 "atoms": records[0]["atoms"] if records else "",
                 "attempted_repeats": len(statuses) if statuses else len(records),
                 "successful_repeats": len(records),
-                "failed_repeats": sum(row["status"] != "success" for row in statuses),
+                "failed_repeats": sum(
+                    row["status"] != "success" for row in statuses
+                ),
+                "oom_repeats": sum(row["status"] == "oom" for row in statuses),
+                "error_repeats": sum(
+                    row["status"] not in {"success", "oom"} for row in statuses
+                ),
                 "seconds_per_step_median": (
                     f"{median(float(r['seconds_per_step']) for r in records):.9f}"
                     if records
@@ -108,7 +124,7 @@ def main() -> None:
     if not rows:
         raise SystemExit(f"No baseline attempts found in {args.input_dir}")
 
-    report_tsv = args.input_dir / "baseline_report.tsv"
+    report_tsv = args.input_dir / f"{args.report_prefix}.tsv"
     with report_tsv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]), delimiter="\t")
         writer.writeheader()
@@ -122,7 +138,7 @@ def main() -> None:
     markdown.extend(
         "| " + " | ".join(str(row[name]) for name in headers) + " |" for row in rows
     )
-    report_md = args.input_dir / "baseline_report.md"
+    report_md = args.input_dir / f"{args.report_prefix}.md"
     report_md.write_text("\n".join(markdown) + "\n", encoding="utf-8")
 
     print(report_md.read_text(encoding="utf-8"))

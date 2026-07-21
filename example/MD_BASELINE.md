@@ -12,6 +12,8 @@ Baseline contract:
 - TF32 disabled;
 - on-the-fly neighbor graph construction retained;
 - energy and force outputs only;
+- model parameters frozen while retaining position gradients;
+- stress regression and activation checkpointing disabled;
 - three untimed MD warm-up steps, followed by restoration of the initial state;
 - model loading, warm-up, validation, hashing, and result I/O excluded from timing;
 - no trajectory or per-step logfile in the timed region.
@@ -82,3 +84,5 @@ bash example/run_md_baselines.sh
 Each system is tested at both 300 K and 800 K. Each repeat runs in a fresh
 Python process. JSON results, process status, logs, and median reports are
 written under a timestamped directory in `example/md_out` by default.
+CUDA out-of-memory attempts are recorded as `oom` in `run_status.tsv`; the
+remaining systems still run before the script returns its final status.

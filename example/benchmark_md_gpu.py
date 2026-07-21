@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Benchmark eSEN ASE molecular dynamics without CUDA Graph or torch.compile.
+"""Benchmark eager GPU-resident eSEN molecular dynamics.
 
-The timed region contains only ASE NVT MD steps. Model loading, warm-up,
-checkpoint hashing, validation, and result I/O are deliberately excluded.
+No CUDA Graph, ``torch.compile``, AMP, TF32, or custom kernel fusion is used.
+The timed region includes the initial force evaluation and the requested NVT
+MD steps, but excludes model loading, warm-up, validation, hashing, and I/O.
 """
 
 from __future__ import annotations
@@ -41,9 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--structure", type=Path, required=True)
     parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=REPO / "esen_30m_oam.pt",
+        "--checkpoint", type=Path, default=REPO / "esen_30m_oam.pt"
     )
     parser.add_argument("--system", required=True, choices=EXPECTED_ATOMS)
     parser.add_argument("--output-dir", type=Path, default=REPO / "example/md_out")
@@ -53,16 +52,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestep", type=float, default=1.0, help="fs")
     parser.add_argument("--temperature", type=float, required=True, help="K")
     parser.add_argument("--taut", type=float, default=100.0, help="fs")
-    parser.add_argument("--seed", type=int, default=20260715)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--outputs",
-        nargs="+",
-        default=["energy", "forces"],
-        help=(
-            "Checkpoint outputs to retain. Use '--outputs all' for checkpoint "
-            "defaults."
-        ),
+        "--md-dtype",
+        choices=("float64", "float32"),
+        default="float64",
+        help="GPU dtype for positions, momenta, masses, and integration",
     )
+    parser.add_argument(
+        "--validate-official",
+        action="store_true",
+        help="Compare the initial direct-GPU result with OCPCalculator before timing",
+    )
+    parser.add_argument("--energy-atol", type=float, default=1e-4)
+    parser.add_argument("--force-atol", type=float, default=2e-4)
+    parser.add_argument("--rtol", type=float, default=1e-5)
     args = parser.parse_args()
     if args.steps < 1:
         parser.error("--steps must be positive")
@@ -111,18 +115,16 @@ def append_tsv(path: Path, record: dict[str, object]) -> None:
 
 def main() -> None:
     args = parse_args()
-
-    # Import the checkout when fairchem-core has not been installed editable.
     sys.path.insert(0, str(REPO / "src"))
 
     import torch
-    from ase import units
     from ase.io import read
-    from ase.md.nvtberendsen import NVTBerendsen
     from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
-    from fairchem.core import OCPCalculator
     from fairchem.core.applications.esen_gpu_md import (
-        configure_esen_energy_force_inference,
+        ESENEnergyForceEvaluator,
+        GPUIntegrator,
+        GPUMDState,
+        GPUResidentMD,
     )
 
     if not torch.cuda.is_available():
@@ -132,7 +134,6 @@ def main() -> None:
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
 
-    # Precision is part of the baseline contract.
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
 
@@ -157,62 +158,79 @@ def main() -> None:
     )
     Stationary(atoms)
 
-    initial_positions = atoms.get_positions().copy()
-    initial_momenta = atoms.get_momenta().copy()
-    initial_cell = atoms.get_cell().copy()
+    device = torch.device("cuda:0")
+    md_dtype = torch.float64 if args.md_dtype == "float64" else torch.float32
+    state = GPUMDState(
+        positions=torch.as_tensor(
+            atoms.get_positions(), dtype=md_dtype, device=device
+        ).clone(),
+        momenta=torch.as_tensor(
+            atoms.get_momenta(), dtype=md_dtype, device=device
+        ).clone(),
+    )
+    masses = torch.as_tensor(
+        atoms.get_masses(), dtype=md_dtype, device=device
+    )
 
-    only_output = None if args.outputs == ["all"] else args.outputs
-    calc = OCPCalculator(
-        checkpoint_path=args.checkpoint,
-        cpu=False,
+    evaluator = ESENEnergyForceEvaluator(
+        atoms,
+        args.checkpoint,
+        device=device,
         seed=args.seed,
-        only_output=only_output,
         disable_amp=True,
     )
-    loaded_model = calc.trainer._unwrapped_model
-    energy_force_only = only_output is not None and "stress" not in only_output
-    if energy_force_only:
-        configure_esen_energy_force_inference(loaded_model)
-    else:
-        loaded_model.eval()
-        for parameter in loaded_model.parameters():
-            parameter.requires_grad_(False)
-        if hasattr(loaded_model.backbone, "activation_checkpointing"):
-            loaded_model.backbone.activation_checkpointing = False
-    atoms.calc = calc
-
-    # Untimed warm-up initializes CUDA libraries and allocator state.
-    if args.warmup_steps:
-        warmup = NVTBerendsen(
-            atoms,
-            timestep=args.timestep * units.fs,
-            temperature_K=args.temperature,
-            taut=args.taut * units.fs,
-        )
-        warmup.run(args.warmup_steps)
-        torch.cuda.synchronize()
-
-    # Production always starts from the same state, independent of warm-up count.
-    atoms.set_cell(initial_cell, scale_atoms=False)
-    atoms.set_positions(initial_positions)
-    atoms.set_momenta(initial_momenta)
-    calc.reset()
-
-    # One untimed correctness call also catches bad structures/checkpoints early.
-    initial_forces = atoms.get_forces()
-    if not np.isfinite(initial_forces).all():
-        raise FloatingPointError("Initial force prediction contains NaN or Inf")
-    initial_energy = float(atoms.get_potential_energy())
-    if not math.isfinite(initial_energy):
-        raise FloatingPointError("Initial energy prediction contains NaN or Inf")
-
-    calc.reset()
-    dynamics = NVTBerendsen(
-        atoms,
-        timestep=args.timestep * units.fs,
+    integrator = GPUIntegrator(
+        masses,
+        timestep_fs=args.timestep,
         temperature_K=args.temperature,
-        taut=args.taut * units.fs,
+        taut_fs=args.taut,
+        fix_com=True,
+        degrees_of_freedom=atoms.get_number_of_degrees_of_freedom(),
     )
+    dynamics = GPUResidentMD(state, evaluator, integrator)
+    initial_state = state.clone()
+
+    # Warm up CUDA libraries, allocator state, the OTF graph builder, and model.
+    if args.warmup_steps:
+        dynamics.run(args.warmup_steps)
+        torch.cuda.synchronize()
+    state.restore_(initial_state)
+    dynamics.nsteps = 0
+
+    # Untimed direct-path correctness result.
+    initial_forces_device, initial_energy_device = dynamics.evaluate()
+    torch.cuda.synchronize()
+    initial_forces = initial_forces_device.detach().cpu().numpy()
+    initial_energy = float(initial_energy_device.item())
+    if not np.isfinite(initial_forces).all() or not math.isfinite(initial_energy):
+        raise FloatingPointError("Initial direct-GPU prediction contains NaN or Inf")
+
+    if args.validate_official:
+        evaluator.calculator.reset()
+        atoms.calc = evaluator.calculator
+        official_forces = atoms.get_forces()
+        official_energy = float(atoms.get_potential_energy())
+        np.testing.assert_allclose(
+            initial_forces,
+            official_forces,
+            rtol=args.rtol,
+            atol=args.force_atol,
+            err_msg="Direct-GPU and OCPCalculator forces differ",
+        )
+        np.testing.assert_allclose(
+            initial_energy,
+            official_energy,
+            rtol=args.rtol,
+            atol=args.energy_atol,
+            err_msg="Direct-GPU and OCPCalculator energies differ",
+        )
+
+    # Restore once more.  Setting forces=None intentionally matches the
+    # existing ASE benchmark, whose timed dynamics performs its initial force
+    # evaluation after calc.reset().
+    state.restore_(initial_state)
+    dynamics.nsteps = 0
+    del initial_state
 
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
@@ -221,18 +239,27 @@ def main() -> None:
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
 
-    final_forces = atoms.get_forces()
-    final_energy = float(atoms.get_potential_energy())
-    if not np.isfinite(final_forces).all() or not math.isfinite(final_energy):
-        raise FloatingPointError("Final MD prediction contains NaN or Inf")
+    if state.forces is None or state.potential_energy is None:
+        raise RuntimeError("GPU MD completed without forces or potential energy")
+    finite = (
+        torch.isfinite(state.positions).all()
+        & torch.isfinite(state.momenta).all()
+        & torch.isfinite(state.forces).all()
+        & torch.isfinite(state.potential_energy).all()
+    )
+    if not bool(finite.item()):
+        raise FloatingPointError("Final GPU MD state contains NaN or Inf")
 
+    final_energy = float(state.potential_energy.item())
+    final_max_force = float(state.forces.abs().max().item())
+    final_temperature = float(integrator.temperature(state.momenta).item())
     run_name = args.run_name or (
-        f"{args.system}_{args.temperature:g}K_{args.steps}step_esen_baseline"
+        f"{args.system}_{args.temperature:g}K_{args.steps}step_esen_gpu_eager"
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     record: dict[str, object] = {
-        "backend": "esen_ocpcalculator_eager",
+        "backend": "esen_gpu_resident_eager",
         "system": args.system,
         "atoms": len(atoms),
         "formula": atoms.get_chemical_formula(),
@@ -243,14 +270,19 @@ def main() -> None:
         "timestep_fs": args.timestep,
         "taut_fs": args.taut,
         "seed": args.seed,
-        "outputs": "all" if only_output is None else ",".join(only_output),
+        "outputs": "energy,forces",
         "parameters_frozen": True,
-        "stress_computed": not energy_force_only,
-        "activation_checkpointing": False,
         "amp": False,
         "tf32": False,
         "torch_compile": False,
         "cuda_graph": False,
+        "kernel_fusion": False,
+        "stress_computed": False,
+        "activation_checkpointing": False,
+        "gpu_resident_md": True,
+        "neighbor_builder": "fairchem_radius_graph_pbc",
+        "md_state_dtype": str(state.positions.dtype).removeprefix("torch."),
+        "model_dtype": str(evaluator.model_dtype).removeprefix("torch."),
         "md_wall_time_s": elapsed,
         "elapsed_s": elapsed,
         "seconds_per_step": elapsed / args.steps,
@@ -261,8 +293,8 @@ def main() -> None:
         "initial_energy_eV": initial_energy,
         "final_energy_eV": final_energy,
         "initial_max_force_eV_per_A": float(np.abs(initial_forces).max()),
-        "final_max_force_eV_per_A": float(np.abs(final_forces).max()),
-        "final_temperature_K": float(atoms.get_temperature()),
+        "final_max_force_eV_per_A": final_max_force,
+        "final_temperature_K": final_temperature,
         "cell_volume_A3": float(atoms.get_volume()),
         "gpu": torch.cuda.get_device_name(0),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
@@ -275,12 +307,12 @@ def main() -> None:
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_sha256": sha256(args.checkpoint),
         "structure": str(args.structure.resolve()),
+        "official_validation": args.validate_official,
     }
 
     json_path = args.output_dir / f"{run_name}.json"
     json_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     append_tsv(args.output_dir / "summary.tsv", record)
-
     print(json.dumps(record, indent=2))
     print(f"Result: {json_path}")
     print(f"Summary: {args.output_dir / 'summary.tsv'}")
@@ -289,7 +321,7 @@ def main() -> None:
 def entrypoint() -> int:
     try:
         main()
-    except BaseException as exc:
+    except BaseException as exc:  # Classify CUDA OOM for the batch driver.
         message = str(exc).lower()
         if exc.__class__.__name__ == "OutOfMemoryError" or "out of memory" in message:
             print(f"BENCHMARK_STATUS=oom: {exc}", file=sys.stderr)
