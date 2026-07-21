@@ -7,10 +7,47 @@ from ase.calculators.calculator import Calculator, all_changes
 from ase.md.nvtberendsen import NVTBerendsen
 
 from fairchem.core.applications.esen_gpu_md import (
+    ESENEnergyForceEvaluator,
     GPUIntegrator,
     GPUMDState,
     GPUResidentMD,
 )
+
+
+def test_direct_evaluator_reshapes_system_energy_before_denormalization():
+    class FakeModel:
+        def __call__(self, batch):
+            return {
+                "energy": torch.tensor([2.0]),
+                "forces": torch.arange(6.0).reshape(2, 3),
+            }
+
+    class FakeTrainer:
+        def __init__(self):
+            self.seen_shapes = {}
+
+        def _denorm_preds(self, key, prediction, batch):
+            self.seen_shapes[key] = tuple(prediction.shape)
+            return prediction
+
+    evaluator = object.__new__(ESENEnergyForceEvaluator)
+    evaluator.device = torch.device("cpu")
+    evaluator.model = FakeModel()
+    evaluator.trainer = FakeTrainer()
+    evaluator.batch = type("FakeBatch", (), {})()
+    evaluator.model_positions = torch.zeros(2, 3, requires_grad=True)
+    evaluator.batch.pos = evaluator.model_positions
+    evaluator.num_atoms = 2
+    evaluator.num_graphs = 1
+
+    forces, energy = evaluator(torch.ones(2, 3))
+
+    assert evaluator.trainer.seen_shapes == {
+        "energy": (1, 1),
+        "forces": (2, 3),
+    }
+    assert forces.shape == (2, 3)
+    assert energy.shape == ()
 
 
 class ConstantForceCalculator(Calculator):

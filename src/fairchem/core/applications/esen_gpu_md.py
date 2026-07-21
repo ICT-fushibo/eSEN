@@ -95,6 +95,7 @@ class ESENEnergyForceEvaluator:
         self.batch.pos = self.model_positions
         self.model_dtype = self.model_positions.dtype
         self.num_atoms = int(len(atoms))
+        self.num_graphs = int(self.batch.natoms.numel())
 
     def __call__(self, positions: Tensor) -> tuple[Tensor, Tensor]:
         """Return denormalized ``(forces, energy)`` without leaving the device."""
@@ -120,6 +121,11 @@ class ESENEnergyForceEvaluator:
             raw_outputs = self.model(self.batch)
             raw_energy = _resolve_model_output(raw_outputs, "energy")
             raw_forces = _resolve_model_output(raw_outputs, "forces")
+            # Match OCPTrainer._forward before applying normalizers and element
+            # references.  In particular, ElementReferences expects a system
+            # target shaped [num_graphs, features], not a flat [num_graphs].
+            raw_energy = raw_energy.reshape(self.num_graphs, -1)
+            raw_forces = raw_forces.reshape(self.num_atoms, -1)
             energy = self.trainer._denorm_preds("energy", raw_energy, self.batch)
             forces = self.trainer._denorm_preds("forces", raw_forces, self.batch)
 
