@@ -15,6 +15,9 @@ Baseline contract:
 - model parameters frozen while retaining position gradients;
 - stress regression and activation checkpointing disabled;
 - three untimed MD warm-up steps, followed by restoration of the initial state;
+- Python, NumPy, Torch, CUDA, and MD initialization seeds fixed to 42;
+- total structure energies recorded after MD steps 1, 50, 100, and 1000;
+- checkpoint and CIF SHA256 values recorded for reference matching;
 - model loading, warm-up, validation, hashing, and result I/O excluded from timing;
 - no trajectory or per-step logfile in the timed region.
 
@@ -63,6 +66,7 @@ python ../MatRIS-09bk/example/generate_structures.py \
 ## One smoke test
 
 ```bash
+PYTHONHASHSEED=42 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
 CUDA_VISIBLE_DEVICES=1 python -u example/benchmark_md.py \
     --structure ../MatRIS-09bk/example/cif_file/Cu192.cif \
     --checkpoint esen_30m_oam.pt \
@@ -86,3 +90,5 @@ Python process. JSON results, process status, logs, and median reports are
 written under a timestamped directory in `example/md_out` by default.
 CUDA out-of-memory attempts are recorded as `oom` in `run_status.tsv`; the
 remaining systems still run before the script returns its final status.
+Each successful JSON file is the energy reference for the matching system,
+temperature, and repeat number in subsequent optimized runs.

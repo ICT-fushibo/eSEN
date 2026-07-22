@@ -22,6 +22,16 @@ import time
 
 import numpy as np
 
+from md_energy_reference import (
+    REQUIRED_SEED,
+    checkpoint_energy_fields,
+    compare_checkpoint_energies,
+    load_baseline_reference,
+    reached_energy_checkpoints,
+    seed_everything,
+    validate_reference_metadata,
+)
+
 
 REPO = Path(__file__).resolve().parent.parent
 EXPECTED_ATOMS = {
@@ -52,7 +62,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestep", type=float, default=1.0, help="fs")
     parser.add_argument("--temperature", type=float, required=True, help="K")
     parser.add_argument("--taut", type=float, default=100.0, help="fs")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=REQUIRED_SEED)
+    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument(
+        "--baseline-result",
+        type=Path,
+        default=None,
+        help="Matching baseline JSON used for energy-error validation",
+    )
     parser.add_argument(
         "--md-dtype",
         choices=("float64", "float32"),
@@ -74,6 +91,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--warmup-steps must be non-negative")
     if args.timestep <= 0 or args.temperature <= 0 or args.taut <= 0:
         parser.error("--timestep, --temperature, and --taut must be positive")
+    if args.seed != REQUIRED_SEED:
+        parser.error(f"--seed must be {REQUIRED_SEED}")
+    if args.repeat < 1:
+        parser.error("--repeat must be positive")
     return args
 
 
@@ -113,8 +134,13 @@ def append_tsv(path: Path, record: dict[str, object]) -> None:
         writer.writerow(record)
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
+    if os.environ.get("PYTHONHASHSEED") != str(REQUIRED_SEED):
+        raise RuntimeError(
+            f"Launch the benchmark with PYTHONHASHSEED={REQUIRED_SEED}"
+        )
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     sys.path.insert(0, str(REPO / "src"))
 
     import torch
@@ -134,6 +160,8 @@ def main() -> None:
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
 
+    seed_everything(torch, args.seed)
+
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
 
@@ -148,6 +176,26 @@ def main() -> None:
         raise ValueError(f"Periodic boundary conditions are required: pbc={atoms.pbc}")
     if not math.isfinite(atoms.get_volume()) or atoms.get_volume() <= 0:
         raise ValueError(f"Invalid cell volume: {atoms.get_volume()}")
+
+    checkpoint_hash = sha256(args.checkpoint)
+    structure_hash = sha256(args.structure)
+    baseline_reference = None
+    if args.baseline_result is not None:
+        baseline_reference = load_baseline_reference(args.baseline_result)
+        validate_reference_metadata(
+            baseline_reference,
+            {
+                "system": args.system,
+                "atoms": len(atoms),
+                "temperature_K": args.temperature,
+                "timestep_fs": args.timestep,
+                "taut_fs": args.taut,
+                "seed": args.seed,
+                "repeat": args.repeat,
+                "checkpoint_sha256": checkpoint_hash,
+                "structure_sha256": structure_hash,
+            },
+        )
 
     rng = np.random.RandomState(args.seed)
     MaxwellBoltzmannDistribution(
@@ -232,12 +280,28 @@ def main() -> None:
     dynamics.nsteps = 0
     del initial_state
 
+    checkpoint_energy_tensors: dict[int, torch.Tensor] = {}
+    completed_steps = 0
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
     start = time.perf_counter()
-    dynamics.run(args.steps)
+    for checkpoint_step in reached_energy_checkpoints(args.steps):
+        dynamics.run(checkpoint_step - completed_steps)
+        if state.potential_energy is None:
+            raise RuntimeError(f"No potential energy at MD step {checkpoint_step}")
+        # Keep the value on the GPU so checkpoint reporting does not introduce
+        # a device synchronization into the timed MD loop.
+        checkpoint_energy_tensors[checkpoint_step] = (
+            state.potential_energy.detach().clone()
+        )
+        completed_steps = checkpoint_step
+    if completed_steps < args.steps:
+        dynamics.run(args.steps - completed_steps)
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
+    checkpoint_energies = {
+        step: float(value.item()) for step, value in checkpoint_energy_tensors.items()
+    }
 
     if state.forces is None or state.potential_energy is None:
         raise RuntimeError("GPU MD completed without forces or potential energy")
@@ -260,6 +324,7 @@ def main() -> None:
 
     record: dict[str, object] = {
         "backend": "esen_gpu_resident_eager",
+        "run_name": run_name,
         "system": args.system,
         "atoms": len(atoms),
         "formula": atoms.get_chemical_formula(),
@@ -270,6 +335,7 @@ def main() -> None:
         "timestep_fs": args.timestep,
         "taut_fs": args.taut,
         "seed": args.seed,
+        "repeat": args.repeat,
         "outputs": "energy,forces",
         "parameters_frozen": True,
         "amp": False,
@@ -283,6 +349,10 @@ def main() -> None:
         "neighbor_builder": "fairchem_radius_graph_pbc",
         "md_state_dtype": str(state.positions.dtype).removeprefix("torch."),
         "model_dtype": str(evaluator.model_dtype).removeprefix("torch."),
+        "pythonhashseed": os.environ.get("PYTHONHASHSEED", ""),
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG", ""),
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
         "md_wall_time_s": elapsed,
         "elapsed_s": elapsed,
         "seconds_per_step": elapsed / args.steps,
@@ -305,10 +375,31 @@ def main() -> None:
         "ase_version": package_version("ase"),
         "repo_commit": git_commit(),
         "checkpoint": str(args.checkpoint.resolve()),
-        "checkpoint_sha256": sha256(args.checkpoint),
+        "checkpoint_sha256": checkpoint_hash,
         "structure": str(args.structure.resolve()),
+        "structure_sha256": structure_hash,
         "official_validation": args.validate_official,
+        "energy_reference_role": "candidate",
+        "baseline_result": (
+            "" if args.baseline_result is None else str(args.baseline_result.resolve())
+        ),
+        "baseline_result_sha256": (
+            "" if args.baseline_result is None else sha256(args.baseline_result)
+        ),
     }
+    record.update(checkpoint_energy_fields(checkpoint_energies))
+    validation_pass: bool | None = None
+    if baseline_reference is None:
+        record["energy_validation_status"] = "not_requested"
+        record["energy_validation_pass"] = None
+    else:
+        validation_fields, validation_pass = compare_checkpoint_energies(
+            checkpoint_energies, baseline_reference
+        )
+        record.update(validation_fields)
+        record["energy_validation_status"] = (
+            "passed" if validation_pass else "failed"
+        )
 
     json_path = args.output_dir / f"{run_name}.json"
     json_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
@@ -316,18 +407,25 @@ def main() -> None:
     print(json.dumps(record, indent=2))
     print(f"Result: {json_path}")
     print(f"Summary: {args.output_dir / 'summary.tsv'}")
+    if validation_pass is False:
+        print(
+            "BENCHMARK_STATUS=validation_failed: energy error exceeded the "
+            "1-step or 50-step limit",
+            file=sys.stderr,
+        )
+        return 43
+    return 0
 
 
 def entrypoint() -> int:
     try:
-        main()
+        return main()
     except BaseException as exc:  # Classify CUDA OOM for the batch driver.
         message = str(exc).lower()
         if exc.__class__.__name__ == "OutOfMemoryError" or "out of memory" in message:
             print(f"BENCHMARK_STATUS=oom: {exc}", file=sys.stderr)
             return 42
         raise
-    return 0
 
 
 if __name__ == "__main__":

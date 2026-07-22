@@ -15,6 +15,7 @@ STEPS=${STEPS:-1000}
 WARMUP_STEPS=${WARMUP_STEPS:-3}
 REPEATS=${REPEATS:-3}
 STRICT=${STRICT:-1}
+SEED=${SEED:-42}
 SYSTEMS=${SYSTEMS:-"Cu32 Cu64 Cu192 Cu512 Cu1024 H2O32 H2O60 H2O192 H2O512 H2O1024"}
 TEMPERATURES=${TEMPERATURES:-"300 800"}
 
@@ -23,6 +24,10 @@ read -r -a temperatures <<< "$TEMPERATURES"
 
 if [[ ! -f "$CHECKPOINT" ]]; then
     echo "Checkpoint not found: $CHECKPOINT" >&2
+    exit 2
+fi
+if [[ "$SEED" != "42" ]]; then
+    echo "All benchmark RNG seeds are fixed at 42; got SEED=$SEED" >&2
     exit 2
 fi
 
@@ -39,6 +44,14 @@ done
 
 STATUS_TSV="$OUTPUT_DIR/run_status.tsv"
 printf 'system\ttemperature_K\trepeat\trun_name\tstatus\texit_code\tprocess_wall_time_s\n' > "$STATUS_TSV"
+STRUCTURE_HASH_TSV="$OUTPUT_DIR/structure_sha256.tsv"
+printf 'system\tstructure\tsha256\n' > "$STRUCTURE_HASH_TSV"
+for system in "${systems[@]}"; do
+    structure="$STRUCTURE_DIR/$system.cif"
+    structure_sha=$(sha256sum "$structure" | awk '{print $1}')
+    printf '%s\t%s\t%s\n' "$system" "$structure" "$structure_sha" \
+        >> "$STRUCTURE_HASH_TSV"
+done
 failure_count=0
 oom_count=0
 error_count=0
@@ -54,8 +67,12 @@ error_count=0
     echo "steps=$STEPS"
     echo "warmup_steps=$WARMUP_STEPS"
     echo "repeats=$REPEATS"
+    echo "seed=$SEED"
     echo "systems=$SYSTEMS"
     echo "temperatures=$TEMPERATURES"
+    echo "pythonhashseed=$SEED"
+    echo "cublas_workspace_config=:4096:8"
+    echo "checkpoint_sha256=$(sha256sum "$CHECKPOINT" | awk '{print $1}')"
     python -c 'import torch; print(f"python_torch={torch.__version__}"); print(f"torch_cuda={torch.version.cuda}")'
     nvidia-smi -i "$GPU" --query-gpu=index,name,uuid,driver_version --format=csv,noheader
 } > "$OUTPUT_DIR/run_metadata.txt"
@@ -68,7 +85,10 @@ for system in "${systems[@]}"; do
             echo "Running $run_name on physical GPU $GPU"
             start_ns=$(date +%s%N)
             set +e
-            CUDA_VISIBLE_DEVICES="$GPU" PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+            CUDA_VISIBLE_DEVICES="$GPU" \
+            PYTHONHASHSEED="$SEED" \
+            CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+            PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
                 python -u "$REPO_ROOT/example/benchmark_md.py" \
                     --structure "$structure" \
                     --checkpoint "$CHECKPOINT" \
@@ -80,7 +100,8 @@ for system in "${systems[@]}"; do
                     --temperature "$temperature" \
                     --timestep 1.0 \
                     --taut 100.0 \
-                    --seed 42 \
+                    --seed "$SEED" \
+                    --repeat "$repeat" \
                     --outputs energy forces \
                 2>&1 | tee "$OUTPUT_DIR/${run_name}.log"
             exit_code=${PIPESTATUS[0]}
@@ -89,7 +110,8 @@ for system in "${systems[@]}"; do
             process_wall_time=$(awk -v start="$start_ns" -v end="$end_ns" \
                 'BEGIN { printf "%.6f", (end - start) / 1000000000 }')
 
-            if [[ $exit_code -eq 0 ]]; then
+            result_json="$OUTPUT_DIR/${run_name}.json"
+            if [[ $exit_code -eq 0 && -f "$result_json" ]]; then
                 status=success
             elif [[ $exit_code -eq 42 ]] || grep -Eqi \
                 'BENCHMARK_STATUS=oom|CUDA out of memory|CUDA error: out of memory|OutOfMemoryError' \

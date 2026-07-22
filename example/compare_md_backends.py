@@ -80,7 +80,12 @@ def main() -> None:
         keys, key=lambda key: (SYSTEM_ORDER.get(key[0], 999), key[1])
     ):
         baseline_records = baseline[(system, temperature)]
-        gpu_records = gpu[(system, temperature)]
+        all_gpu_records = gpu[(system, temperature)]
+        gpu_records = [
+            record
+            for record in all_gpu_records
+            if record.get("energy_validation_pass") is not False
+        ]
         baseline_sps = (
             median(float(record["seconds_per_step"]) for record in baseline_records)
             if baseline_records
@@ -106,6 +111,15 @@ def main() -> None:
             if gpu_records
             else None
         )
+        energy_error_max = {}
+        for step in (1, 50, 100, 1000):
+            field = f"energy_abs_error_step_{step}_eV"
+            values = [
+                float(record[field])
+                for record in all_gpu_records
+                if record.get(field) is not None
+            ]
+            energy_error_max[step] = max(values) if values else None
         rows.append(
             {
                 "system": system,
@@ -114,11 +128,34 @@ def main() -> None:
                 "baseline_oom": baseline_status[(system, temperature)].count("oom"),
                 "gpu_success": len(gpu_records),
                 "gpu_oom": gpu_status[(system, temperature)].count("oom"),
+                "gpu_validation_failed": gpu_status[(system, temperature)].count(
+                    "validation_failed"
+                ),
                 "baseline_seconds_per_step": format_float(baseline_sps, 9),
                 "gpu_seconds_per_step": format_float(gpu_sps, 9),
                 "gpu_resident_speedup": format_float(speedup, 4),
                 "baseline_peak_allocated_gib": format_float(baseline_peak, 6),
                 "gpu_peak_allocated_gib": format_float(gpu_peak, 6),
+                "energy_error_step1_eV_max": (
+                    ""
+                    if energy_error_max[1] is None
+                    else f"{energy_error_max[1]:.12e}"
+                ),
+                "energy_error_step50_eV_max": (
+                    ""
+                    if energy_error_max[50] is None
+                    else f"{energy_error_max[50]:.12e}"
+                ),
+                "energy_error_step100_eV_max": (
+                    ""
+                    if energy_error_max[100] is None
+                    else f"{energy_error_max[100]:.12e}"
+                ),
+                "energy_error_step1000_eV_max": (
+                    ""
+                    if energy_error_max[1000] is None
+                    else f"{energy_error_max[1000]:.12e}"
+                ),
             }
         )
 

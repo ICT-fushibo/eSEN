@@ -37,6 +37,22 @@ def load_status(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle, delimiter="\t"))
 
 
+def record_run_name(record: dict[str, object]) -> str:
+    """Return the explicit run name, with compatibility for older JSON files."""
+
+    if record.get("run_name"):
+        return str(record["run_name"])
+    backend_suffix = (
+        "esen_baseline"
+        if record["backend"] == "esen_ocpcalculator_eager"
+        else "esen_gpu_eager"
+    )
+    return (
+        f"{record['system']}_{float(record['temperature_K']):g}K_"
+        f"{record['steps']}step_{backend_suffix}_r{record.get('repeat', 1)}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, required=True)
@@ -58,6 +74,7 @@ def main() -> None:
         for row in status_rows
         if row["status"] == "success"
     }
+    status_by_run = {row["run_name"]: row["status"] for row in status_rows}
     status_groups: dict[tuple[str, float], list[dict[str, str]]] = defaultdict(list)
     for row in status_rows:
         status_groups[(row["system"], float(row["temperature_K"]))].append(row)
@@ -66,6 +83,7 @@ def main() -> None:
         record = json.loads(path.read_text(encoding="utf-8"))
         if record.get("backend") != args.backend:
             continue
+        record.setdefault("run_name", path.stem)
         record["process_wall_time_s"] = process_times.get(path.stem)
         groups[(str(record["system"]), float(record["temperature_K"]))].append(record)
 
@@ -76,46 +94,130 @@ def main() -> None:
     ):
         records = groups[(system, temperature)]
         statuses = status_groups[(system, temperature)]
+        successful_records = [
+            record
+            for record in records
+            if not status_by_run
+            or status_by_run.get(record_run_name(record)) == "success"
+        ]
+        if not statuses:
+            successful_records = records
         process_values = [
             float(record["process_wall_time_s"])
-            for record in records
+            for record in successful_records
             if record["process_wall_time_s"] is not None
         ]
+        seconds_per_step_values = [
+            float(record["seconds_per_step"]) for record in successful_records
+        ]
+        md_wall_values = [
+            float(record["md_wall_time_s"]) for record in successful_records
+        ]
+        peak_allocated_values = [
+            float(record["peak_allocated_gib"]) for record in successful_records
+        ]
+        peak_reserved_values = [
+            float(record["peak_reserved_gib"]) for record in successful_records
+        ]
+        energy_errors: dict[int, list[float]] = {}
+        checkpoint_energies: dict[int, list[float]] = {}
+        for step in (1, 50, 100, 1000):
+            field = f"energy_abs_error_step_{step}_eV"
+            energy_errors[step] = [
+                float(record[field])
+                for record in records
+                if record.get(field) is not None
+            ]
+            energy_field = f"energy_step_{step}_eV"
+            checkpoint_energies[step] = [
+                float(record[energy_field])
+                for record in successful_records
+                if record.get(energy_field) is not None
+            ]
         rows.append(
             {
                 "system": system,
                 "temperature_K": f"{temperature:g}",
                 "atoms": records[0]["atoms"] if records else "",
                 "attempted_repeats": len(statuses) if statuses else len(records),
-                "successful_repeats": len(records),
+                "successful_repeats": (
+                    sum(row["status"] == "success" for row in statuses)
+                    if statuses
+                    else len(records)
+                ),
                 "failed_repeats": sum(
                     row["status"] != "success" for row in statuses
                 ),
                 "oom_repeats": sum(row["status"] == "oom" for row in statuses),
+                "validation_failed_repeats": sum(
+                    row["status"] == "validation_failed" for row in statuses
+                ),
+                "missing_reference_repeats": sum(
+                    row["status"] == "missing_reference" for row in statuses
+                ),
                 "error_repeats": sum(
-                    row["status"] not in {"success", "oom"} for row in statuses
+                    row["status"]
+                    not in {"success", "oom", "validation_failed", "missing_reference"}
+                    for row in statuses
                 ),
                 "seconds_per_step_median": (
-                    f"{median(float(r['seconds_per_step']) for r in records):.9f}"
-                    if records
+                    f"{median(seconds_per_step_values):.9f}"
+                    if seconds_per_step_values
                     else ""
                 ),
                 "md_wall_time_s_median": (
-                    f"{median(float(r['md_wall_time_s']) for r in records):.6f}"
-                    if records
+                    f"{median(md_wall_values):.6f}"
+                    if md_wall_values
                     else ""
                 ),
                 "process_wall_time_s_median": (
                     f"{median(process_values):.6f}" if process_values else ""
                 ),
                 "peak_allocated_gib_max": (
-                    f"{max(float(r['peak_allocated_gib']) for r in records):.6f}"
-                    if records
+                    f"{max(peak_allocated_values):.6f}"
+                    if peak_allocated_values
                     else ""
                 ),
                 "peak_reserved_gib_max": (
-                    f"{max(float(r['peak_reserved_gib']) for r in records):.6f}"
-                    if records
+                    f"{max(peak_reserved_values):.6f}"
+                    if peak_reserved_values
+                    else ""
+                ),
+                "energy_step_1_eV_median": (
+                    f"{median(checkpoint_energies[1]):.12f}"
+                    if checkpoint_energies[1]
+                    else ""
+                ),
+                "energy_step_50_eV_median": (
+                    f"{median(checkpoint_energies[50]):.12f}"
+                    if checkpoint_energies[50]
+                    else ""
+                ),
+                "energy_step_100_eV_median": (
+                    f"{median(checkpoint_energies[100]):.12f}"
+                    if checkpoint_energies[100]
+                    else ""
+                ),
+                "energy_step_1000_eV_median": (
+                    f"{median(checkpoint_energies[1000]):.12f}"
+                    if checkpoint_energies[1000]
+                    else ""
+                ),
+                "energy_validation_passed_repeats": sum(
+                    record.get("energy_validation_pass") is True for record in records
+                ),
+                "energy_abs_error_step_1_eV_max": (
+                    f"{max(energy_errors[1]):.12e}" if energy_errors[1] else ""
+                ),
+                "energy_abs_error_step_50_eV_max": (
+                    f"{max(energy_errors[50]):.12e}" if energy_errors[50] else ""
+                ),
+                "energy_abs_error_step_100_eV_max": (
+                    f"{max(energy_errors[100]):.12e}" if energy_errors[100] else ""
+                ),
+                "energy_abs_error_step_1000_eV_max": (
+                    f"{max(energy_errors[1000]):.12e}"
+                    if energy_errors[1000]
                     else ""
                 ),
             }

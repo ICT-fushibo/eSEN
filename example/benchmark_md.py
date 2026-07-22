@@ -21,6 +21,13 @@ import time
 
 import numpy as np
 
+from md_energy_reference import (
+    REQUIRED_SEED,
+    checkpoint_energy_fields,
+    reached_energy_checkpoints,
+    seed_everything,
+)
+
 
 REPO = Path(__file__).resolve().parent.parent
 EXPECTED_ATOMS = {
@@ -53,7 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestep", type=float, default=1.0, help="fs")
     parser.add_argument("--temperature", type=float, required=True, help="K")
     parser.add_argument("--taut", type=float, default=100.0, help="fs")
-    parser.add_argument("--seed", type=int, default=20260715)
+    parser.add_argument("--seed", type=int, default=REQUIRED_SEED)
+    parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument(
         "--outputs",
         nargs="+",
@@ -70,6 +78,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--warmup-steps must be non-negative")
     if args.timestep <= 0 or args.temperature <= 0 or args.taut <= 0:
         parser.error("--timestep, --temperature, and --taut must be positive")
+    if args.seed != REQUIRED_SEED:
+        parser.error(f"--seed must be {REQUIRED_SEED}")
+    if args.repeat < 1:
+        parser.error("--repeat must be positive")
     return args
 
 
@@ -112,6 +124,12 @@ def append_tsv(path: Path, record: dict[str, object]) -> None:
 def main() -> None:
     args = parse_args()
 
+    if os.environ.get("PYTHONHASHSEED") != str(REQUIRED_SEED):
+        raise RuntimeError(
+            f"Launch the benchmark with PYTHONHASHSEED={REQUIRED_SEED}"
+        )
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
     # Import the checkout when fairchem-core has not been installed editable.
     sys.path.insert(0, str(REPO / "src"))
 
@@ -131,6 +149,8 @@ def main() -> None:
         raise FileNotFoundError(args.structure)
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
+
+    seed_everything(torch, args.seed)
 
     # Precision is part of the baseline contract.
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -214,10 +234,21 @@ def main() -> None:
         taut=args.taut * units.fs,
     )
 
+    checkpoint_hash = sha256(args.checkpoint)
+    structure_hash = sha256(args.structure)
+    checkpoint_energies: dict[int, float] = {}
+    completed_steps = 0
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
     start = time.perf_counter()
-    dynamics.run(args.steps)
+    for checkpoint_step in reached_energy_checkpoints(args.steps):
+        dynamics.run(checkpoint_step - completed_steps)
+        # OCPCalculator already returned energy together with the forces for
+        # this step, so this reads the ASE cache without another model call.
+        checkpoint_energies[checkpoint_step] = float(atoms.get_potential_energy())
+        completed_steps = checkpoint_step
+    if completed_steps < args.steps:
+        dynamics.run(args.steps - completed_steps)
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
 
@@ -233,6 +264,7 @@ def main() -> None:
 
     record: dict[str, object] = {
         "backend": "esen_ocpcalculator_eager",
+        "run_name": run_name,
         "system": args.system,
         "atoms": len(atoms),
         "formula": atoms.get_chemical_formula(),
@@ -243,6 +275,7 @@ def main() -> None:
         "timestep_fs": args.timestep,
         "taut_fs": args.taut,
         "seed": args.seed,
+        "repeat": args.repeat,
         "outputs": "all" if only_output is None else ",".join(only_output),
         "parameters_frozen": True,
         "stress_computed": not energy_force_only,
@@ -251,6 +284,17 @@ def main() -> None:
         "tf32": False,
         "torch_compile": False,
         "cuda_graph": False,
+        "kernel_fusion": False,
+        "gpu_resident_md": False,
+        "neighbor_builder": "fairchem_radius_graph_pbc",
+        "md_state_dtype": "float64",
+        "model_dtype": str(next(loaded_model.parameters()).dtype).removeprefix(
+            "torch."
+        ),
+        "pythonhashseed": os.environ.get("PYTHONHASHSEED", ""),
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG", ""),
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
         "md_wall_time_s": elapsed,
         "elapsed_s": elapsed,
         "seconds_per_step": elapsed / args.steps,
@@ -273,9 +317,12 @@ def main() -> None:
         "ase_version": package_version("ase"),
         "repo_commit": git_commit(),
         "checkpoint": str(args.checkpoint.resolve()),
-        "checkpoint_sha256": sha256(args.checkpoint),
+        "checkpoint_sha256": checkpoint_hash,
         "structure": str(args.structure.resolve()),
+        "structure_sha256": structure_hash,
+        "energy_reference_role": "baseline",
     }
+    record.update(checkpoint_energy_fields(checkpoint_energies))
 
     json_path = args.output_dir / f"{run_name}.json"
     json_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")

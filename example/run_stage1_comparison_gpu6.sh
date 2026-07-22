@@ -18,6 +18,7 @@ common_env=(
     "STEPS=$STEPS"
     "WARMUP_STEPS=$WARMUP_STEPS"
     "REPEATS=$REPEATS"
+    "SEED=42"
     "SYSTEMS=$SYSTEMS"
     "TEMPERATURES=$TEMPERATURES"
     "STRICT=0"
@@ -31,6 +32,9 @@ env "${common_env[@]}" \
 env "${common_env[@]}" \
     RUN_ID="${RUN_ID}_gpu_eager" \
     OUTPUT_DIR="$ROOT_OUTPUT_DIR/gpu_eager" \
+    BASELINE_DIR="$ROOT_OUTPUT_DIR/ase" \
+    BASELINE_STEPS="$STEPS" \
+    REQUIRE_BASELINE_REFERENCE=1 \
     bash "$REPO_ROOT/example/run_md_gpu_resident.sh"
 
 python "$REPO_ROOT/example/compare_md_backends.py" \

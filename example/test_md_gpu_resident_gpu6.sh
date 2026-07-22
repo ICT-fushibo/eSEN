@@ -10,5 +10,6 @@ REPEATS=1 \
 SYSTEMS="Cu32 H2O32" \
 TEMPERATURES="300" \
 VALIDATE_OFFICIAL=1 \
+REQUIRE_BASELINE_REFERENCE=0 \
 STRICT=1 \
 bash "$(dirname "$0")/run_md_gpu_resident.sh"

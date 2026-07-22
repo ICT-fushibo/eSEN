@@ -12,6 +12,12 @@ checkpoint model keeps its FP32 input dtype; conversion happens on the GPU.
 Stress regression and activation checkpointing are disabled because this MD
 benchmark consumes only energy and forces.
 
+All random-number layers use seed 42. Formal optimized runs require the
+matching baseline result directory. The runner compares total structure
+energies after steps 1, 50, 100, and 1000. The strict acceptance limits are
+`abs(error_step_1) < 1e-8 eV` and `abs(error_step_50) < 1e-6 eV`; step-100
+and step-1000 errors are reported without an acceptance threshold.
+
 ## GPU 6 smoke test
 
 On the server:
@@ -52,6 +58,7 @@ conda activate esen_opt
 
 CHECKPOINT=/public-data/fushibo/eSEN/esen_30m_oam.pt \
 STRUCTURE_DIR=/public-data/fushibo/MatRIS-09bk/example/cif_file \
+BASELINE_DIR=/path/to/esen_baseline_output \
 GPU=6 STEPS=1000 WARMUP_STEPS=3 REPEATS=3 \
 bash example/run_md_gpu_resident.sh
 ```
@@ -65,6 +72,7 @@ Useful short-run overrides:
 ```bash
 GPU=6 STEPS=10 REPEATS=1 \
 SYSTEMS="Cu32 Cu64 H2O32 H2O60" TEMPERATURES="300" \
+REQUIRE_BASELINE_REFERENCE=0 \
 bash example/run_md_gpu_resident.sh
 ```
 
