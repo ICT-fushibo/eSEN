@@ -38,6 +38,43 @@ class CUDAGraphValidationError(RuntimeError):
     """Raised when a captured graph fails an untimed correctness check."""
 
 
+def prepare_cuda_graph_index_tensors_(
+    model: torch.nn.Module,
+    device: torch.device,
+) -> int:
+    """Move plain forward-path index tensors to the capture device.
+
+    eSEN stores ``out_mask`` as an ordinary tensor attribute rather than a
+    registered buffer.  ``Module.to(cuda)`` therefore leaves it on the CPU.
+    CUDA eager advanced indexing accepts that CPU index, but performs an
+    implicit host-to-device transfer on every forward.  Such a transfer is
+    forbidden during CUDA Graph capture.  This opt2-only preparation keeps
+    the official eager modules unchanged and gives the captured model stable
+    device-resident index addresses.
+    """
+
+    prepared = 0
+    for module in model.modules():
+        out_mask = getattr(module, "out_mask", None)
+        if not isinstance(out_mask, Tensor):
+            continue
+        if out_mask.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "eSEN out_mask must be an integer index tensor, got "
+                f"{out_mask.dtype} in {type(module).__name__}"
+            )
+        if out_mask.device != device:
+            module.out_mask = out_mask.to(device=device)
+        if module.out_mask.device != device:
+            raise RuntimeError(
+                f"Failed to move {type(module).__name__}.out_mask to {device}"
+            )
+        prepared += 1
+    if prepared == 0:
+        raise RuntimeError("No eSEN out_mask index tensors were found")
+    return prepared
+
+
 def edge_capacity_from_probe(
     maximum_edges: int,
     *,
@@ -136,6 +173,13 @@ class ESENModelCUDAGraphEvaluator:
         self.dummy_atoms = int(dummy_atoms)
         self.capture_warmup = int(capture_warmup)
         self.total_atoms = self.num_atoms + self.dummy_atoms
+
+        # Must happen before warmup/capture.  The original eSEN model keeps
+        # these advanced-index tensors on CPU because they are not buffers.
+        # Only this model-CG evaluator mutates its private inference instance.
+        self.capture_index_tensor_count = prepare_cuda_graph_index_tensors_(
+            self.model, self.device
+        )
 
         # A real-only batch drives the dynamic OTF graph builder and the
         # denormalizers.  A padded batch with static tensor shapes is consumed
@@ -450,6 +494,9 @@ class ESENModelCUDAGraphEvaluator:
             "cuda_graph_max_padding_fraction": max_padding_fraction,
             "cuda_graph_dummy_atoms": self.dummy_atoms,
             "cuda_graph_capture_warmup": self.capture_warmup,
+            "cuda_graph_device_index_tensor_count": (
+                self.capture_index_tensor_count
+            ),
             "cuda_graph_replay_output_addresses_stable": (
                 self.replay_output_addresses_stable
             ),

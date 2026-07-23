@@ -7,6 +7,7 @@ from torch import nn
 from fairchem.core.applications.esen_cuda_graph import (
     CUDAGraphCapacityError,
     edge_capacity_from_probe,
+    prepare_cuda_graph_index_tensors_,
     staticize_neighbor_graph_,
 )
 from fairchem.core.models.esen.esen import MLP_EFS_Head
@@ -55,6 +56,18 @@ def test_staticize_neighbor_graph_rejects_capacity_overflow():
             dummy_sink_template=torch.tensor([3, 4]),
             padding_offset_template=torch.zeros(2, 3),
         )
+
+
+def test_prepare_cuda_graph_index_tensors_finds_plain_out_masks():
+    model = nn.Sequential(nn.Identity())
+    model[0].out_mask = torch.tensor([0, 2, 4], dtype=torch.long)
+    assert dict(model[0].named_buffers()) == {}
+
+    prepared = prepare_cuda_graph_index_tensors_(model, torch.device("cpu"))
+
+    assert prepared == 1
+    assert model[0].out_mask.device.type == "cpu"
+    torch.testing.assert_close(model[0].out_mask, torch.tensor([0, 2, 4]))
 
 
 def test_esen_energy_head_excludes_cuda_graph_dummy_atoms():
