@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-# Eager GPU-resident eSEN benchmark.  There is intentionally no CUDA Graph,
-# torch.compile, AMP, TF32, or custom fusion in this runner.
+# GPU-resident eSEN benchmark. BACKEND=gpu-eager is opt1 and BACKEND=model-cg
+# is opt2. Neither backend enables torch.compile, AMP, TF32, or custom fusion.
 #
 # Examples:
 #   GPU=6 STEPS=10 REPEATS=1 SYSTEMS="Cu32 H2O32" TEMPERATURES="300" \
@@ -16,7 +16,17 @@ set -uo pipefail
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CHECKPOINT=${CHECKPOINT:-"$REPO_ROOT/esen_30m_oam.pt"}
 STRUCTURE_DIR=${STRUCTURE_DIR:-"$REPO_ROOT/../MatRIS-09bk/example/cif_file"}
-RUN_ID=${RUN_ID:-"esen_gpu_eager_$(date '+%Y%m%d_%H%M%S')"}
+BACKEND=${BACKEND:-gpu-eager}
+if [[ "$BACKEND" == "model-cg" ]]; then
+    backend_suffix=esen_model_cg
+    backend_record=esen_gpu_resident_model_cg
+    report_prefix=model_cg_report
+else
+    backend_suffix=esen_gpu_eager
+    backend_record=esen_gpu_resident_eager
+    report_prefix=gpu_resident_report
+fi
+RUN_ID=${RUN_ID:-"${backend_suffix}_$(date '+%Y%m%d_%H%M%S')"}
 OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/example/md_out/$RUN_ID"}
 GPU=${GPU:-6}
 STEPS=${STEPS:-1000}
@@ -29,6 +39,11 @@ SEED=${SEED:-42}
 BASELINE_DIR=${BASELINE_DIR:-}
 BASELINE_STEPS=${BASELINE_STEPS:-1000}
 REQUIRE_BASELINE_REFERENCE=${REQUIRE_BASELINE_REFERENCE:-1}
+CG_PROBE_STEPS=${CG_PROBE_STEPS:-50}
+CG_CAPACITY_MARGIN=${CG_CAPACITY_MARGIN:-0.10}
+CG_EDGE_STEP=${CG_EDGE_STEP:-256}
+CG_DUMMY_ATOMS=${CG_DUMMY_ATOMS:-32}
+CG_CAPTURE_WARMUP=${CG_CAPTURE_WARMUP:-3}
 SYSTEMS=${SYSTEMS:-"Cu32 Cu64 Cu192 Cu512 Cu1024 H2O32 H2O60 H2O192 H2O512 H2O1024"}
 TEMPERATURES=${TEMPERATURES:-"300 800"}
 
@@ -41,6 +56,10 @@ if [[ ! -f "$CHECKPOINT" ]]; then
 fi
 if [[ "$SEED" != "42" ]]; then
     echo "All benchmark RNG seeds are fixed at 42; got SEED=$SEED" >&2
+    exit 2
+fi
+if [[ "$BACKEND" != "gpu-eager" && "$BACKEND" != "model-cg" ]]; then
+    echo "BACKEND must be gpu-eager or model-cg; got $BACKEND" >&2
     exit 2
 fi
 if [[ "$REQUIRE_BASELINE_REFERENCE" == "1" && -z "$BASELINE_DIR" ]]; then
@@ -75,6 +94,7 @@ done
     echo "checkpoint=$CHECKPOINT"
     echo "structure_dir=$STRUCTURE_DIR"
     echo "physical_gpu=$GPU"
+    echo "backend=$BACKEND"
     echo "systems=$SYSTEMS"
     echo "temperatures=$TEMPERATURES"
     echo "steps=$STEPS"
@@ -88,6 +108,11 @@ done
     echo "require_baseline_reference=$REQUIRE_BASELINE_REFERENCE"
     echo "pythonhashseed=$SEED"
     echo "cublas_workspace_config=:4096:8"
+    echo "cg_probe_steps=$CG_PROBE_STEPS"
+    echo "cg_capacity_margin=$CG_CAPACITY_MARGIN"
+    echo "cg_edge_step=$CG_EDGE_STEP"
+    echo "cg_dummy_atoms=$CG_DUMMY_ATOMS"
+    echo "cg_capture_warmup=$CG_CAPTURE_WARMUP"
     echo "checkpoint_sha256=$(sha256sum "$CHECKPOINT" | awk '{print $1}')"
     PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
         python -c 'import torch; print(f"python_torch={torch.__version__}"); print(f"torch_cuda={torch.version.cuda}")'
@@ -104,13 +129,14 @@ success_count=0
 oom_count=0
 error_count=0
 validation_failed_count=0
+capacity_overflow_count=0
 missing_reference_count=0
 
 for system in "${systems[@]}"; do
     structure="$STRUCTURE_DIR/$system.cif"
     for temperature in "${temperatures[@]}"; do
         for repeat in $(seq 1 "$REPEATS"); do
-            run_name="${system}_${temperature}K_${STEPS}step_esen_gpu_eager_r${repeat}"
+            run_name="${system}_${temperature}K_${STEPS}step_${backend_suffix}_r${repeat}"
             log_path="$OUTPUT_DIR/${run_name}.log"
             baseline_run_name="${system}_${temperature}K_${BASELINE_STEPS}step_esen_baseline_r${repeat}"
             baseline_result=""
@@ -127,6 +153,9 @@ for system in "${systems[@]}"; do
                         "missing_reference" "44" "0.000000" "$baseline_result" \
                         >> "$STATUS_TSV"
                     continue
+                else
+                    reference_args+=(--missing-baseline-reference)
+                    ((missing_reference_count += 1))
                 fi
             fi
             echo "Running $run_name on physical GPU $GPU"
@@ -138,6 +167,7 @@ for system in "${systems[@]}"; do
             CUBLAS_WORKSPACE_CONFIG=:4096:8 \
             PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
                 python -u "$REPO_ROOT/example/benchmark_md_gpu.py" \
+                    --backend "$BACKEND" \
                     --structure "$structure" \
                     --checkpoint "$CHECKPOINT" \
                     --system "$system" \
@@ -151,6 +181,11 @@ for system in "${systems[@]}"; do
                     --seed "$SEED" \
                     --repeat "$repeat" \
                     --md-dtype "$MD_DTYPE" \
+                    --cg-probe-steps "$CG_PROBE_STEPS" \
+                    --cg-capacity-margin "$CG_CAPACITY_MARGIN" \
+                    --cg-edge-step "$CG_EDGE_STEP" \
+                    --cg-dummy-atoms "$CG_DUMMY_ATOMS" \
+                    --cg-capture-warmup "$CG_CAPTURE_WARMUP" \
                     "${reference_args[@]}" \
                     "${validation_args[@]}" \
                 2>&1 | tee "$log_path"
@@ -176,6 +211,11 @@ for system in "${systems[@]}"; do
                 status=validation_failed
                 ((validation_failed_count += 1))
                 echo "ENERGY VALIDATION FAILED: $run_name; continuing" >&2
+            elif [[ $exit_code -eq 45 ]] || grep -Eqi \
+                'BENCHMARK_STATUS=capacity_overflow' "$log_path"; then
+                status=capacity_overflow
+                ((capacity_overflow_count += 1))
+                echo "CUDA GRAPH CAPACITY OVERFLOW: $run_name; continuing" >&2
             else
                 status=error
                 ((error_count += 1))
@@ -192,21 +232,22 @@ done
 
 python "$REPO_ROOT/example/summarize_md_baselines.py" \
     --input-dir "$OUTPUT_DIR" \
-    --backend esen_gpu_resident_eager \
-    --report-prefix gpu_resident_report
+    --backend "$backend_record" \
+    --report-prefix "$report_prefix"
 
 {
     echo "finished_at=$(date --iso-8601=seconds)"
     echo "successful_runs=$success_count"
     echo "oom_runs=$oom_count"
     echo "validation_failed_runs=$validation_failed_count"
+    echo "capacity_overflow_runs=$capacity_overflow_count"
     echo "missing_reference_runs=$missing_reference_count"
     echo "error_runs=$error_count"
 } >> "$OUTPUT_DIR/run_metadata.txt"
 
 echo "Results: $OUTPUT_DIR"
-echo "success=$success_count oom=$oom_count validation_failed=$validation_failed_count missing_reference=$missing_reference_count error=$error_count"
+echo "success=$success_count oom=$oom_count validation_failed=$validation_failed_count capacity_overflow=$capacity_overflow_count missing_reference=$missing_reference_count error=$error_count"
 
-if [[ "$STRICT" == "1" && $((oom_count + validation_failed_count + missing_reference_count + error_count)) -ne 0 ]]; then
+if [[ "$STRICT" == "1" && $((oom_count + validation_failed_count + capacity_overflow_count + missing_reference_count + error_count)) -ne 0 ]]; then
     exit 1
 fi

@@ -133,6 +133,27 @@ class ESENEnergyForceEvaluator:
         energy = energy.reshape(-1)[0].detach()
         return forces, energy
 
+    @torch.no_grad()
+    def build_neighbor_graph(self, positions: Tensor) -> dict[str, Any]:
+        """Build the current real-atom OTF graph without running the model.
+
+        This is used by the model-only CUDA-graph backend for capacity probing
+        and for the per-step dynamic neighbor build that intentionally remains
+        outside CUDA Graph capture.
+        """
+
+        if positions.shape != self.model_positions.shape:
+            raise ValueError(
+                f"Expected positions with shape {tuple(self.model_positions.shape)}, "
+                f"got {tuple(positions.shape)}"
+            )
+        if positions.device != self.device:
+            raise ValueError(
+                f"Positions must be on {self.device}, got {positions.device}"
+            )
+        self.model_positions.copy_(positions)
+        return self.model.backbone.generate_graph(self.batch, otf_graph=True)
+
 
 @dataclass
 class GPUMDState:

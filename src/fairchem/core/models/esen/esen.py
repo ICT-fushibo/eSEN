@@ -264,7 +264,9 @@ class eSEN_Backbone(nn.Module, GraphModelMixin):
             graph_dict = self.generate_graph(data_dict)
         else:
             cell_per_edge = data_dict["cell"].repeat_interleave(
-                data_dict["nedges"], dim=0
+                data_dict["nedges"],
+                dim=0,
+                output_size=data_dict["edge_index"].shape[1],
             )
             shifts = torch.einsum(
                 "ij,ijk->ik",
@@ -429,10 +431,26 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
             emb["node_embedding"].narrow(1, 0, 1).squeeze()
         ).view(-1, 1, 1)
 
+        # CUDA-graph MD may append fixed dummy sink atoms so the edge tensors
+        # have a static capacity.  Those atoms are disconnected from the real
+        # system and must not contribute to its energy.  Normal training and
+        # inference batches do not define ``n_real`` and retain the original
+        # all-atom reduction unchanged.
+        n_real = data.get("n_real", None)
+        if n_real is not None:
+            n_real = int(n_real)
+            node_energy_for_reduction = node_energy.narrow(0, 0, n_real)
+            batch_for_reduction = data["batch"].narrow(0, 0, n_real)
+        else:
+            node_energy_for_reduction = node_energy
+            batch_for_reduction = data["batch"]
+
         energy = torch.zeros(
             len(data["natoms"]), device=data["pos"].device, dtype=node_energy.dtype
         )
-        energy.index_add_(0, data["batch"], node_energy.view(-1))
+        energy.index_add_(
+            0, batch_for_reduction, node_energy_for_reduction.view(-1)
+        )
         outputs[energy_key] = energy
 
         if self.regress_stress:
