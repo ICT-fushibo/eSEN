@@ -44,19 +44,23 @@ def init_edge_rot_mat(
     norm_x = edge_vec_0 / (edge_vec_0_distance.view(-1, 1))
 
     if rot_clip:
-        yprod = norm_x @ norm_x.new_tensor([0.0, 1.0, 0.0])
         if capture_safe:
+            # Dotting with the Cartesian y axis is exactly the y component.
+            # Avoid ``new_tensor([0, 1, 0])`` here: constructing that CUDA
+            # constant from a Python list performs a host-to-device copy,
+            # which is illegal while a CUDA Graph stream is being captured.
+            yprod = norm_x[:, 1]
+            clipped_norm_x = torch.zeros_like(norm_x)
+            clipped_norm_x[:, 1] = torch.sign(yprod)
             norm_x = torch.where(
-                (yprod > YTOL).view(-1, 1),
-                norm_x.new_tensor([0.0, 1.0, 0.0]).view(1, 3),
-                norm_x,
-            )
-            norm_x = torch.where(
-                (yprod < -YTOL).view(-1, 1),
-                norm_x.new_tensor([0.0, -1.0, 0.0]).view(1, 3),
+                (torch.abs(yprod) > YTOL).view(-1, 1),
+                clipped_norm_x,
                 norm_x,
             )
         else:
+            # Keep the official eager path unchanged.  This branch is used by
+            # the ASE baseline and the existing GPU-resident eager backend.
+            yprod = norm_x @ norm_x.new_tensor([0.0, 1.0, 0.0])
             norm_x[yprod > YTOL] = norm_x.new_tensor([0.0, 1.0, 0.0])
             norm_x[yprod < -YTOL] = norm_x.new_tensor([0.0, -1.0, 0.0])
 
@@ -165,7 +169,13 @@ def rotation_to_wigner(
     """
     set <rot_clip=True> to handle gradient instability when using gradient-based force/stress prediction.
     """
-    x = edge_rot_mat @ edge_rot_mat.new_tensor([0.0, 1.0, 0.0])
+    if fixed_shape:
+        # Matrix-vector multiplication by the Cartesian y axis selects the
+        # second matrix column.  Indexing avoids creating a CUDA tensor from a
+        # Python list during graph capture.
+        x = edge_rot_mat[..., 1]
+    else:
+        x = edge_rot_mat @ edge_rot_mat.new_tensor([0.0, 1.0, 0.0])
     alpha, beta = o3.xyz_to_angles(x)
     R = (
         o3.angles_to_matrix(alpha, beta, torch.zeros_like(alpha)).transpose(-1, -2)
@@ -174,7 +184,10 @@ def rotation_to_wigner(
     gamma = torch.atan2(R[..., 0, 2], R[..., 0, 0])
 
     if rot_clip:
-        yprod = (x @ x.new_tensor([0, 1, 0])).detach()
+        if fixed_shape:
+            yprod = x[..., 1].detach()
+        else:
+            yprod = (x @ x.new_tensor([0, 1, 0])).detach()
         mask = (yprod > -YTOL) & (yprod < YTOL)
         if fixed_shape:
             # Preserve the original values and gradient clipping without
