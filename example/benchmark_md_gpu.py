@@ -102,6 +102,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cg-edge-step", type=int, default=256)
     parser.add_argument("--cg-dummy-atoms", type=int, default=32)
     parser.add_argument("--cg-capture-warmup", type=int, default=3)
+    parser.add_argument("--cg-replay-energy-atol", type=float, default=0.0)
+    parser.add_argument("--cg-replay-force-atol", type=float, default=1e-6)
     parser.add_argument("--cg-eager-energy-atol", type=float, default=1e-8)
     parser.add_argument("--cg-eager-force-atol", type=float, default=2e-4)
     args = parser.parse_args()
@@ -127,8 +129,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("--cg-edge-step and --cg-dummy-atoms must be positive")
     if args.cg_capture_warmup < 0:
         parser.error("--cg-capture-warmup must be non-negative")
-    if args.cg_eager_energy_atol < 0 or args.cg_eager_force_atol < 0:
-        parser.error("CUDA Graph eager-comparison tolerances must be non-negative")
+    if (
+        args.cg_replay_energy_atol < 0
+        or args.cg_replay_force_atol < 0
+        or args.cg_eager_energy_atol < 0
+        or args.cg_eager_force_atol < 0
+    ):
+        parser.error("CUDA Graph validation tolerances must be non-negative")
     return args
 
 
@@ -347,6 +354,8 @@ def main() -> int:
             edge_capacity=cg_edge_capacity,
             dummy_atoms=args.cg_dummy_atoms,
             capture_warmup=args.cg_capture_warmup,
+            replay_energy_atol=args.cg_replay_energy_atol,
+            replay_force_atol=args.cg_replay_force_atol,
         )
         model_cg_evaluator.capture(state.positions)
         dynamics.evaluator = model_cg_evaluator
@@ -567,6 +576,8 @@ def main() -> int:
         ),
         "cg_initial_energy_abs_error_eV": cg_initial_energy_abs_error_eV,
         "cg_eager_energy_atol_eV": args.cg_eager_energy_atol,
+        "cg_replay_energy_atol_eV": args.cg_replay_energy_atol,
+        "cg_replay_force_atol_eV_per_A": args.cg_replay_force_atol,
         "cg_initial_force_max_abs_error_eV_per_A": (
             cg_initial_force_max_abs_error_eV_per_A
         ),

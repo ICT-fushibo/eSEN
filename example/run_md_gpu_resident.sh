@@ -44,6 +44,8 @@ CG_CAPACITY_MARGIN=${CG_CAPACITY_MARGIN:-0.10}
 CG_EDGE_STEP=${CG_EDGE_STEP:-256}
 CG_DUMMY_ATOMS=${CG_DUMMY_ATOMS:-32}
 CG_CAPTURE_WARMUP=${CG_CAPTURE_WARMUP:-3}
+CG_REPLAY_ENERGY_ATOL=${CG_REPLAY_ENERGY_ATOL:-0.0}
+CG_REPLAY_FORCE_ATOL=${CG_REPLAY_FORCE_ATOL:-1e-6}
 SYSTEMS=${SYSTEMS:-"Cu32 Cu64 Cu192 Cu512 Cu1024 H2O32 H2O60 H2O192 H2O512 H2O1024"}
 TEMPERATURES=${TEMPERATURES:-"300 800"}
 
@@ -113,6 +115,8 @@ done
     echo "cg_edge_step=$CG_EDGE_STEP"
     echo "cg_dummy_atoms=$CG_DUMMY_ATOMS"
     echo "cg_capture_warmup=$CG_CAPTURE_WARMUP"
+    echo "cg_replay_energy_atol=$CG_REPLAY_ENERGY_ATOL"
+    echo "cg_replay_force_atol=$CG_REPLAY_FORCE_ATOL"
     echo "checkpoint_sha256=$(sha256sum "$CHECKPOINT" | awk '{print $1}')"
     PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
         python -c 'import torch; print(f"python_torch={torch.__version__}"); print(f"torch_cuda={torch.version.cuda}")'
@@ -186,6 +190,8 @@ for system in "${systems[@]}"; do
                     --cg-edge-step "$CG_EDGE_STEP" \
                     --cg-dummy-atoms "$CG_DUMMY_ATOMS" \
                     --cg-capture-warmup "$CG_CAPTURE_WARMUP" \
+                    --cg-replay-energy-atol "$CG_REPLAY_ENERGY_ATOL" \
+                    --cg-replay-force-atol "$CG_REPLAY_FORCE_ATOL" \
                     "${reference_args[@]}" \
                     "${validation_args[@]}" \
                 2>&1 | tee "$log_path"

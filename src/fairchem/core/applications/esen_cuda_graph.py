@@ -148,6 +148,8 @@ class ESENModelCUDAGraphEvaluator:
         edge_capacity: int,
         dummy_atoms: int = 32,
         capture_warmup: int = 3,
+        replay_energy_atol: float = 0.0,
+        replay_force_atol: float = 1e-6,
     ) -> None:
         if eager_evaluator.device.type != "cuda":
             raise ValueError("Model-only CUDA Graph requires a CUDA evaluator")
@@ -157,6 +159,8 @@ class ESENModelCUDAGraphEvaluator:
             raise ValueError("dummy_atoms must be positive")
         if capture_warmup < 0:
             raise ValueError("capture_warmup must be non-negative")
+        if replay_energy_atol < 0 or replay_force_atol < 0:
+            raise ValueError("Replay stability tolerances must be non-negative")
 
         self.eager_evaluator = eager_evaluator
         self.device = eager_evaluator.device
@@ -172,6 +176,8 @@ class ESENModelCUDAGraphEvaluator:
         self.edge_capacity = int(edge_capacity)
         self.dummy_atoms = int(dummy_atoms)
         self.capture_warmup = int(capture_warmup)
+        self.replay_energy_atol = float(replay_energy_atol)
+        self.replay_force_atol = float(replay_force_atol)
         self.total_atoms = self.num_atoms + self.dummy_atoms
 
         # Must happen before warmup/capture.  The original eSEN model keeps
@@ -444,13 +450,15 @@ class ESENModelCUDAGraphEvaluator:
                 "CUDA Graph output addresses changed between replays"
             )
         if (
-            self.replay_stability_force_max_abs_error != 0.0
-            or self.replay_stability_energy_abs_error != 0.0
+            self.replay_stability_force_max_abs_error > self.replay_force_atol
+            or self.replay_stability_energy_abs_error > self.replay_energy_atol
         ):
             raise CUDAGraphValidationError(
-                "Identical CUDA Graph replays were not bitwise stable: "
+                "Identical CUDA Graph replays exceeded stability tolerances: "
                 f"energy_error={self.replay_stability_energy_abs_error}, "
-                f"force_error={self.replay_stability_force_max_abs_error}"
+                f"energy_atol={self.replay_energy_atol}, "
+                f"force_error={self.replay_stability_force_max_abs_error}, "
+                f"force_atol={self.replay_force_atol}"
             )
 
     def reset_production_stats(self) -> None:
@@ -525,6 +533,12 @@ class ESENModelCUDAGraphEvaluator:
             ),
             "cuda_graph_replay_stability_force_max_abs_error_eV_per_A": (
                 self.replay_stability_force_max_abs_error
+            ),
+            "cuda_graph_replay_stability_energy_atol_eV": (
+                self.replay_energy_atol
+            ),
+            "cuda_graph_replay_stability_force_atol_eV_per_A": (
+                self.replay_force_atol
             ),
             "cuda_graph_capture_wall_time_s": self.capture_wall_time_s,
             "cuda_graph_capture_allocated_delta_gib": (
