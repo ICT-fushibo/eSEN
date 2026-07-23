@@ -304,10 +304,15 @@ def main() -> int:
     cg_eager_initial_energy = None
     cg_initial_energy_abs_error_eV = None
     cg_initial_force_max_abs_error_eV_per_A = None
+    cg_initial_validation_pass = None
+    official_energy_abs_error_eV = None
+    official_force_max_abs_error_eV_per_A = None
+    official_energy_validation_pass = None
+    official_force_validation_pass = None
+    numerical_validation_failures: list[str] = []
 
     if args.backend == "model-cg":
         from fairchem.core.applications.esen_cuda_graph import (
-            CUDAGraphValidationError,
             ESENModelCUDAGraphEvaluator,
             edge_capacity_from_probe,
         )
@@ -358,6 +363,16 @@ def main() -> int:
             replay_force_atol=args.cg_replay_force_atol,
         )
         model_cg_evaluator.capture(state.positions)
+        if not model_cg_evaluator.replay_stability_passed:
+            numerical_validation_failures.append(
+                "CUDA Graph identical-input replay stability failed: "
+                f"energy_error="
+                f"{model_cg_evaluator.replay_stability_energy_abs_error}, "
+                f"energy_atol={model_cg_evaluator.replay_energy_atol}, "
+                f"force_error="
+                f"{model_cg_evaluator.replay_stability_force_max_abs_error}, "
+                f"force_atol={model_cg_evaluator.replay_force_atol}"
+            )
         dynamics.evaluator = model_cg_evaluator
         cg_setup_wall_time_s = time.perf_counter() - setup_start
 
@@ -387,14 +402,19 @@ def main() -> int:
                 initial_forces_device - cg_eager_initial_forces
             ).abs().max().item()
         )
+        cg_initial_validation_pass = bool(
+            cg_initial_energy_abs_error_eV <= args.cg_eager_energy_atol
+            and cg_initial_force_max_abs_error_eV_per_A
+            <= args.cg_eager_force_atol
+        )
         if cg_initial_energy_abs_error_eV > args.cg_eager_energy_atol:
-            raise CUDAGraphValidationError(
+            numerical_validation_failures.append(
                 "Model CUDA Graph and GPU eager initial energies differ: "
                 f"error={cg_initial_energy_abs_error_eV}, "
                 f"atol={args.cg_eager_energy_atol}"
             )
         if cg_initial_force_max_abs_error_eV_per_A > args.cg_eager_force_atol:
-            raise CUDAGraphValidationError(
+            numerical_validation_failures.append(
                 "Model CUDA Graph and GPU eager initial forces differ: "
                 f"error={cg_initial_force_max_abs_error_eV_per_A}, "
                 f"atol={args.cg_eager_force_atol}"
@@ -410,20 +430,38 @@ def main() -> int:
             official_energy = float(atoms.get_potential_energy())
         finally:
             evaluator.model.backbone.otf_graph = original_otf_graph
-        np.testing.assert_allclose(
-            initial_forces,
-            official_forces,
-            rtol=args.rtol,
-            atol=args.force_atol,
-            err_msg="Direct-GPU and OCPCalculator forces differ",
+        official_force_max_abs_error_eV_per_A = float(
+            np.max(np.abs(initial_forces - official_forces))
         )
-        np.testing.assert_allclose(
-            initial_energy,
-            official_energy,
-            rtol=args.rtol,
-            atol=args.energy_atol,
-            err_msg="Direct-GPU and OCPCalculator energies differ",
+        official_energy_abs_error_eV = abs(initial_energy - official_energy)
+        official_force_validation_pass = bool(
+            np.allclose(
+                initial_forces,
+                official_forces,
+                rtol=args.rtol,
+                atol=args.force_atol,
+            )
         )
+        official_energy_validation_pass = bool(
+            np.allclose(
+                initial_energy,
+                official_energy,
+                rtol=args.rtol,
+                atol=args.energy_atol,
+            )
+        )
+        if not official_force_validation_pass:
+            numerical_validation_failures.append(
+                "Direct-GPU and OCPCalculator initial forces differ: "
+                f"max_abs_error={official_force_max_abs_error_eV_per_A}, "
+                f"atol={args.force_atol}, rtol={args.rtol}"
+            )
+        if not official_energy_validation_pass:
+            numerical_validation_failures.append(
+                "Direct-GPU and OCPCalculator initial energies differ: "
+                f"abs_error={official_energy_abs_error_eV}, "
+                f"atol={args.energy_atol}, rtol={args.rtol}"
+            )
 
     # Restore once more.  Setting forces=None intentionally matches the
     # existing ASE benchmark, whose timed dynamics performs its initial force
@@ -575,6 +613,7 @@ def main() -> int:
             cg_setup_wall_time_s if args.backend == "model-cg" else None
         ),
         "cg_initial_energy_abs_error_eV": cg_initial_energy_abs_error_eV,
+        "cg_initial_validation_pass": cg_initial_validation_pass,
         "cg_eager_energy_atol_eV": args.cg_eager_energy_atol,
         "cg_replay_energy_atol_eV": args.cg_replay_energy_atol,
         "cg_replay_force_atol_eV_per_A": args.cg_replay_force_atol,
@@ -582,6 +621,16 @@ def main() -> int:
             cg_initial_force_max_abs_error_eV_per_A
         ),
         "cg_eager_force_atol_eV_per_A": args.cg_eager_force_atol,
+        "official_initial_energy_abs_error_eV": official_energy_abs_error_eV,
+        "official_initial_force_max_abs_error_eV_per_A": (
+            official_force_max_abs_error_eV_per_A
+        ),
+        "official_initial_energy_validation_pass": (
+            official_energy_validation_pass
+        ),
+        "official_initial_force_validation_pass": (
+            official_force_validation_pass
+        ),
     }
     if cg_stats is not None:
         record.update(cg_stats)
@@ -602,6 +651,17 @@ def main() -> int:
         record["energy_validation_status"] = (
             "passed" if validation_pass else "failed"
         )
+        if not validation_pass:
+            numerical_validation_failures.append(
+                "Trajectory energy validation failed at the 1-step or "
+                "50-step checkpoint"
+            )
+
+    record["numerical_validation_pass"] = not numerical_validation_failures
+    record["numerical_validation_status"] = (
+        "passed" if not numerical_validation_failures else "failed"
+    )
+    record["numerical_validation_failures"] = numerical_validation_failures
 
     json_path = args.output_dir / f"{run_name}.json"
     json_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
@@ -609,10 +669,10 @@ def main() -> int:
     print(json.dumps(record, indent=2))
     print(f"Result: {json_path}")
     print(f"Summary: {args.output_dir / 'summary.tsv'}")
-    if validation_pass is False:
+    if numerical_validation_failures:
         print(
-            "BENCHMARK_STATUS=validation_failed: energy error exceeded the "
-            "1-step or 50-step limit",
+            "BENCHMARK_STATUS=validation_failed: MD completed; "
+            + " | ".join(numerical_validation_failures),
             file=sys.stderr,
         )
         return 43

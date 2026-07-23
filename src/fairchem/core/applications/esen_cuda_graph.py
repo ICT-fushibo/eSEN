@@ -254,6 +254,7 @@ class ESENModelCUDAGraphEvaluator:
         self.production_max_edges: int | None = None
         self.replay_stability_energy_abs_error = 0.0
         self.replay_stability_force_max_abs_error = 0.0
+        self.replay_stability_passed = False
         self.replay_output_addresses_stable = False
 
     @torch.no_grad()
@@ -449,17 +450,10 @@ class ESENModelCUDAGraphEvaluator:
             raise CUDAGraphValidationError(
                 "CUDA Graph output addresses changed between replays"
             )
-        if (
+        self.replay_stability_passed = not (
             self.replay_stability_force_max_abs_error > self.replay_force_atol
             or self.replay_stability_energy_abs_error > self.replay_energy_atol
-        ):
-            raise CUDAGraphValidationError(
-                "Identical CUDA Graph replays exceeded stability tolerances: "
-                f"energy_error={self.replay_stability_energy_abs_error}, "
-                f"energy_atol={self.replay_energy_atol}, "
-                f"force_error={self.replay_stability_force_max_abs_error}, "
-                f"force_atol={self.replay_force_atol}"
-            )
+        )
 
     def reset_production_stats(self) -> None:
         self.production_replays = 0
@@ -528,6 +522,7 @@ class ESENModelCUDAGraphEvaluator:
             "cuda_graph_replay_output_addresses_stable": (
                 self.replay_output_addresses_stable
             ),
+            "cuda_graph_replay_stability_pass": self.replay_stability_passed,
             "cuda_graph_replay_stability_energy_abs_error_eV": (
                 self.replay_stability_energy_abs_error
             ),
