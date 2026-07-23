@@ -189,8 +189,15 @@ class eSEN_Backbone(nn.Module, GraphModelMixin):
         )
 
     def get_rotmat_and_wigner(self, edge_distance_vecs):
+        fixed_reference_vec = (
+            getattr(self, "cuda_graph_fixed_rotation_reference", None)
+            if not self.otf_graph
+            else None
+        )
         edge_rot_mat = init_edge_rot_mat(
-            edge_distance_vecs, rot_clip=(not self.direct_forces)
+            edge_distance_vecs,
+            rot_clip=(not self.direct_forces),
+            fixed_reference_vec=fixed_reference_vec,
         )
 
         Jd_buffers = [
@@ -204,6 +211,7 @@ class eSEN_Backbone(nn.Module, GraphModelMixin):
             self.lmax,
             Jd_buffers,
             rot_clip=(not self.direct_forces),
+            fixed_shape=fixed_reference_vec is not None,
         )
         wigner_inv = torch.transpose(wigner, 1, 2).contiguous()
 

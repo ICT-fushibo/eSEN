@@ -10,6 +10,7 @@ from fairchem.core.applications.esen_cuda_graph import (
     staticize_neighbor_graph_,
 )
 from fairchem.core.models.esen.esen import MLP_EFS_Head
+from fairchem.core.models.esen.common.rotation import init_edge_rot_mat
 
 
 def test_edge_capacity_from_probe_adds_margin_and_rounds_up():
@@ -73,3 +74,27 @@ def test_esen_energy_head_excludes_cuda_graph_dummy_atoms():
     output = head(data, embedding)
 
     torch.testing.assert_close(output["energy"], torch.tensor([3.0]))
+
+
+def test_fixed_rotation_reference_is_finite_and_does_not_consume_rng():
+    edge_vectors = torch.randn(128, 3)
+    fixed_reference = edge_vectors.new_tensor([0.37, -0.61, 0.71]).expand_as(
+        edge_vectors
+    )
+    rng_state = torch.get_rng_state().clone()
+
+    rotation = init_edge_rot_mat(
+        edge_vectors,
+        rot_clip=True,
+        fixed_reference_vec=fixed_reference,
+    )
+
+    assert torch.equal(torch.get_rng_state(), rng_state)
+    assert bool(torch.isfinite(rotation).all())
+    identity = rotation @ rotation.transpose(1, 2)
+    torch.testing.assert_close(
+        identity,
+        torch.eye(3).expand_as(identity),
+        atol=2e-6,
+        rtol=2e-6,
+    )

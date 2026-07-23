@@ -185,6 +185,7 @@ class ESENModelCUDAGraphEvaluator:
         self.static_cell_offsets: Tensor | None = None
         self.dummy_sink_template: Tensor | None = None
         self.padding_offset_template: Tensor | None = None
+        self.fixed_rotation_reference: Tensor | None = None
         self.graph: torch.cuda.CUDAGraph | None = None
         self.static_forces: Tensor | None = None
         self.static_energy: Tensor | None = None
@@ -253,6 +254,19 @@ class ESENModelCUDAGraphEvaluator:
             self.edge_capacity, 3
         )
         self.padding_offset_template[:, axis] = shift
+
+        # eSEN normally samples a random auxiliary vector for each edge when
+        # constructing its local rotation frame.  A captured RNG operation
+        # advances on replay and would make identical graph replays differ.
+        # These three non-collinear component values are safely separated from
+        # every edge direction by the fallback rotations in init_edge_rot_mat.
+        reference = self.static_positions.new_tensor([0.37, -0.61, 0.71])
+        self.fixed_rotation_reference = reference.expand(
+            self.edge_capacity, 3
+        ).contiguous()
+        self.model.backbone.cuda_graph_fixed_rotation_reference = (
+            self.fixed_rotation_reference
+        )
 
     @torch.no_grad()
     def _staticize(self, graph: dict[str, Any]) -> int:
