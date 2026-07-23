@@ -230,6 +230,7 @@ class ESENModelCUDAGraphEvaluator:
         self.dummy_sink_template: Tensor | None = None
         self.padding_offset_template: Tensor | None = None
         self.fixed_rotation_reference: Tensor | None = None
+        self.capture_stream: torch.cuda.Stream | None = None
         self.graph: torch.cuda.CUDAGraph | None = None
         self.static_forces: Tensor | None = None
         self.static_energy: Tensor | None = None
@@ -370,9 +371,26 @@ class ESENModelCUDAGraphEvaluator:
         # invoking the ragged OTF builder internally.
         self.model.backbone.otf_graph = False
         current_stream = torch.cuda.current_stream(self.device)
+        # Autograd nodes retain the stream affinity established during their
+        # first warmup execution.  Warmup and capture must therefore use the
+        # exact same non-default stream.  Letting ``torch.cuda.graph`` create
+        # a second internal stream makes the backward engine try to bridge a
+        # stale stream through the legacy default stream, which invalidates
+        # capture with cudaErrorStreamCaptureImplicit (906).
         side_stream = torch.cuda.Stream(device=self.device)
+        self.capture_stream = side_stream
         side_stream.wait_stream(current_stream)
         with torch.cuda.stream(side_stream):
+            # Recreate the differentiable static input on the stream that will
+            # own both warmup and capture.  AccumulateGrad is initialized
+            # lazily by the first grad-enabled operation involving this leaf;
+            # rebinding the real-atom view here prevents it from acquiring
+            # legacy-default-stream affinity during setup.
+            capture_positions = self.static_positions.detach().clone()
+            capture_positions.requires_grad_(True)
+            self.static_positions = capture_positions
+            self.real_batch.pos = capture_positions[: self.num_atoms]
+            self.static_batch.pos = capture_positions
             for _ in range(self.capture_warmup):
                 self._static_forward()
         current_stream.wait_stream(side_stream)
@@ -382,7 +400,7 @@ class ESENModelCUDAGraphEvaluator:
         reserved_before = torch.cuda.memory_reserved(self.device)
         capture_start = time.perf_counter()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, stream=side_stream):
             static_forces, static_energy = self._static_forward()
         torch.cuda.synchronize(self.device)
         self.capture_wall_time_s = time.perf_counter() - capture_start
@@ -494,6 +512,8 @@ class ESENModelCUDAGraphEvaluator:
             "cuda_graph_max_padding_fraction": max_padding_fraction,
             "cuda_graph_dummy_atoms": self.dummy_atoms,
             "cuda_graph_capture_warmup": self.capture_warmup,
+            "cuda_graph_warmup_capture_same_stream": True,
+            "cuda_graph_input_initialized_on_capture_stream": True,
             "cuda_graph_device_index_tensor_count": (
                 self.capture_index_tensor_count
             ),
