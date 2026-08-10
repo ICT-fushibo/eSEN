@@ -310,7 +310,8 @@ class ESENForceEvalCUDAGraphEvaluator:
 
     def capture(self, positions: Tensor) -> None:
         self.core.model.backbone.otf_graph = False
-        self.core.static_positions[: self.num_atoms].copy_(positions)
+        with torch.no_grad():
+            self.core.static_positions[: self.num_atoms].copy_(positions)
         current = torch.cuda.current_stream(self.device)
         stream = torch.cuda.Stream(device=self.device)
         self.capture_stream = stream
