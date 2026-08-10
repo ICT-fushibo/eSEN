@@ -5,6 +5,10 @@ import torch
 from fairchem.core.applications.esen_gpu_md import (
     GPUIntegrator,
 )
+from fairchem.core.applications.esen_opt3_profiling import (
+    eager_nvt_post,
+    eager_nvt_pre,
+)
 from fairchem.core.applications.esen_whole_step_cuda_graph import (
     _branchless_nvt_momentum_finish,
     _branchless_nvt_position_proposal,
@@ -99,3 +103,49 @@ def test_advance_one_matches_gpu_integrator_tensor_equations():
 
     torch.testing.assert_close(evaluated, expected_positions)
     torch.testing.assert_close(final_momenta, expected_momenta)
+
+
+def test_profiling_nvt_split_matches_gpu_integrator_tensor_equations():
+    positions = torch.tensor(
+        [[0.1, 0.2, 0.3], [1.1, 0.7, 0.4]], dtype=torch.float64
+    )
+    momenta = torch.tensor(
+        [[0.22, -0.13, 0.31], [-0.19, 0.17, -0.28]],
+        dtype=torch.float64,
+    )
+    old_forces = torch.tensor(
+        [[0.03, -0.02, 0.01], [-0.04, 0.02, -0.01]],
+        dtype=torch.float64,
+    )
+    new_forces = torch.tensor(
+        [[0.02, -0.01, 0.04], [-0.03, 0.01, -0.02]],
+        dtype=torch.float64,
+    )
+    integrator = _integrator()
+
+    half, next_positions = eager_nvt_pre(
+        positions, momenta, old_forces, integrator
+    )
+    next_momenta = eager_nvt_post(half, new_forces, integrator)
+
+    expected_half = (
+        integrator.scale_velocities(momenta)
+        + 0.5 * integrator.dt * old_forces
+    )
+    expected_half = expected_half - expected_half.sum(
+        dim=0, keepdim=True
+    ) / 2.0
+    expected_positions = (
+        positions + integrator.dt * expected_half / integrator.masses
+    )
+    expected_momenta = (
+        expected_half + 0.5 * integrator.dt * new_forces
+    )
+
+    torch.testing.assert_close(half, expected_half, rtol=0, atol=0)
+    torch.testing.assert_close(
+        next_positions, expected_positions, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        next_momenta, expected_momenta, rtol=0, atol=0
+    )

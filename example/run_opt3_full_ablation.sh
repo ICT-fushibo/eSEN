@@ -75,3 +75,4 @@ python "$REPO_ROOT/example/compare_opt3_ablation.py" \
 echo "Fixed-builder/model-CG: $FIXED_DIR"
 echo "Whole-step CG: $WHOLE_DIR"
 echo "Opt3 ablation report: $ROOT_OUTPUT_DIR"
+echo "Phase-1 decision report: $ROOT_OUTPUT_DIR/opt3_phase1_decision.md"

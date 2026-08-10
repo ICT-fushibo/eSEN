@@ -54,7 +54,7 @@ done
 
 mkdir -p "$OUTPUT_DIR"
 STATUS_TSV="$OUTPUT_DIR/run_status.tsv"
-printf 'system\ttemperature_K\trepeat\trun_name\tstatus\texit_code\tprocess_wall_time_s\tbaseline_result\n' > "$STATUS_TSV"
+printf 'system\ttemperature_K\trepeat\trun_name\tstatus\texit_code\tprocess_wall_time_s\tbaseline_reference_status\tbaseline_result\n' > "$STATUS_TSV"
 
 {
     echo "run_id=$RUN_ID"
@@ -106,12 +106,15 @@ for system in "${systems[@]}"; do
             log_path="$OUTPUT_DIR/${run_name}.log"
             baseline_run_name="${system}_${temperature}K_${BASELINE_STEPS}step_esen_baseline_r${repeat}"
             baseline_result=""
+            baseline_reference_status=not_requested
             reference_args=()
             if [[ -n "$BASELINE_DIR" ]]; then
                 baseline_result="$BASELINE_DIR/${baseline_run_name}.json"
                 if [[ -f "$baseline_result" ]]; then
+                    baseline_reference_status=available
                     reference_args+=(--baseline-result "$baseline_result")
                 else
+                    baseline_reference_status=missing
                     reference_args+=(--missing-baseline-reference)
                     ((missing_reference_count += 1))
                 fi
@@ -174,9 +177,10 @@ for system in "${systems[@]}"; do
                 status=error
                 ((error_count += 1))
             fi
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "$system" "$temperature" "$repeat" "$run_name" "$status" \
-                "$exit_code" "$process_wall_time" "$baseline_result" \
+                "$exit_code" "$process_wall_time" \
+                "$baseline_reference_status" "$baseline_result" \
                 >> "$STATUS_TSV"
             echo "$status: $run_name"
         done
