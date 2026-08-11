@@ -27,11 +27,15 @@ MAX_NEIGHBORS=${MAX_NEIGHBORS:-300}
 DEGENERACY_TOLERANCE=${DEGENERACY_TOLERANCE:-0.01}
 ENERGY_PER_ATOM_ATOL=${ENERGY_PER_ATOM_ATOL:-1e-5}
 FORCE_MAX_ATOL=${FORCE_MAX_ATOL:-2e-4}
+TRITON_BLOCK_SIZE=${TRITON_BLOCK_SIZE:-256}
 SYSTEMS=${SYSTEMS:-"Cu32 Cu64 Cu192 Cu512 Cu1024 H2O32 H2O60 H2O192 H2O512 H2O1024"}
 TEMPERATURES=${TEMPERATURES:-"300 800"}
 
-if [[ "$BACKEND" != "fixed-builder-model-cg" && "$BACKEND" != "whole-step-cg" ]]; then
-    echo "BACKEND must be fixed-builder-model-cg or whole-step-cg" >&2
+if [[ "$BACKEND" != "fixed-builder-model-cg" \
+    && "$BACKEND" != "whole-step-cg" \
+    && "$BACKEND" != "fixed-builder-model-cg-kf1" \
+    && "$BACKEND" != "whole-step-cg-kf1" ]]; then
+    echo "Unsupported Opt3/Opt4 backend: $BACKEND" >&2
     exit 2
 fi
 if [[ "$SEED" != "42" ]]; then
@@ -81,6 +85,7 @@ printf 'system\ttemperature_K\trepeat\trun_name\tstatus\texit_code\tprocess_wall
     echo "degeneracy_tolerance=$DEGENERACY_TOLERANCE"
     echo "energy_per_atom_atol=$ENERGY_PER_ATOM_ATOL"
     echo "force_max_atol=$FORCE_MAX_ATOL"
+    echo "triton_block_size=$TRITON_BLOCK_SIZE"
     echo "pythonhashseed=$SEED"
     echo "cublas_workspace_config=:4096:8"
     echo "checkpoint_sha256=$(sha256sum "$CHECKPOINT" | awk '{print $1}')"
@@ -123,11 +128,16 @@ for system in "${systems[@]}"; do
             echo "Running $run_name on physical GPU $GPU"
             start_ns=$(date +%s%N)
             set +e
+            if [[ "$BACKEND" == *-kf1 ]]; then
+                benchmark_script="$REPO_ROOT/example/benchmark_md_opt4.py"
+            else
+                benchmark_script="$REPO_ROOT/example/benchmark_md_opt3.py"
+            fi
             CUDA_VISIBLE_DEVICES="$GPU" \
             PYTHONHASHSEED="$SEED" \
             CUBLAS_WORKSPACE_CONFIG=:4096:8 \
             PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
-                python -u "$REPO_ROOT/example/benchmark_md_opt3.py" \
+                python -u "$benchmark_script" \
                     --backend "$BACKEND" \
                     --structure "$structure" \
                     --checkpoint "$CHECKPOINT" \
@@ -150,6 +160,7 @@ for system in "${systems[@]}"; do
                     --degeneracy-tolerance "$DEGENERACY_TOLERANCE" \
                     --energy-per-atom-atol "$ENERGY_PER_ATOM_ATOL" \
                     --force-max-atol "$FORCE_MAX_ATOL" \
+                    --triton-block-size "$TRITON_BLOCK_SIZE" \
                     "${reference_args[@]}" \
                 2>&1 | tee "$log_path"
             exit_code=${PIPESTATUS[0]}
@@ -187,7 +198,13 @@ for system in "${systems[@]}"; do
     done
 done
 
-if [[ "$BACKEND" == "whole-step-cg" ]]; then
+if [[ "$BACKEND" == "whole-step-cg-kf1" ]]; then
+    record_backend=esen_gpu_resident_whole_step_cg_kf1
+    report_prefix=whole_step_cg_kf1_report
+elif [[ "$BACKEND" == "fixed-builder-model-cg-kf1" ]]; then
+    record_backend=esen_gpu_resident_fixed_builder_model_cg_kf1
+    report_prefix=fixed_builder_model_cg_kf1_report
+elif [[ "$BACKEND" == "whole-step-cg" ]]; then
     record_backend=esen_gpu_resident_whole_step_cg
     report_prefix=whole_step_cg_report
 else

@@ -45,7 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--backend",
-        choices=("fixed-builder-model-cg", "whole-step-cg"),
+        choices=(
+            "fixed-builder-model-cg",
+            "whole-step-cg",
+            "fixed-builder-model-cg-kf1",
+            "whole-step-cg-kf1",
+        ),
         required=True,
     )
     parser.add_argument("--structure", type=Path, required=True)
@@ -75,6 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-max-atol", type=float, default=2e-4)
     parser.add_argument("--replay-energy-atol", type=float, default=0.0)
     parser.add_argument("--replay-force-atol", type=float, default=1e-6)
+    parser.add_argument("--triton-block-size", type=int, default=256)
     parser.add_argument("--md-dtype", choices=("float64",), default="float64")
     args = parser.parse_args()
     if args.steps < 1 or args.warmup_steps < 0 or args.probe_steps < 0:
@@ -93,6 +99,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("invalid neighbor pruning parameters")
     if args.energy_per_atom_atol < 0 or args.force_max_atol < 0:
         parser.error("engineering tolerances must be non-negative")
+    if not 32 <= args.triton_block_size <= 1024:
+        parser.error("triton block size must be between 32 and 1024")
+    if args.triton_block_size & (args.triton_block_size - 1):
+        parser.error("triton block size must be a power of two")
     if args.baseline_result is not None and args.missing_baseline_reference:
         parser.error("baseline path and missing-reference flag are exclusive")
     return args
@@ -167,6 +177,10 @@ def main() -> int:
         ESENFixedBuilderModelCUDAGraphEvaluator,
         ESENWholeStepCUDAGraphMD,
     )
+    from fairchem.core.applications.esen_opt4_kernel_fusion import (
+        ESENKF1FixedBuilderModelCUDAGraphEvaluator,
+        ESENKF1WholeStepCUDAGraphMD,
+    )
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required")
@@ -175,6 +189,8 @@ def main() -> int:
     seed_everything(torch, args.seed)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+    fixed_builder_backend = args.backend.startswith("fixed-builder-model-cg")
+    kf1_backend = args.backend.endswith("-kf1")
 
     atoms = read(args.structure)
     if len(atoms) != EXPECTED_ATOMS[args.system]:
@@ -277,8 +293,16 @@ def main() -> int:
     device_used_before_capture = _device_memory_used(torch, device)
     fixed_evaluator = None
     whole_md = None
-    if args.backend == "fixed-builder-model-cg":
-        fixed_evaluator = ESENFixedBuilderModelCUDAGraphEvaluator(
+    if fixed_builder_backend:
+        evaluator_class = (
+            ESENKF1FixedBuilderModelCUDAGraphEvaluator
+            if kf1_backend
+            else ESENFixedBuilderModelCUDAGraphEvaluator
+        )
+        fixed_kwargs = {}
+        if kf1_backend:
+            fixed_kwargs["triton_block_size"] = args.triton_block_size
+        fixed_evaluator = evaluator_class(
             evaluator,
             neighbors_per_atom=neighbor_capacity,
             dummy_atoms=args.dummy_atoms,
@@ -287,12 +311,21 @@ def main() -> int:
             degeneracy_tolerance=args.degeneracy_tolerance,
             replay_energy_atol=args.replay_energy_atol,
             replay_force_atol=args.replay_force_atol,
+            **fixed_kwargs,
         )
         torch.cuda.empty_cache()
         fixed_evaluator.capture(state.positions)
         dynamics = GPUResidentMD(state, fixed_evaluator, integrator)
     else:
-        whole_md = ESENWholeStepCUDAGraphMD(
+        whole_class = (
+            ESENKF1WholeStepCUDAGraphMD
+            if kf1_backend
+            else ESENWholeStepCUDAGraphMD
+        )
+        whole_kwargs = {}
+        if kf1_backend:
+            whole_kwargs["triton_block_size"] = args.triton_block_size
+        whole_md = whole_class(
             state,
             evaluator,
             integrator,
@@ -301,6 +334,7 @@ def main() -> int:
             capture_warmup=args.capture_warmup,
             max_neighbors=args.max_neighbors,
             degeneracy_tolerance=args.degeneracy_tolerance,
+            **whole_kwargs,
         )
         torch.cuda.empty_cache()
         whole_md.capture(initial_state)
@@ -310,7 +344,7 @@ def main() -> int:
     setup_wall_time = time.perf_counter() - setup_start
 
     # Standard three-step warmup is trajectory-neutral and excluded from timing.
-    if args.backend == "fixed-builder-model-cg":
+    if fixed_builder_backend:
         assert dynamics is not None
         dynamics.run(args.warmup_steps)
         torch.cuda.synchronize()
@@ -341,7 +375,7 @@ def main() -> int:
     force_validation_pass = initial_force_error < args.force_max_atol
 
     # Reset after validation.  The timed region starts from the original state.
-    if args.backend == "fixed-builder-model-cg":
+    if fixed_builder_backend:
         assert dynamics is not None and fixed_evaluator is not None
         state.restore_(initial_state)
         dynamics.nsteps = 0
@@ -356,7 +390,7 @@ def main() -> int:
     device_used_before_timing = _device_memory_used(torch, device)
     torch.cuda.synchronize()
     timed_start = time.perf_counter()
-    if args.backend == "fixed-builder-model-cg":
+    if fixed_builder_backend:
         assert dynamics is not None
         completed = 0
         for checkpoint in reached_energy_checkpoints(args.steps):
@@ -447,16 +481,24 @@ def main() -> int:
     if not graph_invariants_pass:
         numerical_failures.append("CUDA Graph replay invariants failed")
 
-    backend_name = (
-        "esen_gpu_resident_fixed_builder_model_cg"
-        if args.backend == "fixed-builder-model-cg"
-        else "esen_gpu_resident_whole_step_cg"
-    )
-    suffix = (
-        "esen_fixed_builder_model_cg"
-        if args.backend == "fixed-builder-model-cg"
-        else "esen_whole_step_cg"
-    )
+    if fixed_builder_backend:
+        backend_name = (
+            "esen_gpu_resident_fixed_builder_model_cg_kf1"
+            if kf1_backend
+            else "esen_gpu_resident_fixed_builder_model_cg"
+        )
+        suffix = (
+            "esen_fixed_builder_model_cg_kf1"
+            if kf1_backend
+            else "esen_fixed_builder_model_cg"
+        )
+    else:
+        backend_name = (
+            "esen_gpu_resident_whole_step_cg_kf1"
+            if kf1_backend
+            else "esen_gpu_resident_whole_step_cg"
+        )
+        suffix = "esen_whole_step_cg_kf1" if kf1_backend else "esen_whole_step_cg"
     run_name = args.run_name or (
         f"{args.system}_{args.temperature:g}K_{args.steps}step_{suffix}"
     )
@@ -478,18 +520,29 @@ def main() -> int:
         "amp": False,
         "tf32": False,
         "torch_compile": False,
-        "kernel_fusion": False,
+        "kernel_fusion": kf1_backend,
+        "kernel_fusion_stage": "KF1" if kf1_backend else "KF0",
+        "kernel_fusion_name": (
+            "triton_pbc_distance_cutoff_mask" if kf1_backend else "none"
+        ),
+        "triton_block_size": (
+            args.triton_block_size if kf1_backend else None
+        ),
         "cuda_graph": True,
         "cuda_graph_scope": (
             "model_only_fixed_builder"
-            if args.backend == "fixed-builder-model-cg"
+            if fixed_builder_backend
             else "whole_nvt_step"
         ),
         "cuda_graph_neighbor_build_outside": (
-            args.backend == "fixed-builder-model-cg"
+            fixed_builder_backend
         ),
         "gpu_resident_md": True,
-        "neighbor_builder": "fixed_shape_radius_graph_pbc",
+        "neighbor_builder": (
+            "fixed_shape_radius_graph_pbc_triton_kf1"
+            if kf1_backend
+            else "fixed_shape_radius_graph_pbc"
+        ),
         "md_state_dtype": "float64",
         "model_dtype": str(evaluator.model_dtype).removeprefix("torch."),
         "probe_steps": args.probe_steps,
