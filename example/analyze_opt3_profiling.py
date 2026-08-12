@@ -456,16 +456,40 @@ def parse_nsys_kernel_files(root: Path):
         in_kernel_summary = False
         for line, values in zip(lines, reader):
             if line.lstrip().startswith("**"):
-                in_kernel_summary = "CUDA GPU Kernel Summary" in line
+                # Nsight Systems has changed/localized the human-readable
+                # report title across releases.  Prefer the stable report
+                # identifier when it is present, while retaining support for
+                # the older English title.
+                in_kernel_summary = (
+                    "cuda_gpu_kern_sum" in line
+                    or "CUDA GPU Kernel Summary" in line
+                )
+                header = None
+                index = {}
+                continue
+            cleaned = [value.strip().strip('"') for value in values]
+            is_summary_header = (
+                "Name" in cleaned
+                and any("Total Time" in value for value in cleaned)
+            )
+            is_kernel_header = is_summary_header and "Instances" in cleaned
+            if is_kernel_header:
+                # The CSV table schema is more stable than the optional
+                # banner.  In particular, cuda_gpu_kern_sum uses Instances,
+                # whereas cuda_api_sum uses Num Calls.  Recognizing the table
+                # directly also handles `nsys stats` output without banners.
+                in_kernel_summary = True
+                header = cleaned
+                index = {value: position for position, value in enumerate(header)}
+                continue
+            if is_summary_header:
+                # A later CUDA API or other summary table must not be parsed
+                # as kernel data when several reports share one CSV file.
+                in_kernel_summary = False
                 header = None
                 index = {}
                 continue
             if not in_kernel_summary:
-                continue
-            cleaned = [value.strip().strip('"') for value in values]
-            if "Name" in cleaned and any("Total Time" in value for value in cleaned):
-                header = cleaned
-                index = {value: position for position, value in enumerate(header)}
                 continue
             if header is None or len(cleaned) != len(header):
                 continue

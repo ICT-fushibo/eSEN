@@ -37,6 +37,28 @@ def test_nsys_parser_excludes_cuda_api_summary(tmp_path: Path):
     assert len(families) == 1
 
 
+def test_nsys_parser_accepts_kernel_table_without_english_banner(
+    tmp_path: Path,
+):
+    path = (
+        tmp_path
+        / "Cu192_300K_20step_whole-step-cg_nsys_node.stats.csv"
+    )
+    path.write_text(
+        '"Time (%)","Total Time (ns)","Instances","Name"\n'
+        '"100.0","3000000","20","model_kernel"\n'
+        '"Time (%)","Total Time (ns)","Num Calls","Name"\n'
+        '"100.0","9000000","20","cudaGraphLaunch"\n',
+        encoding="utf-8",
+    )
+
+    raw, families = ANALYZER.parse_nsys_kernel_files(tmp_path)
+
+    assert [row["kernel"] for row in raw] == ["model_kernel"]
+    assert raw[0]["time_ms_per_step"] == 0.15
+    assert len(families) == 1
+
+
 def test_nsys_graph_trace_reports_span_active_and_gap(tmp_path: Path):
     path = (
         tmp_path
