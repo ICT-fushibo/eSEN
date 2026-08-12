@@ -389,9 +389,29 @@ def profiler_equivalence(records: list[dict[str, Any]]):
         momenta = {row.get("final_momenta_sha256") for row in values}
         forces = {row.get("final_forces_sha256") for row in values}
         energies = [float(row["final_energy_eV"]) for row in values]
-        passed = bool(
+        hashes_match = bool(
             len(positions) == len(momenta) == len(forces) == 1
             and None not in positions | momenta | forces
+        )
+        atoms = int(values[0]["atoms"])
+        energy_range = max(energies) - min(energies)
+        energy_range_per_atom = energy_range / atoms
+        force_errors = [
+            float(row["initial_eager_force_max_abs_error_eV_per_A"])
+            for row in values
+            if row.get("initial_eager_force_max_abs_error_eV_per_A")
+            not in (None, "")
+        ]
+        max_force_error = max(force_errors, default=math.inf)
+        reference_statuses = {
+            str(row.get("engineering_validation_status", ""))
+            for row in values
+        }
+        reference_pass = "failed" not in reference_statuses
+        engineering_pass = bool(
+            energy_range_per_atom < 1e-5
+            and max_force_error < 2e-4
+            and reference_pass
         )
         rows.append(
             {
@@ -400,8 +420,15 @@ def profiler_equivalence(records: list[dict[str, Any]]):
                 "backend": key[2],
                 "steps": key[3],
                 "instrumented_runs": len(values),
-                "state_hashes_match": passed,
-                "final_energy_range_eV": f"{max(energies) - min(energies):.12e}",
+                "state_hashes_match": hashes_match,
+                "final_energy_range_eV": f"{energy_range:.12e}",
+                "final_energy_range_eV_per_atom": (
+                    f"{energy_range_per_atom:.12e}"
+                ),
+                "max_initial_force_error_eV_per_A": (
+                    f"{max_force_error:.12e}"
+                ),
+                "engineering_equivalence_pass": engineering_pass,
                 "run_names": ";".join(str(row["run_name"]) for row in values),
             }
         )
@@ -681,6 +708,25 @@ def kernel_delta_summary(raw_kernel_rows):
     return rows
 
 
+def ncu_function_filter(kernel: str) -> str:
+    """Return an exact NCU function-base regex for an NSYS kernel name.
+
+    NSYS reports demangled C++ signatures, while NCU matches
+    ``--kernel-name`` against the parameter-free function name by default.
+    Keeping the full NSYS signature therefore misses templated ATen/CUTLASS
+    kernels even though the corresponding function is present.
+    """
+
+    function = kernel.strip()
+    for delimiter in ("<", "("):
+        if delimiter in function:
+            function = function.split(delimiter, 1)[0]
+            break
+    function = function.rsplit(None, 1)[-1]
+    function = function.rsplit("::", 1)[-1]
+    return rf"^{re.escape(function)}$"
+
+
 def make_hot_filters(raw_kernel_rows):
     filters = []
     for row in kernel_delta_summary(raw_kernel_rows):
@@ -689,7 +735,7 @@ def make_hot_filters(raw_kernel_rows):
                 {
                     "system": row["system"],
                     "backend": backend,
-                    "kernel_regex": re.escape(str(row["kernel"])),
+                    "kernel_regex": ncu_function_filter(str(row["kernel"])),
                     "rank": row["rank"],
                     "delta_ms_per_step": row["delta_ms_per_step"],
                     "kernel": row["kernel"],
@@ -710,12 +756,14 @@ def parse_ncu_csv(root: Path):
         graph_mode = "node" if "_ncu_node" in path.name else "graph"
         rank_match = re.search(r"_kernel_(\d+)", path.name)
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        reader = csv.reader(lines)
+        parsed = list(csv.reader(lines))
         header = None
-        for values in reader:
+        found_long_format = False
+        for values in parsed:
             cleaned = [value.strip().strip('"') for value in values]
             if "Metric Name" in cleaned and "Metric Value" in cleaned:
                 header = cleaned
+                found_long_format = True
                 continue
             if header is None or len(cleaned) != len(header):
                 continue
@@ -735,6 +783,57 @@ def parse_ncu_csv(root: Path):
                     "value": item.get("Metric Value", ""),
                 }
             )
+        if found_long_format or not parsed:
+            continue
+
+        # NCU 2025.1 emits `--page raw --csv` as a wide table: one metric per
+        # column, followed by a unit row and one or more kernel rows.  Flatten
+        # it to the same long schema used by earlier NCU releases.
+        wide_header = [value.strip().strip('"') for value in parsed[0]]
+        if "Kernel Name" not in wide_header:
+            continue
+        units = (
+            [value.strip().strip('"') for value in parsed[1]]
+            if len(parsed) > 1 and len(parsed[1]) == len(wide_header)
+            else [""] * len(wide_header)
+        )
+        metadata = {
+            "ID",
+            "Process ID",
+            "Process Name",
+            "Host Name",
+            "Kernel Name",
+            "Context",
+            "Stream",
+            "Block Size",
+            "Grid Size",
+            "Device",
+            "CC",
+        }
+        for values in parsed[2:]:
+            cleaned = [value.strip().strip('"') for value in values]
+            if len(cleaned) != len(wide_header):
+                continue
+            item = dict(zip(wide_header, cleaned))
+            kernel = item.get("Kernel Name", "")
+            for metric, unit, value in zip(wide_header, units, cleaned):
+                if metric in metadata or value in ("", "no data"):
+                    continue
+                rows.append(
+                    {
+                        "source": path.name,
+                        "system": system,
+                        "backend": backend,
+                        "graph_profiling": graph_mode,
+                        "hot_kernel_rank": (
+                            "" if rank_match is None else rank_match.group(1)
+                        ),
+                        "kernel": kernel,
+                        "metric": metric,
+                        "unit": unit,
+                        "value": value,
+                    }
+                )
     return rows
 
 
@@ -763,8 +862,12 @@ def build_report(
         and required_traces <= available_traces
         and any(row["system"] == "Cu192" for row in kernel_rows)
         and any(row["system"] == "H2O60" for row in kernel_rows)
+        and ncu_rows
         and profiler_equivalence_rows
-        and all(row["state_hashes_match"] for row in profiler_equivalence_rows)
+        and all(
+            row["engineering_equivalence_pass"]
+            for row in profiler_equivalence_rows
+        )
     )
     lines = [
         "# eSEN Opt3 Whole-step CUDA Graph 退化 Profiling",
@@ -811,7 +914,10 @@ def build_report(
         lines.append(
             "交错重跑没有确认任何捕获范围存在稳定的 >5% 退化；原结果优先判为时段/GPU 状态漂移。"
         )
-        recommendation = "先修正测试环境稳定性，不进入 kernel fusion。"
+        recommendation = (
+            "Whole-step Graph 无需因退化而重构；kernel fusion 可继续，"
+            "但目标应由模型内部热点决定。"
+        )
     else:
         lines.append(
             f"主要退化发生在 **{primary['description']}**："
@@ -857,7 +963,9 @@ def build_report(
             continue
         wall_delta = float(transition["delta_ms_per_step"])
         gpu_delta = after - before
-        if wall_delta > 0 and gpu_delta >= 0.5 * wall_delta:
+        if not transition["significant"]:
+            classification = "未确认退化；NSYS 只用于定性核对"
+        elif wall_delta > 0 and gpu_delta >= 0.5 * wall_delta:
             classification = "真实 GPU kernel/依赖执行退化"
         elif wall_delta > 0 and abs(gpu_delta) <= 0.2 * wall_delta:
             classification = "主要是 host launch/同步/Python bookkeeping"
@@ -881,6 +989,9 @@ def build_report(
                 "## GPU 端还是 Host 端",
                 "",
                 markdown_table(device_classification),
+                "",
+                "NSYS trace 带有 profiler 开销，且 Graph trace 的 span 不等同于无 profiler 的端到端时间；"
+                "因此这里只检查方向是否支持真实 GPU 退化，不用 NSYS 数值替代正式 timing。",
             ]
         )
 
@@ -899,19 +1010,25 @@ def build_report(
             delta = values["whole-step-cg"] - values["force-eval-cg"]
             top_kernel_deltas.append((delta, system, family))
         top_kernel_deltas.sort(reverse=True)
-        lines.extend(["## Kernel family 增量", ""])
+        lines.extend(["## Kernel family 差异（诊断性）", ""])
         for delta, system, family in top_kernel_deltas[:3]:
             lines.append(f"- {system} / {family}: {delta:.6f} ms/step。")
+        lines.append(
+            "这些值来自一次 node trace；在无 profiler timing 未确认退化时，只用于热点排序，不能解释为因果贡献。"
+        )
         lines.append("")
 
     if kernel_deltas:
-        lines.extend(["## 退化贡献最大的 kernel", ""])
+        lines.extend(["## Force-eval → Whole-step 的正向 kernel 差异", ""])
         for row in kernel_deltas:
             lines.append(
                 f"- {row['system']} #{row['rank']}: "
                 f"`{row['kernel']}`，+{row['delta_ms_per_step']} ms/step，"
                 f"占正向 kernel 增量 {row['positive_delta_percent']}%。"
             )
+        lines.append(
+            "同样地，这些是单次 NSYS trace 的差值，而不是已确认退化的归因。"
+        )
         lines.append("")
 
     if profiler_equivalence_rows:

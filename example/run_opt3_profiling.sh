@@ -313,6 +313,10 @@ run_ncu_one() {
     local output="$OUTPUT_DIR/ncu/$run_name"
     local kernel_args=()
     [[ -n "$kernel_regex" ]] && kernel_args=(--kernel-name "regex:${kernel_regex}")
+    if [[ -s "$output.ncu-rep" && -s "$output.csv" ]]; then
+        echo "NCU already complete: $run_name; skipping"
+        return 0
+    fi
     ensure_gpu_idle
     set +e
     CUDA_VISIBLE_DEVICES="$GPU" \
@@ -323,6 +327,7 @@ run_ncu_one() {
             --target-processes all \
             --profile-from-start off \
             --graph-profiling "$graph_mode" \
+            --kernel-name-base function \
             --replay-mode kernel \
             --clock-control none \
             --cache-control none \
@@ -360,6 +365,11 @@ run_ncu_one() {
         record_failure "ncu-$graph_mode" "$backend" "$system" 300 1 "$status"
         echo "NCU failed ($status): $run_name" >&2
         return "$status"
+    fi
+    if [[ ! -s "$output.ncu-rep" ]]; then
+        record_failure "ncu-$graph_mode" "$backend" "$system" 300 1 1
+        echo "NCU produced no report (kernel filter matched nothing): $run_name" >&2
+        return 1
     fi
     "$NCU" --import "$output.ncu-rep" --page raw --csv \
         > "$output.csv"

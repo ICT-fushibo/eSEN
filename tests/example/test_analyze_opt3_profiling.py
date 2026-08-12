@@ -59,6 +59,36 @@ def test_nsys_parser_accepts_kernel_table_without_english_banner(
     assert len(families) == 1
 
 
+def test_ncu_filter_uses_parameter_free_function_name():
+    assert ANALYZER.ncu_function_filter(
+        "void at::native::vectorized_elementwise_kernel<(int)4, T2>(int, T2)"
+    ) == r"^vectorized_elementwise_kernel$"
+    assert ANALYZER.ncu_function_filter(
+        "void cutlass::Kernel2<cutlass_80_simt_sgemm>(T1::Params)"
+    ) == r"^Kernel2$"
+    assert ANALYZER.ncu_function_filter("sm80_xmma_gemm_execute_kernel") == (
+        r"^sm80_xmma_gemm_execute_kernel$"
+    )
+
+
+def test_ncu_parser_accepts_2025_wide_raw_csv(tmp_path: Path):
+    path = tmp_path / "Cu192_300K_1step_whole-step-cg_ncu_node_kernel_1.csv"
+    path.write_text(
+        '"ID","Kernel Name","gpu__time_duration.sum","sm__throughput.avg"\n'
+        '"","","us","%"\n'
+        '"0","model_kernel","123.5","76.0"\n',
+        encoding="utf-8",
+    )
+
+    rows = ANALYZER.parse_ncu_csv(tmp_path)
+
+    assert [(row["metric"], row["unit"], row["value"]) for row in rows] == [
+        ("gpu__time_duration.sum", "us", "123.5"),
+        ("sm__throughput.avg", "%", "76.0"),
+    ]
+    assert all(row["kernel"] == "model_kernel" for row in rows)
+
+
 def test_nsys_graph_trace_reports_span_active_and_gap(tmp_path: Path):
     path = (
         tmp_path
