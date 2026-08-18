@@ -46,6 +46,15 @@ BACKENDS_BY_SCOPE = {
     },
 }
 
+NON_FATAL_STATUSES = {"success", "validation_failed"}
+HARD_STATUSES = {
+    "oom",
+    "capacity_overflow",
+    "unsupported_fusion_config",
+    "graph_validation_failed",
+    "error",
+}
+
 
 def _load_records(root: Path, scope: str) -> list[dict[str, object]]:
     records = []
@@ -131,11 +140,32 @@ def main() -> int:
         if row.get("scope", args.scope) == args.scope
         and row.get("fusion_stage") == args.candidate_stage
     ]
+    base_records = records_by_stage[args.base_stage]
+
+    def record_key(record: dict[str, object]) -> tuple[str, int, int]:
+        return (
+            str(record.get("system", "")),
+            int(float(record.get("temperature_K", 0))),
+            int(record.get("repeat", 1)),
+        )
+
+    def status_key(row: dict[str, str]) -> tuple[str, int, int]:
+        return (
+            str(row.get("system", "")),
+            int(float(row.get("temperature_K", 0))),
+            int(row.get("repeat", 1)),
+        )
+
+    candidate_keys = {record_key(record) for record in candidate_records}
+    base_keys = {record_key(record) for record in base_records}
+    candidate_status_keys = {status_key(row) for row in candidate_statuses}
+    coverage_ok = bool(candidate_keys) and candidate_keys == base_keys == candidate_status_keys
     # Structural CUDA Graph health: graph wiring must be intact for the
     # timing comparison to be valid.  Energy/force-vs-baseline errors are
     # telemetry only and never gate acceptance.
-    structural_ok = bool(candidate_records) and all(
+    structural_ok = coverage_ok and all(
         record.get("graph_invariants_pass") is not False
+        and record.get("performance_sample_eligible", True) is not False
         and int(record.get("cuda_graph_capacity_misses", 0)) == 0
         and int(record.get("cuda_graph_capture_count", 0)) == 1
         for record in candidate_records
@@ -144,8 +174,13 @@ def main() -> int:
         record.get("engineering_validation_pass") is not False
         for record in candidate_records
     )
-    status_ok = bool(candidate_statuses) and all(
-        row.get("status") == "success" for row in candidate_statuses
+    # A legacy validation_failed row is non-fatal: the benchmark wrote a
+    # complete result and the numerical mismatch is recorded in JSON. Hard
+    # runtime failures still invalidate the timing comparison.
+    status_ok = bool(candidate_statuses) and coverage_ok and all(
+        row.get("status") in NON_FATAL_STATUSES
+        and row.get("status") not in HARD_STATUSES
+        for row in candidate_statuses
     )
     geomean = (
         math.exp(sum(math.log(row["speedup"]) for row in comparisons) / len(comparisons))
@@ -164,6 +199,7 @@ def main() -> int:
     )
     accepted = (
         structural_ok
+        and status_ok
         and stable
         and no_regression
         and geomean >= args.minimum_geomean_speedup
@@ -180,13 +216,17 @@ def main() -> int:
         "accepted_after": after,
         "geomean_speedup": geomean,
         "structural_ok": structural_ok,
+        "coverage_ok": coverage_ok,
         "engineering_validation_ok": engineering_validation_ok,
         "status_ok": status_ok,
         "stable": stable,
         "no_system_regression": no_regression,
         "min_paired_repeats": args.min_paired_repeats,
         "min_faster_directions": args.min_faster_directions,
-        "policy": "energy/force-vs-baseline errors are telemetry only",
+        "policy": (
+            "energy/force-vs-baseline errors are telemetry only; legacy "
+            "validation_failed is non-fatal when result and graph are healthy"
+        ),
         "comparisons": comparisons,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

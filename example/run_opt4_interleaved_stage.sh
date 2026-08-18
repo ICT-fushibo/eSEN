@@ -67,7 +67,8 @@ classify() {
     local code=$1 log=$2 result=$3
     if [[ $code -eq 0 && -s "$result" ]]; then echo success
     elif [[ $code -eq 42 ]] || grep -Eqi 'BENCHMARK_STATUS=oom|out of memory' "$log"; then echo oom
-    elif [[ $code -eq 43 ]] || grep -Eqi 'BENCHMARK_STATUS=validation_failed' "$log"; then echo validation_failed
+    elif [[ $code -eq 43 ]] || grep -Eqi 'BENCHMARK_STATUS=graph_validation_failed' "$log"; then echo graph_validation_failed
+    elif grep -Eqi 'BENCHMARK_STATUS=validation_failed' "$log"; then echo validation_failed
     elif [[ $code -eq 45 ]] || grep -Eqi 'BENCHMARK_STATUS=capacity_overflow' "$log"; then echo capacity_overflow
     elif [[ $code -eq 46 ]] || grep -Eqi 'BENCHMARK_STATUS=unsupported_fusion_config' "$log"; then echo unsupported_fusion_config
     else echo error; fi
