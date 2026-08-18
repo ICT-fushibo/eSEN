@@ -28,14 +28,25 @@ DEGENERACY_TOLERANCE=${DEGENERACY_TOLERANCE:-0.01}
 ENERGY_PER_ATOM_ATOL=${ENERGY_PER_ATOM_ATOL:-1e-5}
 FORCE_MAX_ATOL=${FORCE_MAX_ATOL:-2e-4}
 TRITON_BLOCK_SIZE=${TRITON_BLOCK_SIZE:-256}
+MODEL_FUSIONS=${MODEL_FUSIONS:-}
+FUSION_STAGE=${FUSION_STAGE:-}
 SYSTEMS=${SYSTEMS:-"Cu32 Cu64 Cu192 Cu512 Cu1024 H2O32 H2O60 H2O192 H2O512 H2O1024"}
 TEMPERATURES=${TEMPERATURES:-"300 800"}
+SOURCE_BUNDLE_SHA256=${SOURCE_BUNDLE_SHA256:-}
 
-if [[ "$BACKEND" != "fixed-builder-model-cg" \
+if [[ "$BACKEND" != "model-cg" \
+    && "$BACKEND" != "model-cg-opt4" \
+    && "$BACKEND" != "fixed-builder-model-cg" \
     && "$BACKEND" != "whole-step-cg" \
     && "$BACKEND" != "fixed-builder-model-cg-kf1" \
-    && "$BACKEND" != "whole-step-cg-kf1" ]]; then
+    && "$BACKEND" != "whole-step-cg-kf1" \
+    && "$BACKEND" != "fixed-builder-model-cg-opt4" \
+    && "$BACKEND" != "whole-step-cg-opt4" ]]; then
     echo "Unsupported Opt3/Opt4 backend: $BACKEND" >&2
+    exit 2
+fi
+if [[ "$BACKEND" == *-opt4 && ( -z "$MODEL_FUSIONS" || -z "$FUSION_STAGE" ) ]]; then
+    echo "Opt4 backends require MODEL_FUSIONS and FUSION_STAGE" >&2
     exit 2
 fi
 if [[ "$SEED" != "42" ]]; then
@@ -65,6 +76,7 @@ printf 'system\ttemperature_K\trepeat\trun_name\tstatus\texit_code\tprocess_wall
     echo "started_at=$(date --iso-8601=seconds)"
     echo "hostname=$(hostname)"
     echo "repo_commit=$(git -C "$REPO_ROOT" rev-parse HEAD)"
+    echo "source_bundle_sha256=$SOURCE_BUNDLE_SHA256"
     echo "checkpoint=$CHECKPOINT"
     echo "structure_dir=$STRUCTURE_DIR"
     echo "physical_gpu=$GPU"
@@ -86,6 +98,8 @@ printf 'system\ttemperature_K\trepeat\trun_name\tstatus\texit_code\tprocess_wall
     echo "energy_per_atom_atol=$ENERGY_PER_ATOM_ATOL"
     echo "force_max_atol=$FORCE_MAX_ATOL"
     echo "triton_block_size=$TRITON_BLOCK_SIZE"
+    echo "model_fusions=$MODEL_FUSIONS"
+    echo "fusion_stage=$FUSION_STAGE"
     echo "pythonhashseed=$SEED"
     echo "cublas_workspace_config=:4096:8"
     echo "checkpoint_sha256=$(sha256sum "$CHECKPOINT" | awk '{print $1}')"
@@ -128,42 +142,81 @@ for system in "${systems[@]}"; do
             echo "Running $run_name on physical GPU $GPU"
             start_ns=$(date +%s%N)
             set +e
-            if [[ "$BACKEND" == *-kf1 ]]; then
-                benchmark_script="$REPO_ROOT/example/benchmark_md_opt4.py"
+            if [[ "$BACKEND" == "model-cg" || "$BACKEND" == "model-cg-opt4" ]]; then
+                model_args=()
+                if [[ "$BACKEND" == "model-cg-opt4" ]]; then
+                    model_args+=(--model-fusions "$MODEL_FUSIONS")
+                    model_args+=(--fusion-stage "$FUSION_STAGE")
+                fi
+                CUDA_VISIBLE_DEVICES="$GPU" \
+                PYTHONHASHSEED="$SEED" \
+                CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+                PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+                    python -u "$REPO_ROOT/example/benchmark_md_gpu.py" \
+                        --backend "$BACKEND" \
+                        --structure "$structure" \
+                        --checkpoint "$CHECKPOINT" \
+                        --system "$system" \
+                        --output-dir "$OUTPUT_DIR" \
+                        --run-name "$run_name" \
+                        --steps "$STEPS" \
+                        --warmup-steps "$WARMUP_STEPS" \
+                        --temperature "$temperature" \
+                        --timestep 1.0 --taut 100.0 \
+                        --seed "$SEED" --repeat "$repeat" \
+                        --md-dtype float64 \
+                        --cg-probe-steps "$PROBE_STEPS" \
+                        --cg-capacity-margin "$NEIGHBOR_MARGIN" \
+                        --cg-edge-step 256 \
+                        --cg-dummy-atoms "$DUMMY_ATOMS" \
+                        --cg-capture-warmup "$CAPTURE_WARMUP" \
+                        --cg-replay-energy-atol 0.0 \
+                        --cg-replay-force-atol 1e-6 \
+                        --energy-per-atom-atol "$ENERGY_PER_ATOM_ATOL" \
+                        --force-max-atol "$FORCE_MAX_ATOL" \
+                        "${model_args[@]}" "${reference_args[@]}" \
+                    2>&1 | tee "$log_path"
+                exit_code=${PIPESTATUS[0]}
             else
-                benchmark_script="$REPO_ROOT/example/benchmark_md_opt3.py"
+                if [[ "$BACKEND" == *-kf1 || "$BACKEND" == *-opt4 ]]; then
+                    benchmark_script="$REPO_ROOT/example/benchmark_md_opt4.py"
+                else
+                    benchmark_script="$REPO_ROOT/example/benchmark_md_opt3.py"
+                fi
+                CUDA_VISIBLE_DEVICES="$GPU" \
+                PYTHONHASHSEED="$SEED" \
+                CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+                PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+                    python -u "$benchmark_script" \
+                        --backend "$BACKEND" \
+                        --structure "$structure" \
+                        --checkpoint "$CHECKPOINT" \
+                        --system "$system" \
+                        --output-dir "$OUTPUT_DIR" \
+                        --run-name "$run_name" \
+                        --steps "$STEPS" \
+                        --warmup-steps "$WARMUP_STEPS" \
+                        --temperature "$temperature" \
+                        --timestep 1.0 \
+                        --taut 100.0 \
+                        --seed "$SEED" \
+                        --repeat "$repeat" \
+                        --probe-steps "$PROBE_STEPS" \
+                        --neighbor-margin "$NEIGHBOR_MARGIN" \
+                        --neighbor-slot-step "$NEIGHBOR_SLOT_STEP" \
+                        --dummy-atoms "$DUMMY_ATOMS" \
+                        --capture-warmup "$CAPTURE_WARMUP" \
+                        --max-neighbors "$MAX_NEIGHBORS" \
+                        --degeneracy-tolerance "$DEGENERACY_TOLERANCE" \
+                        --energy-per-atom-atol "$ENERGY_PER_ATOM_ATOL" \
+                        --force-max-atol "$FORCE_MAX_ATOL" \
+                        --triton-block-size "$TRITON_BLOCK_SIZE" \
+                        --model-fusions "$MODEL_FUSIONS" \
+                        --fusion-stage "$FUSION_STAGE" \
+                        "${reference_args[@]}" \
+                    2>&1 | tee "$log_path"
+                exit_code=${PIPESTATUS[0]}
             fi
-            CUDA_VISIBLE_DEVICES="$GPU" \
-            PYTHONHASHSEED="$SEED" \
-            CUBLAS_WORKSPACE_CONFIG=:4096:8 \
-            PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
-                python -u "$benchmark_script" \
-                    --backend "$BACKEND" \
-                    --structure "$structure" \
-                    --checkpoint "$CHECKPOINT" \
-                    --system "$system" \
-                    --output-dir "$OUTPUT_DIR" \
-                    --run-name "$run_name" \
-                    --steps "$STEPS" \
-                    --warmup-steps "$WARMUP_STEPS" \
-                    --temperature "$temperature" \
-                    --timestep 1.0 \
-                    --taut 100.0 \
-                    --seed "$SEED" \
-                    --repeat "$repeat" \
-                    --probe-steps "$PROBE_STEPS" \
-                    --neighbor-margin "$NEIGHBOR_MARGIN" \
-                    --neighbor-slot-step "$NEIGHBOR_SLOT_STEP" \
-                    --dummy-atoms "$DUMMY_ATOMS" \
-                    --capture-warmup "$CAPTURE_WARMUP" \
-                    --max-neighbors "$MAX_NEIGHBORS" \
-                    --degeneracy-tolerance "$DEGENERACY_TOLERANCE" \
-                    --energy-per-atom-atol "$ENERGY_PER_ATOM_ATOL" \
-                    --force-max-atol "$FORCE_MAX_ATOL" \
-                    --triton-block-size "$TRITON_BLOCK_SIZE" \
-                    "${reference_args[@]}" \
-                2>&1 | tee "$log_path"
-            exit_code=${PIPESTATUS[0]}
             set -e
             end_ns=$(date +%s%N)
             process_wall_time=$(awk -v start="$start_ns" -v end="$end_ns" \
@@ -184,6 +237,10 @@ for system in "${systems[@]}"; do
                 'BENCHMARK_STATUS=validation_failed' "$log_path"; then
                 status=validation_failed
                 ((validation_failed_count += 1))
+            elif [[ $exit_code -eq 46 ]] || grep -Eqi \
+                'BENCHMARK_STATUS=unsupported_fusion_config' "$log_path"; then
+                status=unsupported_fusion_config
+                ((error_count += 1))
             else
                 status=error
                 ((error_count += 1))
@@ -198,7 +255,19 @@ for system in "${systems[@]}"; do
     done
 done
 
-if [[ "$BACKEND" == "whole-step-cg-kf1" ]]; then
+if [[ "$BACKEND" == "model-cg-opt4" ]]; then
+    record_backend=esen_gpu_resident_model_cg_opt4
+    report_prefix="model_cg_${FUSION_STAGE}_report"
+elif [[ "$BACKEND" == "model-cg" ]]; then
+    record_backend=esen_gpu_resident_model_cg
+    report_prefix=model_cg_report
+elif [[ "$BACKEND" == "whole-step-cg-opt4" ]]; then
+    record_backend=esen_gpu_resident_whole_step_cg_opt4
+    report_prefix="whole_step_cg_${FUSION_STAGE}_report"
+elif [[ "$BACKEND" == "fixed-builder-model-cg-opt4" ]]; then
+    record_backend=esen_gpu_resident_fixed_builder_model_cg_opt4
+    report_prefix="fixed_builder_model_cg_${FUSION_STAGE}_report"
+elif [[ "$BACKEND" == "whole-step-cg-kf1" ]]; then
     record_backend=esen_gpu_resident_whole_step_cg_kf1
     report_prefix=whole_step_cg_kf1_report
 elif [[ "$BACKEND" == "fixed-builder-model-cg-kf1" ]]; then

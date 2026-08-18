@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Benchmark GPU-resident eager or model-CUDA-Graph eSEN molecular dynamics.
 
-Neither backend uses ``torch.compile``, AMP, TF32, or custom kernel fusion.
+The original ``gpu-eager`` and ``model-cg`` backends do not use custom
+kernel fusion.  ``model-cg-opt4`` is a separate experimental backend that
+installs explicitly requested Triton model fusions on its private inference
+model instance before CUDA Graph capture.
 The timed region includes the initial force evaluation and the requested NVT
 MD steps, but excludes model loading, probing, capture, warm-up, validation,
 hashing, and I/O.
@@ -54,9 +57,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--backend",
-        choices=("gpu-eager", "model-cg"),
+        choices=("gpu-eager", "model-cg", "model-cg-opt4"),
         default="gpu-eager",
-        help="GPU-resident eager execution or model-only CUDA Graph replay",
+        help=(
+            "GPU-resident eager execution, the original model-only CUDA "
+            "Graph, or the independent Opt4 fused model-only CUDA Graph"
+        ),
     )
     parser.add_argument("--structure", type=Path, required=True)
     parser.add_argument(
@@ -106,6 +112,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cg-replay-force-atol", type=float, default=1e-6)
     parser.add_argument("--cg-eager-energy-atol", type=float, default=1e-8)
     parser.add_argument("--cg-eager-force-atol", type=float, default=2e-4)
+    parser.add_argument("--model-fusions", default="")
+    parser.add_argument("--fusion-stage", default="")
+    parser.add_argument("--energy-per-atom-atol", type=float, default=1e-5)
+    parser.add_argument("--force-max-atol", type=float, default=2e-4)
     args = parser.parse_args()
     if args.steps < 1:
         parser.error("--steps must be positive")
@@ -136,6 +146,15 @@ def parse_args() -> argparse.Namespace:
         or args.cg_eager_force_atol < 0
     ):
         parser.error("CUDA Graph validation tolerances must be non-negative")
+    if args.energy_per_atom_atol < 0 or args.force_max_atol < 0:
+        parser.error("Engineering validation tolerances must be non-negative")
+    if args.backend == "model-cg-opt4":
+        if not args.model_fusions.strip() or not args.fusion_stage.strip():
+            parser.error(
+                "model-cg-opt4 requires --model-fusions and --fusion-stage"
+            )
+    elif args.model_fusions.strip():
+        parser.error("--model-fusions is only valid for model-cg-opt4")
     return args
 
 
@@ -222,6 +241,17 @@ def main() -> int:
 
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+    model_cg_backend = args.backend in {"model-cg", "model-cg-opt4"}
+    opt4_backend = args.backend == "model-cg-opt4"
+    selected_model_fusions: tuple[str, ...] = ()
+    if opt4_backend:
+        from fairchem.core.applications.esen_opt4_model_fusion import (
+            parse_model_fusions,
+        )
+
+        selected_model_fusions = parse_model_fusions(args.model_fusions)
+        if not selected_model_fusions:
+            raise ValueError("model-cg-opt4 requires at least one model fusion")
 
     atoms = read(args.structure)
     expected_atoms = EXPECTED_ATOMS[args.system]
@@ -311,11 +341,15 @@ def main() -> int:
     official_force_validation_pass = None
     numerical_validation_failures: list[str] = []
 
-    if args.backend == "model-cg":
+    if model_cg_backend:
         from fairchem.core.applications.esen_cuda_graph import (
             ESENModelCUDAGraphEvaluator,
             edge_capacity_from_probe,
         )
+        if opt4_backend:
+            from fairchem.core.applications.esen_opt4_kernel_fusion import (
+                ESENOpt4ModelCUDAGraphEvaluator,
+            )
 
         setup_start = time.perf_counter()
         rng_state = capture_rng_state(torch)
@@ -354,13 +388,25 @@ def main() -> int:
         cg_eager_initial_energy = cg_eager_initial_energy.detach().clone()
         torch.cuda.synchronize()
 
-        model_cg_evaluator = ESENModelCUDAGraphEvaluator(
+        evaluator_class = (
+            ESENOpt4ModelCUDAGraphEvaluator
+            if opt4_backend
+            else ESENModelCUDAGraphEvaluator
+        )
+        evaluator_kwargs = {}
+        if opt4_backend:
+            evaluator_kwargs.update(
+                model_fusions=",".join(selected_model_fusions),
+                fusion_stage=args.fusion_stage,
+            )
+        model_cg_evaluator = evaluator_class(
             evaluator,
             edge_capacity=cg_edge_capacity,
             dummy_atoms=args.cg_dummy_atoms,
             capture_warmup=args.cg_capture_warmup,
             replay_energy_atol=args.cg_replay_energy_atol,
             replay_force_atol=args.cg_replay_force_atol,
+            **evaluator_kwargs,
         )
         model_cg_evaluator.capture(state.positions)
         if not model_cg_evaluator.replay_stability_passed:
@@ -402,22 +448,29 @@ def main() -> int:
                 initial_forces_device - cg_eager_initial_forces
             ).abs().max().item()
         )
-        cg_initial_validation_pass = bool(
-            cg_initial_energy_abs_error_eV <= args.cg_eager_energy_atol
-            and cg_initial_force_max_abs_error_eV_per_A
-            <= args.cg_eager_force_atol
+        initial_energy_atol = (
+            args.energy_per_atom_atol * len(atoms)
+            if opt4_backend
+            else args.cg_eager_energy_atol
         )
-        if cg_initial_energy_abs_error_eV > args.cg_eager_energy_atol:
+        initial_force_atol = (
+            args.force_max_atol if opt4_backend else args.cg_eager_force_atol
+        )
+        cg_initial_validation_pass = bool(
+            cg_initial_energy_abs_error_eV < initial_energy_atol
+            and cg_initial_force_max_abs_error_eV_per_A < initial_force_atol
+        )
+        if cg_initial_energy_abs_error_eV >= initial_energy_atol:
             numerical_validation_failures.append(
                 "Model CUDA Graph and GPU eager initial energies differ: "
                 f"error={cg_initial_energy_abs_error_eV}, "
-                f"atol={args.cg_eager_energy_atol}"
+                f"atol={initial_energy_atol}"
             )
-        if cg_initial_force_max_abs_error_eV_per_A > args.cg_eager_force_atol:
+        if cg_initial_force_max_abs_error_eV_per_A >= initial_force_atol:
             numerical_validation_failures.append(
                 "Model CUDA Graph and GPU eager initial forces differ: "
                 f"error={cg_initial_force_max_abs_error_eV_per_A}, "
-                f"atol={args.cg_eager_force_atol}"
+                f"atol={initial_force_atol}"
             )
 
     if args.validate_official:
@@ -525,12 +578,15 @@ def main() -> int:
     final_energy = float(state.potential_energy.item())
     final_max_force = float(state.forces.abs().max().item())
     final_temperature = float(integrator.temperature(state.momenta).item())
-    backend_name = (
-        "esen_gpu_resident_model_cg"
-        if args.backend == "model-cg"
-        else "esen_gpu_resident_eager"
-    )
-    backend_suffix = "esen_model_cg" if args.backend == "model-cg" else "esen_gpu_eager"
+    if opt4_backend:
+        backend_name = "esen_gpu_resident_model_cg_opt4"
+        backend_suffix = f"esen_model_cg_{args.fusion_stage}"
+    elif model_cg_backend:
+        backend_name = "esen_gpu_resident_model_cg"
+        backend_suffix = "esen_model_cg"
+    else:
+        backend_name = "esen_gpu_resident_eager"
+        backend_suffix = "esen_gpu_eager"
     run_name = args.run_name or (
         f"{args.system}_{args.temperature:g}K_{args.steps}step_{backend_suffix}"
     )
@@ -555,10 +611,20 @@ def main() -> int:
         "amp": False,
         "tf32": False,
         "torch_compile": False,
-        "cuda_graph": args.backend == "model-cg",
-        "cuda_graph_scope": "model_only" if args.backend == "model-cg" else "none",
-        "cuda_graph_neighbor_build_outside": args.backend == "model-cg",
-        "kernel_fusion": False,
+        "cuda_graph": model_cg_backend,
+        "cuda_graph_scope": "model_only" if model_cg_backend else "none",
+        "cuda_graph_neighbor_build_outside": model_cg_backend,
+        "kernel_fusion": opt4_backend,
+        "kernel_fusion_stage": (
+            args.fusion_stage if args.fusion_stage else "none"
+        ),
+        "kernel_fusion_name": (
+            ",".join(selected_model_fusions) if opt4_backend else "none"
+        ),
+        "model_fusions": (
+            ",".join(selected_model_fusions) if opt4_backend else ""
+        ),
+        "opt4_scope": "model-only" if opt4_backend else "none",
         "stress_computed": False,
         "activation_checkpointing": False,
         "gpu_resident_md": True,
@@ -590,6 +656,9 @@ def main() -> int:
         "fairchem_core_version": package_version("fairchem-core"),
         "ase_version": package_version("ase"),
         "repo_commit": git_commit(),
+        "source_bundle_sha256": os.environ.get(
+            "SOURCE_BUNDLE_SHA256", ""
+        ),
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_sha256": checkpoint_hash,
         "structure": str(args.structure.resolve()),
@@ -602,25 +671,35 @@ def main() -> int:
         "baseline_result_sha256": (
             "" if args.baseline_result is None else sha256(args.baseline_result)
         ),
-        "cg_probe_steps": args.cg_probe_steps if args.backend == "model-cg" else 0,
+        "cg_probe_steps": args.cg_probe_steps if model_cg_backend else 0,
         "cg_probe_max_edges": cg_probe_max_edges,
         "cg_capacity_margin": (
-            args.cg_capacity_margin if args.backend == "model-cg" else None
+            args.cg_capacity_margin if model_cg_backend else None
         ),
-        "cg_edge_step": args.cg_edge_step if args.backend == "model-cg" else None,
+        "cg_edge_step": args.cg_edge_step if model_cg_backend else None,
         "cg_edge_capacity": cg_edge_capacity,
         "cg_setup_wall_time_s": (
-            cg_setup_wall_time_s if args.backend == "model-cg" else None
+            cg_setup_wall_time_s if model_cg_backend else None
         ),
         "cg_initial_energy_abs_error_eV": cg_initial_energy_abs_error_eV,
         "cg_initial_validation_pass": cg_initial_validation_pass,
-        "cg_eager_energy_atol_eV": args.cg_eager_energy_atol,
+        "cg_eager_energy_atol_eV": (
+            args.energy_per_atom_atol * len(atoms)
+            if opt4_backend
+            else args.cg_eager_energy_atol
+        ),
         "cg_replay_energy_atol_eV": args.cg_replay_energy_atol,
         "cg_replay_force_atol_eV_per_A": args.cg_replay_force_atol,
         "cg_initial_force_max_abs_error_eV_per_A": (
             cg_initial_force_max_abs_error_eV_per_A
         ),
-        "cg_eager_force_atol_eV_per_A": args.cg_eager_force_atol,
+        "cg_eager_force_atol_eV_per_A": (
+            args.force_max_atol
+            if opt4_backend
+            else args.cg_eager_force_atol
+        ),
+        "engineering_energy_per_atom_atol_eV": args.energy_per_atom_atol,
+        "engineering_force_max_atol_eV_per_A": args.force_max_atol,
         "official_initial_energy_abs_error_eV": official_energy_abs_error_eV,
         "official_initial_force_max_abs_error_eV_per_A": (
             official_force_max_abs_error_eV_per_A
@@ -634,8 +713,27 @@ def main() -> int:
     }
     if cg_stats is not None:
         record.update(cg_stats)
+        graph_invariants_pass = bool(
+            int(cg_stats.get("cuda_graph_capture_count", 0)) == 1
+            and int(cg_stats.get("cuda_graph_production_capture_count", 0)) == 0
+            and int(cg_stats.get("cuda_graph_production_replays", 0))
+            == args.steps + 1
+            and int(cg_stats.get("cuda_graph_capacity_misses", 0)) == 0
+            and float(cg_stats.get("cuda_graph_hit_rate", 0.0)) == 1.0
+            and bool(
+                cg_stats.get("cuda_graph_replay_output_addresses_stable", False)
+            )
+        )
+    else:
+        graph_invariants_pass = None
+    record["graph_invariants_pass"] = graph_invariants_pass
+    if opt4_backend and graph_invariants_pass is False:
+        numerical_validation_failures.append(
+            "Opt4 model-only CUDA Graph replay invariants failed"
+        )
     record.update(checkpoint_energy_fields(checkpoint_energies))
     validation_pass: bool | None = None
+    engineering_energy_pass: bool | None = None
     if baseline_reference is None:
         record["energy_validation_status"] = (
             "missing_reference"
@@ -643,19 +741,74 @@ def main() -> int:
             else "not_requested"
         )
         record["energy_validation_pass"] = None
+        for step in (1, 50, 100, 1000):
+            record[f"energy_abs_error_step_{step}_eV_per_atom"] = None
     else:
         validation_fields, validation_pass = compare_checkpoint_energies(
             checkpoint_energies, baseline_reference
         )
         record.update(validation_fields)
-        record["energy_validation_status"] = (
-            "passed" if validation_pass else "failed"
-        )
-        if not validation_pass:
-            numerical_validation_failures.append(
-                "Trajectory energy validation failed at the 1-step or "
-                "50-step checkpoint"
+        record["legacy_energy_validation_pass"] = validation_pass
+        for step in (1, 50, 100, 1000):
+            error_value = record.get(f"energy_abs_error_step_{step}_eV")
+            record[f"energy_abs_error_step_{step}_eV_per_atom"] = (
+                None if error_value is None else float(error_value) / len(atoms)
             )
+        required_engineering_errors = [
+            record.get(f"energy_abs_error_step_{step}_eV_per_atom")
+            for step in (1, 50)
+            if step <= args.steps
+        ]
+        engineering_energy_pass = bool(
+            all(value is not None for value in required_engineering_errors)
+            and all(
+                float(value) < args.energy_per_atom_atol
+                for value in required_engineering_errors
+            )
+        )
+        record["engineering_energy_validation_pass"] = (
+            engineering_energy_pass
+        )
+        if opt4_backend:
+            record["energy_validation_status"] = (
+                "passed" if engineering_energy_pass else "failed"
+            )
+            if not engineering_energy_pass:
+                numerical_validation_failures.append(
+                    "Trajectory energy validation failed the Opt4 "
+                    "1e-5 eV/atom engineering threshold at step 1 or 50"
+                )
+        else:
+            record["energy_validation_status"] = (
+                "passed" if validation_pass else "failed"
+            )
+            if not validation_pass:
+                numerical_validation_failures.append(
+                    "Trajectory energy validation failed at the 1-step or "
+                    "50-step checkpoint"
+                )
+
+    engineering_force_pass = (
+        None
+        if cg_initial_force_max_abs_error_eV_per_A is None
+        else cg_initial_force_max_abs_error_eV_per_A < args.force_max_atol
+    )
+    record["engineering_force_validation_pass"] = engineering_force_pass
+    engineering_validation_pass = (
+        None
+        if engineering_energy_pass is None or engineering_force_pass is None
+        else bool(
+            engineering_energy_pass
+            and engineering_force_pass
+            and graph_invariants_pass is not False
+        )
+    )
+    record["engineering_validation_pass"] = engineering_validation_pass
+    record["engineering_validation_status"] = (
+        "missing_reference"
+        if engineering_validation_pass is None
+        else ("passed" if engineering_validation_pass else "failed")
+    )
 
     record["numerical_validation_pass"] = not numerical_validation_failures
     record["numerical_validation_status"] = (
@@ -693,6 +846,12 @@ def entrypoint() -> int:
         if exc.__class__.__name__ == "CUDAGraphValidationError":
             print(f"BENCHMARK_STATUS=validation_failed: {exc}", file=sys.stderr)
             return 43
+        if exc.__class__.__name__ == "UnsupportedFusionConfigError":
+            print(
+                f"BENCHMARK_STATUS=unsupported_fusion_config: {exc}",
+                file=sys.stderr,
+            )
+            return 46
         raise
 
 

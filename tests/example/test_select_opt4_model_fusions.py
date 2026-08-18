@@ -1,0 +1,152 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+
+
+SCRIPT = Path(__file__).parents[2] / "example" / "select_opt4_model_fusions.py"
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("select_opt4_model_fusions", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _record(
+    stage: str,
+    repeat: int,
+    seconds: float,
+    *,
+    scope: str = "whole-step",
+) -> dict[str, object]:
+    if scope == "model-only":
+        base_backend = "esen_gpu_resident_model_cg"
+        fused_backend = "esen_gpu_resident_model_cg_opt4"
+    else:
+        base_backend = "esen_gpu_resident_whole_step_cg"
+        fused_backend = "esen_gpu_resident_whole_step_cg_opt4"
+    return {
+        "backend": base_backend if stage.endswith("_base") else fused_backend,
+        "kernel_fusion_stage": stage,
+        "system": "Cu32",
+        "temperature_K": 300,
+        "repeat": repeat,
+        "seconds_per_step": seconds,
+        "engineering_validation_pass": True,
+        "graph_invariants_pass": True,
+        "cuda_graph_capacity_misses": 0,
+        "cuda_graph_capture_count": 1,
+    }
+
+
+def _write_status_tsv(root: Path, scope: str, stage: str, status: str) -> None:
+    header = (
+        "scope\tvariant\tfusion_stage\tmodel_fusions\tsystem\t"
+        "temperature_K\trepeat\trun_name\tstatus\texit_code\t"
+        "process_wall_time_s\n"
+    )
+    rows = [
+        f"{scope}\tcandidate\t{stage}\tgather-wigner\tCu32\t300\t{repeat}\t"
+        f"run_{repeat}\t{status}\t0\t1.0\n"
+        for repeat in range(1, 6)
+    ]
+    (root / "run_status.tsv").write_text(header + "".join(rows), encoding="utf-8")
+
+
+def test_selector_accepts_stable_candidate_despite_validation_status(
+    tmp_path, monkeypatch
+):
+    # Energy/force-vs-baseline errors are telemetry only: a validation_failed
+    # shell status must not block a structurally healthy, stably faster
+    # candidate under the current acceptance policy.
+    module = _load_module()
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    for repeat in range(1, 6):
+        records = (
+            _record("KF2_base", repeat, 1.0),
+            _record("KF2", repeat, 0.98),
+        )
+        for index, record in enumerate(records):
+            (result_dir / f"{repeat}_{index}.json").write_text(
+                json.dumps(record), encoding="utf-8"
+            )
+    _write_status_tsv(tmp_path, "whole-step", "KF2", "validation_failed")
+    output = tmp_path / "selection.json"
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        [
+            str(SCRIPT), "--input-dir", str(tmp_path),
+            "--scope", "whole-step",
+            "--base-stage", "KF2_base", "--candidate-stage", "KF2",
+            "--candidate-fusion", "gather-wigner", "--output", str(output),
+        ],
+    )
+    assert module.main() == 0
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["accepted"] is True
+    assert result["accepted_after"] == ["gather-wigner"]
+
+
+def test_selector_rejects_regression(tmp_path, monkeypatch):
+    module = _load_module()
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    for repeat in range(1, 6):
+        for index, record in enumerate(
+            (_record("KF3_base", repeat, 1.0), _record("KF3", repeat, 1.02))
+        ):
+            (result_dir / f"{repeat}_{index}.json").write_text(
+                json.dumps(record), encoding="utf-8"
+            )
+    output = tmp_path / "selection.json"
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        [
+            str(SCRIPT), "--input-dir", str(tmp_path),
+            "--scope", "whole-step",
+            "--base-stage", "KF3_base", "--candidate-stage", "KF3",
+            "--candidate-fusion", "reverse-scatter", "--output", str(output),
+        ],
+    )
+    assert module.main() == 1
+    assert json.loads(output.read_text(encoding="utf-8"))["accepted"] is False
+
+
+def test_selector_supports_model_only_scope(tmp_path, monkeypatch):
+    module = _load_module()
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    for repeat in range(1, 6):
+        for index, record in enumerate(
+            (
+                _record(
+                    "KF2_base", repeat, 1.0, scope="model-only"
+                ),
+                _record("KF2", repeat, 0.98, scope="model-only"),
+            )
+        ):
+            (result_dir / f"{repeat}_{index}.json").write_text(
+                json.dumps(record), encoding="utf-8"
+            )
+    output = tmp_path / "selection.json"
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        [
+            str(SCRIPT), "--input-dir", str(tmp_path),
+            "--scope", "model-only",
+            "--base-stage", "KF2_base", "--candidate-stage", "KF2",
+            "--candidate-fusion", "gather-wigner", "--output", str(output),
+        ],
+    )
+    assert module.main() == 0
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["scope"] == "model-only"
+    assert result["accepted"] is True

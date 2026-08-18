@@ -21,10 +21,17 @@ from fairchem.core.applications.esen_gpu_md import (
     GPUIntegrator,
     GPUMDState,
 )
+from fairchem.core.applications.esen_cuda_graph import (
+    ESENModelCUDAGraphEvaluator,
+)
 from fairchem.core.applications.esen_whole_step_cuda_graph import (
     ESENFixedBuilderModelCUDAGraphEvaluator,
     ESENWholeStepCUDAGraphMD,
     _pbc_vector,
+)
+from fairchem.core.applications.esen_opt4_model_fusion import (
+    FusionMetadata,
+    configure_esen_30m_model_fusions,
 )
 
 try:
@@ -399,3 +406,114 @@ class ESENKF1WholeStepCUDAGraphMD(ESENWholeStepCUDAGraphMD):
             degeneracy_tolerance=degeneracy_tolerance,
             triton_block_size=triton_block_size,
         )
+
+
+class _Opt4ModelFusionStats:
+    fusion_metadata: FusionMetadata
+    fusion_stage: str
+
+    def _fusion_stats(self) -> dict[str, Any]:
+        record = self.fusion_metadata.as_dict()
+        record.update(
+            {
+                "kernel_fusion": True,
+                "kernel_fusion_stage": self.fusion_stage,
+                "kernel_fusion_name": record["model_fusions"],
+            }
+        )
+        return record
+
+
+class ESENOpt4ModelCUDAGraphEvaluator(
+    _Opt4ModelFusionStats, ESENModelCUDAGraphEvaluator
+):
+    """Opt2 dynamic-builder/model-CG with selected 30M model fusions."""
+
+    def __init__(
+        self,
+        eager_evaluator: ESENEnergyForceEvaluator,
+        *,
+        model_fusions: str,
+        fusion_stage: str,
+        **kwargs,
+    ) -> None:
+        self.fusion_metadata = configure_esen_30m_model_fusions(
+            eager_evaluator.model, model_fusions
+        )
+        self.fusion_stage = str(fusion_stage)
+        super().__init__(eager_evaluator, **kwargs)
+
+    def stats(self) -> dict[str, Any]:
+        record = super().stats()
+        record.update(self._fusion_stats())
+        record.update(
+            {
+                "opt4_scope": "model-only",
+                "fixed_builder_distance_backend": "not_applicable",
+            }
+        )
+        return record
+
+
+class ESENOpt4FixedBuilderModelCUDAGraphEvaluator(
+    _Opt4ModelFusionStats, ESENFixedBuilderModelCUDAGraphEvaluator
+):
+    """Opt3 fixed-builder/model-CG with selected 30M model fusions."""
+
+    def __init__(
+        self,
+        eager_evaluator: ESENEnergyForceEvaluator,
+        *,
+        model_fusions: str,
+        fusion_stage: str,
+        **kwargs,
+    ) -> None:
+        self.fusion_metadata = configure_esen_30m_model_fusions(
+            eager_evaluator.model, model_fusions
+        )
+        self.fusion_stage = str(fusion_stage)
+        super().__init__(eager_evaluator, **kwargs)
+
+    def stats(self) -> dict[str, Any]:
+        record = super().stats()
+        record.update(self._fusion_stats())
+        record.update(
+            {
+                "opt4_scope": "fixed-builder-model-only",
+                "fixed_builder_distance_backend": "torch",
+            }
+        )
+        return record
+
+
+class ESENOpt4WholeStepCUDAGraphMD(
+    _Opt4ModelFusionStats, ESENWholeStepCUDAGraphMD
+):
+    """Opt3 whole-step graph with selected 30M model fusions."""
+
+    def __init__(
+        self,
+        state: GPUMDState,
+        eager_evaluator: ESENEnergyForceEvaluator,
+        integrator: GPUIntegrator,
+        *,
+        model_fusions: str,
+        fusion_stage: str,
+        **kwargs,
+    ) -> None:
+        self.fusion_metadata = configure_esen_30m_model_fusions(
+            eager_evaluator.model, model_fusions
+        )
+        self.fusion_stage = str(fusion_stage)
+        super().__init__(state, eager_evaluator, integrator, **kwargs)
+
+    def stats(self) -> dict[str, Any]:
+        record = super().stats()
+        record.update(self._fusion_stats())
+        record.update(
+            {
+                "opt4_scope": "whole-step",
+                "fixed_builder_distance_backend": "torch",
+            }
+        )
+        return record

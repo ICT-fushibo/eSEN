@@ -2,7 +2,7 @@
 """Opt4-only entry point for eSEN kernel-fusion benchmarks.
 
 The implementation reuses the validated Opt3 measurement and validation
-pipeline, but only permits explicitly named KF1 backends.  Baseline through
+pipeline, but only permits explicitly named Opt4 backends.  Baseline through
 Opt3 backend behavior remains available through their original scripts.
 """
 
@@ -14,8 +14,11 @@ from benchmark_md_opt3 import entrypoint
 
 
 ALLOWED_BACKENDS = {
+    "whole-step-cg",
     "fixed-builder-model-cg-kf1",
     "whole-step-cg-kf1",
+    "fixed-builder-model-cg-opt4",
+    "whole-step-cg-opt4",
 }
 
 

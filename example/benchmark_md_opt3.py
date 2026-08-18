@@ -50,6 +50,8 @@ def parse_args() -> argparse.Namespace:
             "whole-step-cg",
             "fixed-builder-model-cg-kf1",
             "whole-step-cg-kf1",
+            "fixed-builder-model-cg-opt4",
+            "whole-step-cg-opt4",
         ),
         required=True,
     )
@@ -81,6 +83,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay-energy-atol", type=float, default=0.0)
     parser.add_argument("--replay-force-atol", type=float, default=1e-6)
     parser.add_argument("--triton-block-size", type=int, default=256)
+    parser.add_argument("--model-fusions", default="")
+    parser.add_argument("--fusion-stage", default="")
     parser.add_argument("--md-dtype", choices=("float64",), default="float64")
     args = parser.parse_args()
     if args.steps < 1 or args.warmup_steps < 0 or args.probe_steps < 0:
@@ -180,6 +184,11 @@ def main() -> int:
     from fairchem.core.applications.esen_opt4_kernel_fusion import (
         ESENKF1FixedBuilderModelCUDAGraphEvaluator,
         ESENKF1WholeStepCUDAGraphMD,
+        ESENOpt4FixedBuilderModelCUDAGraphEvaluator,
+        ESENOpt4WholeStepCUDAGraphMD,
+    )
+    from fairchem.core.applications.esen_opt4_model_fusion import (
+        parse_model_fusions,
     )
 
     if not torch.cuda.is_available():
@@ -191,6 +200,14 @@ def main() -> int:
     torch.backends.cudnn.allow_tf32 = False
     fixed_builder_backend = args.backend.startswith("fixed-builder-model-cg")
     kf1_backend = args.backend.endswith("-kf1")
+    opt4_backend = args.backend.endswith("-opt4")
+    selected_model_fusions = parse_model_fusions(args.model_fusions)
+    if opt4_backend and not selected_model_fusions:
+        raise ValueError("Opt4 backend requires at least one --model-fusions item")
+    if not opt4_backend and selected_model_fusions:
+        raise ValueError("--model-fusions is only valid for an Opt4 backend")
+    if opt4_backend and not args.fusion_stage:
+        raise ValueError("Opt4 backend requires --fusion-stage")
 
     atoms = read(args.structure)
     if len(atoms) != EXPECTED_ATOMS[args.system]:
@@ -294,14 +311,20 @@ def main() -> int:
     fixed_evaluator = None
     whole_md = None
     if fixed_builder_backend:
-        evaluator_class = (
-            ESENKF1FixedBuilderModelCUDAGraphEvaluator
-            if kf1_backend
-            else ESENFixedBuilderModelCUDAGraphEvaluator
-        )
+        if kf1_backend:
+            evaluator_class = ESENKF1FixedBuilderModelCUDAGraphEvaluator
+        elif opt4_backend:
+            evaluator_class = ESENOpt4FixedBuilderModelCUDAGraphEvaluator
+        else:
+            evaluator_class = ESENFixedBuilderModelCUDAGraphEvaluator
         fixed_kwargs = {}
         if kf1_backend:
             fixed_kwargs["triton_block_size"] = args.triton_block_size
+        if opt4_backend:
+            fixed_kwargs.update(
+                model_fusions=",".join(selected_model_fusions),
+                fusion_stage=args.fusion_stage,
+            )
         fixed_evaluator = evaluator_class(
             evaluator,
             neighbors_per_atom=neighbor_capacity,
@@ -317,14 +340,20 @@ def main() -> int:
         fixed_evaluator.capture(state.positions)
         dynamics = GPUResidentMD(state, fixed_evaluator, integrator)
     else:
-        whole_class = (
-            ESENKF1WholeStepCUDAGraphMD
-            if kf1_backend
-            else ESENWholeStepCUDAGraphMD
-        )
+        if kf1_backend:
+            whole_class = ESENKF1WholeStepCUDAGraphMD
+        elif opt4_backend:
+            whole_class = ESENOpt4WholeStepCUDAGraphMD
+        else:
+            whole_class = ESENWholeStepCUDAGraphMD
         whole_kwargs = {}
         if kf1_backend:
             whole_kwargs["triton_block_size"] = args.triton_block_size
+        if opt4_backend:
+            whole_kwargs.update(
+                model_fusions=",".join(selected_model_fusions),
+                fusion_stage=args.fusion_stage,
+            )
         whole_md = whole_class(
             state,
             evaluator,
@@ -482,23 +511,25 @@ def main() -> int:
         numerical_failures.append("CUDA Graph replay invariants failed")
 
     if fixed_builder_backend:
-        backend_name = (
-            "esen_gpu_resident_fixed_builder_model_cg_kf1"
-            if kf1_backend
-            else "esen_gpu_resident_fixed_builder_model_cg"
-        )
-        suffix = (
-            "esen_fixed_builder_model_cg_kf1"
-            if kf1_backend
-            else "esen_fixed_builder_model_cg"
-        )
+        if kf1_backend:
+            backend_name = "esen_gpu_resident_fixed_builder_model_cg_kf1"
+            suffix = "esen_fixed_builder_model_cg_kf1"
+        elif opt4_backend:
+            backend_name = "esen_gpu_resident_fixed_builder_model_cg_opt4"
+            suffix = f"esen_fixed_builder_model_cg_{args.fusion_stage}"
+        else:
+            backend_name = "esen_gpu_resident_fixed_builder_model_cg"
+            suffix = "esen_fixed_builder_model_cg"
     else:
-        backend_name = (
-            "esen_gpu_resident_whole_step_cg_kf1"
-            if kf1_backend
-            else "esen_gpu_resident_whole_step_cg"
-        )
-        suffix = "esen_whole_step_cg_kf1" if kf1_backend else "esen_whole_step_cg"
+        if kf1_backend:
+            backend_name = "esen_gpu_resident_whole_step_cg_kf1"
+            suffix = "esen_whole_step_cg_kf1"
+        elif opt4_backend:
+            backend_name = "esen_gpu_resident_whole_step_cg_opt4"
+            suffix = f"esen_whole_step_cg_{args.fusion_stage}"
+        else:
+            backend_name = "esen_gpu_resident_whole_step_cg"
+            suffix = "esen_whole_step_cg"
     run_name = args.run_name or (
         f"{args.system}_{args.temperature:g}K_{args.steps}step_{suffix}"
     )
@@ -520,11 +551,16 @@ def main() -> int:
         "amp": False,
         "tf32": False,
         "torch_compile": False,
-        "kernel_fusion": kf1_backend,
-        "kernel_fusion_stage": "KF1" if kf1_backend else "KF0",
-        "kernel_fusion_name": (
-            "triton_pbc_distance_cutoff_mask" if kf1_backend else "none"
+        "kernel_fusion": kf1_backend or opt4_backend,
+        "kernel_fusion_stage": (
+            "KF1" if kf1_backend else (args.fusion_stage if opt4_backend else "KF0")
         ),
+        "kernel_fusion_name": (
+            "triton_pbc_distance_cutoff_mask"
+            if kf1_backend
+            else (",".join(selected_model_fusions) if opt4_backend else "none")
+        ),
+        "model_fusions": ",".join(selected_model_fusions),
         "triton_block_size": (
             args.triton_block_size if kf1_backend else None
         ),
@@ -648,6 +684,9 @@ def main() -> int:
         "fairchem_core_version": package_version("fairchem-core"),
         "ase_version": package_version("ase"),
         "repo_commit": git_commit(),
+        "source_bundle_sha256": os.environ.get(
+            "SOURCE_BUNDLE_SHA256", ""
+        ),
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_sha256": checkpoint_hash,
         "structure": str(args.structure.resolve()),
@@ -706,6 +745,12 @@ def entrypoint() -> int:
         if exc.__class__.__name__ == "OutOfMemoryError" or "out of memory" in message:
             print(f"BENCHMARK_STATUS=oom: {exc}", file=sys.stderr)
             return 42
+        if exc.__class__.__name__ == "UnsupportedFusionConfigError":
+            print(
+                f"BENCHMARK_STATUS=unsupported_fusion_config: {exc}",
+                file=sys.stderr,
+            )
+            return 46
         raise
 
 
