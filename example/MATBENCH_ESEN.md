@@ -41,13 +41,20 @@ directories.  The launcher never starts or stops MPS; it only sets
 For a directly comparable speedup report, run all four backends in one process
 and one output directory.  Each backend is still initialized and recorded as an
 independent run; the runner releases the previous system's model/cache before
-continuing after OOM or capacity failure:
+continuing after OOM or capacity failure. `--save-dir` is an alias for
+`--output-dir` and is the explicit persistence interface:
 
 ```bash
 GPU=2 BACKENDS='baseline opt1 opt2 opt3' \
-  OUTPUT_DIR=/public-data/fushibo/eSEN/example/md_out/matbench_all_gpu2 \
+  SAVE_DIR=/public-data/fushibo/eSEN/example/md_out/matbench_all_gpu2 \
   bash example/run_esen_matbench.sh
 ```
+
+For multiple GPUs, `run_esen_matbench_8gpu.sh` polls the GPU pool and assigns
+one system per job. All four backends for that system remain on the same
+physical GPU, and each system is saved below `<SAVE_DIR>/systems/<system>`.
+The queue writes `matbench_esen_queue_report.{json,md}` after pending jobs
+finish.
 
 If a backend must be isolated in a separate process, set `BACKEND=opt3` (or
 another single value) and use a unique output directory.  Combine those reports

@@ -102,6 +102,17 @@ def _scope_choices(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(requested))
 
 
+def _stage_choices(value: str) -> tuple[tuple[str, str], ...]:
+    by_name = dict(STAGES)
+    requested = _split(value)
+    if not requested:
+        raise ValueError("OPT4_STAGES must contain at least one stage")
+    unknown = [name for name in requested if name not in by_name]
+    if unknown:
+        raise ValueError("unknown Opt4 stage(s): " + ", ".join(unknown))
+    return tuple((name, by_name[name]) for name in dict.fromkeys(requested))
+
+
 def _hash_shuffle(scope: str, stage: str, system: str, temperature: str, repeat: int) -> list[str]:
     salt = f"42|{stage}|{scope}|{system}|{temperature}|{repeat}"
     seed = int.from_bytes(hashlib.sha256(salt.encode()).digest()[:8], "big")
@@ -212,6 +223,9 @@ class Config:
     memory_limit_mib: int
     utilization_limit: int
     scopes: tuple[str, ...]
+    stages: tuple[tuple[str, str], ...]
+    focus_systems: list[str]
+    initial_accepted: dict[str, tuple[str, ...]]
     python: str
 
     @classmethod
@@ -245,6 +259,18 @@ class Config:
             memory_limit_mib=_env_int("GPU_IDLE_MEMORY_MIB", 1024),
             utilization_limit=_env_int("GPU_IDLE_UTILIZATION_PERCENT", 5),
             scopes=_scope_choices(_env("SCOPES", "both")),
+            stages=_stage_choices(
+                _env("OPT4_STAGES", "KF2 KF3 KF4 KF5 KF6 KF7 KF8")
+            ),
+            focus_systems=_split(_env("OPT4_FOCUS_SYSTEMS", "")),
+            initial_accepted={
+                "model-only": tuple(
+                    _split(_env("INITIAL_ACCEPTED_MODEL_ONLY", ""))
+                ),
+                "whole-step": tuple(
+                    _split(_env("INITIAL_ACCEPTED_WHOLE_STEP", ""))
+                ),
+            },
             python=sys.executable,
         )
 
@@ -599,6 +625,8 @@ class QueueScheduler:
             "--min-faster-directions", str(self.config.min_faster),
             "--output", str(selection_path),
         ]
+        if self.config.focus_systems:
+            command.extend(["--focus-systems", *self.config.focus_systems])
         completed = subprocess.run(
             command,
             cwd=str(self.config.repo_root),
@@ -628,13 +656,13 @@ class QueueScheduler:
             self.config.root_output / "queue_metadata.json",
             {
                 "scopes": self.config.scopes,
-                "stages": [stage for stage, _ in STAGES],
+                "stages": [stage for stage, _ in self.config.stages],
                 "systems": self.config.systems,
                 "temperatures": self.config.temperatures,
                 "steps": self.config.steps,
                 "repeats": self.config.repeats,
                 "expected_task_count": len(self.config.scopes)
-                * len(STAGES)
+                * len(self.config.stages)
                 * 2
                 * len(self.config.systems)
                 * len(self.config.temperatures)
@@ -644,12 +672,23 @@ class QueueScheduler:
                 "gpu_poll_seconds": self.config.poll_seconds,
                 "gpu_idle_memory_mib": self.config.memory_limit_mib,
                 "gpu_idle_utilization_percent": self.config.utilization_limit,
+                "focus_systems": self.config.focus_systems,
+                "initial_accepted": {
+                    scope: list(self.config.initial_accepted.get(scope, ()))
+                    for scope in self.config.scopes
+                },
                 "repo_root": str(self.config.repo_root),
             },
         )
-        accepted = {scope: tuple() for scope in self.config.scopes}
-        final_stage = {scope: "KF0" for scope in self.config.scopes}
-        for stage, candidate_fusion in STAGES:
+        accepted = {
+            scope: self.config.initial_accepted.get(scope, tuple())
+            for scope in self.config.scopes
+        }
+        final_stage = {
+            scope: ("KF4" if accepted[scope] == ("rmsnorm",) else "KF0")
+            for scope in self.config.scopes
+        }
+        for stage, candidate_fusion in self.config.stages:
             tasks = self._make_round_tasks(stage, candidate_fusion, accepted)
             self._write_round_metadata(stage, candidate_fusion, accepted, len(tasks))
             self.run_tasks(tasks)
@@ -698,7 +737,7 @@ def main() -> int:
 
     expected = (
         len(config.scopes)
-        * len(STAGES)
+        * len(config.stages)
         * 2
         * len(config.systems)
         * len(config.temperatures)

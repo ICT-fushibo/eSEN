@@ -57,7 +57,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--matbench-repo", type=Path, default=DEFAULT_MATBENCH_REPO)
     parser.add_argument("--published-yaml", type=Path)
     parser.add_argument("--systems", nargs="*")
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output-dir",
+        "--save-dir",
+        dest="output_dir",
+        type=Path,
+        required=True,
+        help="Directory for JSON, HDF5 trajectories, metrics, and logs",
+    )
     parser.add_argument("--gpu", help="Physical GPU index; normally use CUDA_VISIBLE_DEVICES")
     parser.add_argument("--steps", type=int, default=STEPS)
     parser.add_argument("--record-interval", type=int, default=RECORD_INTERVAL)

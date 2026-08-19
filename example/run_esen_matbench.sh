@@ -28,7 +28,10 @@ SEED=${SEED:-0}
 REFERENCE_H5=${REFERENCE_H5:-"$ROOT_DEFAULT/matbench-discovery-data/md/2026-06-29-dynamat-v1.0-reference-trajectories.h5"}
 MATBENCH_REPO=${MATBENCH_REPO:-"$ROOT_DEFAULT/matbench-discovery"}
 CHECKPOINT=${CHECKPOINT:-"$REPO_ROOT/esen_30m_oam.pt"}
-OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/example/md_out/matbench_${BACKENDS// /_}_$(date '+%Y%m%d_%H%M%S')"}
+# SAVE_DIR is the explicit persistence interface.  OUTPUT_DIR remains a
+# backwards-compatible alias; SAVE_DIR wins when both are supplied.
+SAVE_DIR=${SAVE_DIR:-${OUTPUT_DIR:-"$REPO_ROOT/example/md_out/matbench_${BACKENDS// /_}_$(date '+%Y%m%d_%H%M%S')"}}
+OUTPUT_DIR=$SAVE_DIR
 PROBE_STEPS=${PROBE_STEPS:-50}
 NEIGHBOR_MARGIN=${NEIGHBOR_MARGIN:-0.10}
 NEIGHBOR_SLOT_STEP=${NEIGHBOR_SLOT_STEP:-8}
@@ -54,14 +57,14 @@ if [[ ! -f "$CHECKPOINT" ]]; then
     exit 2
 fi
 
-mkdir -p "$OUTPUT_DIR"
+mkdir -p "$SAVE_DIR"
 read -r -a backends_array <<< "$BACKENDS"
 args=(
     --backend "${backends_array[@]}"
     --reference-h5 "$REFERENCE_H5"
     --checkpoint "$CHECKPOINT"
     --matbench-repo "$MATBENCH_REPO"
-    --output-dir "$OUTPUT_DIR"
+    --save-dir "$SAVE_DIR"
     --gpu "$GPU"
     --steps "$STEPS"
     --record-interval "$RECORD_INTERVAL"
@@ -96,5 +99,5 @@ export PYTHONPATH="$REPO_ROOT/src:$MATBENCH_REPO:$ROOT_DEFAULT${PYTHONPATH:+:$PY
 LOG_NAME=${BACKENDS// /_}
 
 python -u "$REPO_ROOT/example/run_esen_matbench.py" "${args[@]}" \
-    2>&1 | tee "$OUTPUT_DIR/${LOG_NAME}.log"
+    2>&1 | tee "$SAVE_DIR/${LOG_NAME}.log"
 exit "${PIPESTATUS[0]}"
