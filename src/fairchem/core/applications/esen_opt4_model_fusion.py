@@ -1415,7 +1415,14 @@ class _FusedRadialMLP(torch.autograd.Function):
         scratch_g_h1 = torch.empty_like(save_a1)
         rows = x.shape[0]
         if rows > 0:
-            grid = (triton.cdiv(rows, 16),)
+            # The backward path keeps several [BLOCK_R, hidden] dot
+            # accumulators live at once.  BLOCK_R=16/BLOCK_O=256 exceeds the
+            # H100 shared-memory limit for the 30M radial heads (the forward
+            # tile remains unchanged).  Use a smaller capture-safe tile; the
+            # loop covers the same rows/output channels and preserves math.
+            backward_block_r = 8
+            backward_block_o = 64
+            grid = (triton.cdiv(rows, backward_block_r),)
             _radial_mlp_backward_kernel[grid](
                 grad_out,
                 save_a1, save_hhat1, save_rstd1,
@@ -1424,7 +1431,10 @@ class _FusedRadialMLP(torch.autograd.Function):
                 scratch_g_h2, scratch_g_h1, grad_x,
                 rows=rows, in_ch=ctx.in_ch, h1_ch=ctx.h1_ch, h2_ch=ctx.h2_ch,
                 out_ch=ctx.out_ch,
-                BLOCK_R=16, BLOCK_K=32, BLOCK_O=256, num_warps=4,
+                BLOCK_R=backward_block_r,
+                BLOCK_K=32,
+                BLOCK_O=backward_block_o,
+                num_warps=2,
             )
         return grad_x, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
