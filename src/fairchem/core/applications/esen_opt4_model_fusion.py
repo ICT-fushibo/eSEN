@@ -1138,8 +1138,8 @@ if triton is not None:
         for k0 in range(0, channels, BLOCK_K):
             k = k0 + tl.arange(0, BLOCK_K)
             gn_t = tl.load(
-                scratch_g_a1_ptr + r[:, None] * channels + k[None, :],
-                mask=rmask[:, None] & (k[None, :] < channels),
+                scratch_g_a1_ptr + r[:, None] * channels + j[None, :],
+                mask=rmask[:, None],
                 other=0.0,
             )
             w_t = tl.load(
@@ -1147,7 +1147,12 @@ if triton is not None:
                 mask=(j[:, None] < channels) & (k[None, :] < channels),
                 other=0.0,
             )
-            acc = tl.dot(gn_t, tl.trans(w_t), input_precision="ieee")
+            # g_x[r, k] = sum_j g_a1[r, j] * W1[j, k].  The previous
+            # implementation loaded a [R, BLOCK_K] slice of g_a1 and formed
+            # a [R, channels] result, then attempted to store it into a
+            # [R, BLOCK_K] tile.  Load all output channels and keep only the
+            # current input-channel tile in the weight matrix.
+            acc = tl.dot(gn_t, w_t, input_precision="ieee")
             tl.store(
                 grad_x_ptr + r[:, None] * channels + k[None, :],
                 acc,
@@ -1418,9 +1423,9 @@ class _FusedRadialMLP(torch.autograd.Function):
             # The backward path keeps several [BLOCK_R, hidden] dot
             # accumulators live at once.  BLOCK_R=16/BLOCK_O=256 exceeds the
             # H100 shared-memory limit for the 30M radial heads (the forward
-            # tile remains unchanged).  Use a smaller capture-safe tile; the
-            # loop covers the same rows/output channels and preserves math.
-            backward_block_r = 8
+            # tile remains unchanged).  Keep BLOCK_R >= 16 because Triton
+            # tensor-dot requires that minimum, and reduce the output tile.
+            backward_block_r = 16
             backward_block_o = 64
             grid = (triton.cdiv(rows, backward_block_r),)
             _radial_mlp_backward_kernel[grid](
