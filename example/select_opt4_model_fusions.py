@@ -4,11 +4,10 @@
 Acceptance policy: energy/force errors versus the baseline are recorded as
 numerical telemetry only and do NOT decide whether an experiment passes.
 A candidate is accepted on structural CUDA Graph health (one capture, no
-capacity miss, invariants not broken) plus stable paired timing: at least
-``--min-faster-directions`` of ``--min-paired-repeats`` repeats faster per
-(system, temperature), delta beyond the MAD sum, no system regression beyond
-``--maximum-system-regression``, and a geomean speedup of at least
-``--minimum-geomean-speedup``.
+capacity miss, invariants not broken) plus stable paired timing. With
+``--focus-systems``, the focus subset supplies the geomean and stable-speedup
+primary decision; every other supplied system is a regression guardrail.
+Without it, the historical all-system policy is retained.
 """
 
 from __future__ import annotations
@@ -81,6 +80,15 @@ def main() -> int:
     parser.add_argument("--candidate-stage", required=True)
     parser.add_argument("--candidate-fusion", required=True)
     parser.add_argument("--accepted-before", default="")
+    parser.add_argument(
+        "--focus-systems",
+        nargs="+",
+        default=None,
+        help=(
+            "Primary systems for acceptance (for example Cu512 H2O512). "
+            "All other systems remain reported and are guardrails."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--minimum-geomean-speedup", type=float, default=1.01)
     parser.add_argument("--maximum-system-regression", type=float, default=0.01)
@@ -197,13 +205,59 @@ def main() -> int:
         row["speedup"] >= 1.0 - args.maximum_system_regression
         for row in comparisons
     )
-    accepted = (
-        structural_ok
-        and status_ok
-        and stable
-        and no_regression
-        and geomean >= args.minimum_geomean_speedup
+    focus_set = set(args.focus_systems or [])
+    focus_comparisons = (
+        [row for row in comparisons if row["system"] in focus_set]
+        if focus_set
+        else comparisons
     )
+    guardrail_comparisons = (
+        [row for row in comparisons if row["system"] not in focus_set]
+        if focus_set
+        else comparisons
+    )
+
+    def _geomean(rows):
+        return (
+            math.exp(sum(math.log(row["speedup"]) for row in rows) / len(rows))
+            if rows
+            else 0.0
+        )
+
+    focus_geomean = _geomean(focus_comparisons)
+    focus_stable = bool(focus_set) and len(focus_comparisons) == len(focus_set) and all(
+        row["paired_repeats"] >= args.min_paired_repeats
+        and row["directions_faster"] >= args.min_faster_directions
+        and row["delta_exceeds_mad_sum"]
+        for row in focus_comparisons
+    )
+    focus_no_regression = bool(focus_comparisons) and all(
+        row["speedup"] >= 1.0 - args.maximum_system_regression
+        for row in focus_comparisons
+    )
+    # Non-focus systems protect against regressions but do not need to show a
+    # speedup.  With no focus list preserve the historical all-system policy.
+    guardrail_ok = all(
+        row["speedup"] >= 1.0 - args.maximum_system_regression
+        for row in guardrail_comparisons
+    )
+    if focus_set:
+        accepted = (
+            structural_ok
+            and status_ok
+            and focus_stable
+            and focus_no_regression
+            and focus_geomean >= args.minimum_geomean_speedup
+            and guardrail_ok
+        )
+    else:
+        accepted = (
+            structural_ok
+            and status_ok
+            and stable
+            and no_regression
+            and geomean >= args.minimum_geomean_speedup
+        )
     before = [item for item in args.accepted_before.split(",") if item]
     after = before + ([args.candidate_fusion] if accepted else [])
     result = {
@@ -215,6 +269,11 @@ def main() -> int:
         "accepted_before": before,
         "accepted_after": after,
         "geomean_speedup": geomean,
+        "focus_systems": sorted(focus_set),
+        "focus_geomean_speedup": focus_geomean,
+        "focus_stable": focus_stable,
+        "focus_no_system_regression": focus_no_regression,
+        "guardrail_ok": guardrail_ok,
         "structural_ok": structural_ok,
         "coverage_ok": coverage_ok,
         "engineering_validation_ok": engineering_validation_ok,

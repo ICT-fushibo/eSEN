@@ -665,12 +665,16 @@ if triton is not None:
             k = k0 + tl.arange(0, BLOCK_K)
             pre1_t = tl.load(
                 save_a1_ptr + r[:, None] * h1_ch + k[None, :],
-                mask=rmask[:, None],
+                mask=rmask[:, None] & (k[None, :] < h1_ch),
                 other=0.0,
             )
             sig1_t = 1.0 / (1.0 + tl.exp(-pre1_t))
             a_t = pre1_t * sig1_t
-            w_t = tl.load(w2_ptr + j2[:, None] * h1_ch + k[None, :], other=0.0)
+            w_t = tl.load(
+                w2_ptr + j2[:, None] * h1_ch + k[None, :],
+                mask=(j2[:, None] < h2_ch) & (k[None, :] < h1_ch),
+                other=0.0,
+            )
             acc2 = tl.dot(a_t, tl.trans(w_t), acc2, input_precision="ieee")
         h2 = acc2 + tl.load(b2_ptr + j2)[None, :]
         mean2 = tl.sum(h2, axis=1) / h2_ch
@@ -692,14 +696,14 @@ if triton is not None:
                 k = k0 + tl.arange(0, BLOCK_K)
                 pre2_t = tl.load(
                     save_a2_ptr + r[:, None] * h2_ch + k[None, :],
-                    mask=rmask[:, None],
+                    mask=rmask[:, None] & (k[None, :] < h2_ch),
                     other=0.0,
                 )
                 sig2_t = 1.0 / (1.0 + tl.exp(-pre2_t))
                 a_t = pre2_t * sig2_t
                 w_t = tl.load(
                     w3_ptr + o[:, None] * h2_ch + k[None, :],
-                    mask=omask[:, None],
+                    mask=omask[:, None] & (k[None, :] < h2_ch),
                     other=0.0,
                 )
                 acc3 = tl.dot(a_t, tl.trans(w_t), acc3, input_precision="ieee")
@@ -782,12 +786,14 @@ if triton is not None:
             k = k0 + tl.arange(0, BLOCK_K)
             gh_t = tl.load(
                 scratch_g_h2_ptr + r[:, None] * h2_ch + k[None, :],
-                mask=rmask[:, None],
+                mask=rmask[:, None] & (k[None, :] < h2_ch),
                 other=0.0,
             )
             # g_a1[r, i] = sum_j g_h2[r, j] * W2[j, i]
             w_t = tl.load(
-                w2_ptr + k[:, None] * h1_ch + j1[None, :], other=0.0
+                w2_ptr + k[:, None] * h1_ch + j1[None, :],
+                mask=(k[:, None] < h2_ch) & (j1[None, :] < h1_ch),
+                other=0.0,
             )
             g_a1 = tl.dot(gh_t, w_t, g_a1, input_precision="ieee")
         pre1 = tl.load(
@@ -862,11 +868,12 @@ if triton is not None:
                 k = k0 + tl.arange(0, BLOCK_K)
                 x_t = tl.load(
                     x_ptr + r[:, None] * coeffs * channels + m * channels + k[None, :],
-                    mask=rmask[:, None],
+                    mask=rmask[:, None] & (k[None, :] < channels),
                     other=0.0,
                 )
                 w_t = tl.load(
                     w1_ptr + m * channels * channels + c[:, None] * channels + k[None, :],
+                    mask=(c[:, None] < channels) & (k[None, :] < channels),
                     other=0.0,
                 )
                 acc = tl.dot(x_t, tl.trans(w_t), acc, input_precision="ieee")
@@ -895,7 +902,7 @@ if triton is not None:
                 k = k0 + tl.arange(0, BLOCK_K)
                 h_t = tl.load(
                     scratch_h_ptr + r[:, None] * coeffs * channels + m * channels + k[None, :],
-                    mask=rmask[:, None],
+                    mask=rmask[:, None] & (k[None, :] < channels),
                     other=0.0,
                 )
                 if m == 0:
@@ -911,6 +918,7 @@ if triton is not None:
                     g_t = h_t * (1.0 / (1.0 + tl.exp(-gate)))
                 w_t = tl.load(
                     w2_ptr + m * channels * channels + c[:, None] * channels + k[None, :],
+                    mask=(c[:, None] < channels) & (k[None, :] < channels),
                     other=0.0,
                 )
                 acc2 = tl.dot(g_t, tl.trans(w_t), acc2, input_precision="ieee")
@@ -951,11 +959,12 @@ if triton is not None:
                 k = k0 + tl.arange(0, BLOCK_K)
                 go_t = tl.load(
                     grad_out_ptr + r[:, None] * coeffs * channels + m * channels + k[None, :],
-                    mask=rmask[:, None],
+                    mask=rmask[:, None] & (k[None, :] < channels),
                     other=0.0,
                 )
                 w_t = tl.load(
                     w2_ptr + m * channels * channels + k[:, None] * channels + c[None, :],
+                    mask=(k[:, None] < channels) & (c[None, :] < channels),
                     other=0.0,
                 )
                 g_gated = tl.dot(go_t, w_t, g_gated, input_precision="ieee")
@@ -990,11 +999,12 @@ if triton is not None:
                 k = k0 + tl.arange(0, BLOCK_K)
                 gh_t = tl.load(
                     scratch_g_h_ptr + r[:, None] * coeffs * channels + m * channels + k[None, :],
-                    mask=rmask[:, None],
+                    mask=rmask[:, None] & (k[None, :] < channels),
                     other=0.0,
                 )
                 w_t = tl.load(
                     w1_ptr + m * channels * channels + k[:, None] * channels + c[None, :],
+                    mask=(k[:, None] < channels) & (c[None, :] < channels),
                     other=0.0,
                 )
                 acc = tl.dot(gh_t, w_t, input_precision="ieee")
@@ -1030,10 +1040,14 @@ if triton is not None:
             k = k0 + tl.arange(0, BLOCK_K)
             x_t = tl.load(
                 x_ptr + r[:, None] * channels + k[None, :],
-                mask=rmask[:, None],
+                mask=rmask[:, None] & (k[None, :] < channels),
                 other=0.0,
             )
-            w_t = tl.load(w1_ptr + j[:, None] * channels + k[None, :], other=0.0)
+            w_t = tl.load(
+                w1_ptr + j[:, None] * channels + k[None, :],
+                mask=(j[:, None] < channels) & (k[None, :] < channels),
+                other=0.0,
+            )
             acc1 = tl.dot(x_t, tl.trans(w_t), acc1, input_precision="ieee")
         h1 = acc1 + tl.load(b1_ptr + j)[None, :]
         sig1 = 1.0 / (1.0 + tl.exp(-h1))
@@ -1045,12 +1059,16 @@ if triton is not None:
             k = k0 + tl.arange(0, BLOCK_K)
             h1_t = tl.load(
                 save_a1_ptr + r[:, None] * channels + k[None, :],
-                mask=rmask[:, None],
+                mask=rmask[:, None] & (k[None, :] < channels),
                 other=0.0,
             )
             sig1_t = 1.0 / (1.0 + tl.exp(-h1_t))
             a_t = h1_t * sig1_t
-            w_t = tl.load(w2_ptr + j[:, None] * channels + k[None, :], other=0.0)
+            w_t = tl.load(
+                w2_ptr + j[:, None] * channels + k[None, :],
+                mask=(j[:, None] < channels) & (k[None, :] < channels),
+                other=0.0,
+            )
             acc2 = tl.dot(a_t, tl.trans(w_t), acc2, input_precision="ieee")
         h2 = acc2 + tl.load(b2_ptr + j)[None, :]
         sig2 = 1.0 / (1.0 + tl.exp(-h2))
@@ -1098,12 +1116,14 @@ if triton is not None:
             k = k0 + tl.arange(0, BLOCK_K)
             gn_t = tl.load(
                 scratch_g_a2_ptr + r[:, None] * channels + k[None, :],
-                mask=rmask[:, None],
+                mask=rmask[:, None] & (k[None, :] < channels),
                 other=0.0,
             )
             # g_a1[r, i] = sum_j g_n2[r, j] * W2[j, i]
             w_t = tl.load(
-                w2_ptr + k[:, None] * channels + j[None, :], other=0.0
+                w2_ptr + k[:, None] * channels + j[None, :],
+                mask=(k[:, None] < channels) & (j[None, :] < channels),
+                other=0.0,
             )
             g_a1 = tl.dot(gn_t, w_t, g_a1, input_precision="ieee")
         h1 = tl.load(
@@ -1119,10 +1139,14 @@ if triton is not None:
             k = k0 + tl.arange(0, BLOCK_K)
             gn_t = tl.load(
                 scratch_g_a1_ptr + r[:, None] * channels + k[None, :],
-                mask=rmask[:, None],
+                mask=rmask[:, None] & (k[None, :] < channels),
                 other=0.0,
             )
-            w_t = tl.load(w1_ptr + j[:, None] * channels + k[None, :], other=0.0)
+            w_t = tl.load(
+                w1_ptr + j[:, None] * channels + k[None, :],
+                mask=(j[:, None] < channels) & (k[None, :] < channels),
+                other=0.0,
+            )
             acc = tl.dot(gn_t, tl.trans(w_t), input_precision="ieee")
             tl.store(
                 grad_x_ptr + r[:, None] * channels + k[None, :],
@@ -1834,6 +1858,17 @@ class FusionMetadata:
         }
 
 
+def _energy_head_candidates(model: nn.Module) -> list[nn.Module]:
+    """Return output heads across current and legacy HydraModel layouts."""
+    heads = getattr(model, "output_heads", None)
+    if isinstance(heads, nn.ModuleDict):
+        return list(heads.values())
+    if isinstance(heads, dict):
+        return list(heads.values())
+    legacy = getattr(model, "head", None)
+    return [legacy] if legacy is not None else []
+
+
 def _validate_30m_model(model: nn.Module) -> nn.Module:
     if triton is None:
         raise UnsupportedFusionConfigError("Opt4 model fusion requires Triton")
@@ -1960,14 +1995,9 @@ def configure_esen_30m_model_fusions(
                 gate_count += 1
 
     if "energy-head" in selected:
-        heads = getattr(model, "output_heads", None)
-        if isinstance(heads, dict):
-            head_candidates = list(heads.values())
-        else:
-            head_candidates = [
-                head for head in (getattr(model, "head", None),) if head is not None
-            ]
-        for head in head_candidates:
+        # HydraModel exposes inference heads as ``nn.ModuleDict``.  The helper
+        # also keeps plain-dict and legacy ``model.head`` checkpoints working.
+        for head in _energy_head_candidates(model):
             energy_block = getattr(head, "energy_block", None)
             if isinstance(energy_block, nn.Sequential):
                 head.energy_block = FusedEnergyBlock(energy_block)

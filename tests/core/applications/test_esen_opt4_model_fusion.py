@@ -14,6 +14,7 @@ from fairchem.core.applications.esen_opt4_model_fusion import (
     model_fusion_available,
     parse_model_fusions,
     reverse_envelope_scatter,
+    _energy_head_candidates,
 )
 from fairchem.core.models.esen.esen_block import SpectralAtomwise
 from fairchem.core.models.esen.nn.activation import GateActivation
@@ -26,6 +27,18 @@ from fairchem.core.models.esen.nn.radial import RadialMLP
 RTOL = 2e-4
 ATOL = 2e-5
 CUDA_TRITON = torch.cuda.is_available() and model_fusion_available()
+
+
+def test_energy_head_discovery_supports_moduledict_and_legacy_layouts():
+    energy = torch.nn.Linear(2, 1)
+    other = torch.nn.Linear(2, 1)
+    model = torch.nn.Module()
+    model.output_heads = torch.nn.ModuleDict({"energy": energy, "other": other})
+    assert _energy_head_candidates(model) == [energy, other]
+
+    legacy = torch.nn.Module()
+    legacy.head = energy
+    assert _energy_head_candidates(legacy) == [energy]
 
 
 def test_parse_model_fusions_is_ordered_and_strict():
@@ -260,6 +273,60 @@ def test_radial_mlp_forward_backward_is_cuda_graph_capture_safe():
     original.requires_grad_(False)
     fused = FusedRadialMLP(original)
     x = torch.randn(24, 64, device="cuda", requires_grad=True)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            torch.autograd.grad(fused(x).sum(), (x,))
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = fused(x)
+        gradients = torch.autograd.grad(output.sum(), (x,))
+    addresses = (output.data_ptr(), gradients[0].data_ptr())
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert addresses == (output.data_ptr(), gradients[0].data_ptr())
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so3_mlp_forward_backward_is_cuda_graph_capture_safe():
+    torch.manual_seed(42)
+    original = SpectralAtomwise(128, 128, 3, 3, None).cuda().eval()
+    original.requires_grad_(False)
+    fused = FusedSpectralAtomwise(original)
+    x = torch.randn(8, 16, 128, device="cuda", requires_grad=True)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            torch.autograd.grad(fused(x).sum(), (x,))
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = fused(x)
+        gradients = torch.autograd.grad(output.sum(), (x,))
+    addresses = (output.data_ptr(), gradients[0].data_ptr())
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert addresses == (output.data_ptr(), gradients[0].data_ptr())
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_energy_mlp_forward_backward_is_cuda_graph_capture_safe():
+    torch.manual_seed(42)
+    original = torch.nn.Sequential(
+        torch.nn.Linear(128, 128), torch.nn.SiLU(),
+        torch.nn.Linear(128, 128), torch.nn.SiLU(),
+        torch.nn.Linear(128, 1),
+    ).cuda().eval()
+    original.requires_grad_(False)
+    fused = FusedEnergyBlock(original)
+    x = torch.randn(8, 128, device="cuda", requires_grad=True)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
