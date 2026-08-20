@@ -11,9 +11,11 @@ from fairchem.core.applications.esen_opt4_model_fusion import (
     FusedRadialMLP,
     FusedRMSNormSH,
     FusedSO2Convolution,
+    FusedSO2GateBridge,
     FusedSpectralAtomwise,
     UnsupportedFusionConfigError,
     _SO2Epilogue,
+    _SO2GateBridge,
     _SO2Prepare,
     gather_cat_wigner,
     model_fusion_available,
@@ -85,6 +87,38 @@ def _reference_so2_epilogue(m0, m1, m2, mapping, extra_channels):
     return torch.einsum("nac,ab->nbc", m_order, mapping.to_m), gating
 
 
+def _reference_so2_gate_bridge(m0, m1, m2, mapping):
+    l_order, gating = _reference_so2_epilogue(m0, m1, m2, mapping, 384)
+    gate = torch.sigmoid(gating).reshape(-1, 3, 128)
+    expand = torch.tensor(
+        [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2],
+        device=m0.device,
+        dtype=torch.long,
+    )
+    activated = torch.cat(
+        (
+            torch.nn.functional.silu(l_order[:, :1]),
+            l_order[:, 1:] * gate.index_select(1, expand),
+        ),
+        dim=1,
+    )
+    m_order = torch.einsum("nac,ba->nbc", activated, mapping.to_m)
+    return (
+        m_order[:, :4].reshape(-1, 512),
+        m_order[:, 4:10].reshape(-1, 2, 384),
+        m_order[:, 10:14].reshape(-1, 2, 256),
+    )
+
+
+def _m_degree_index(mapping):
+    degree_l = torch.tensor(
+        [0, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3],
+        device=mapping.to_m.device,
+        dtype=torch.long,
+    )
+    return degree_l.index_select(0, mapping.to_m.argmax(dim=1))
+
+
 def test_energy_head_discovery_supports_moduledict_and_legacy_layouts():
     energy = torch.nn.Linear(2, 1)
     other = torch.nn.Linear(2, 1)
@@ -108,6 +142,12 @@ def test_parse_model_fusions_is_ordered_and_strict():
         "rmsnorm",
         "so2-epilogue",
     )
+    assert parse_model_fusions("so2-gate-bridge,so2-epilogue") == (
+        "so2-epilogue",
+        "so2-gate-bridge",
+    )
+    with pytest.raises(UnsupportedFusionConfigError, match="requires so2-epilogue"):
+        parse_model_fusions("so2-gate-bridge")
 
 
 def test_so2_epilogue_rejects_non_permutation_mapping():
@@ -196,6 +236,145 @@ def test_so2_epilogue_forward_and_gradients_match_torch():
         torch.testing.assert_close(
             actual_input.grad, expected_input.grad, rtol=RTOL, atol=ATOL
         )
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_gate_bridge_forward_and_gradients_match_torch():
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    mapping = CoefficientMapping(3, 2).to(device)
+    edges = 5
+    values = (
+        torch.randn(edges, 896, device=device),
+        torch.randn(edges, 2, 768, device=device),
+        torch.randn(edges, 2, 512, device=device),
+    )
+    # Repeated and zero rows cover dummy-capacity-like inputs.
+    for value in values:
+        value[1].copy_(value[0])
+        value[-1].zero_()
+    reference_inputs = [
+        value.detach().clone().requires_grad_(True) for value in values
+    ]
+    actual_inputs = []
+    for value in values:
+        storage = torch.empty(
+            *value.shape[:-1], value.shape[-1] + 1,
+            device=device,
+            dtype=value.dtype,
+        )
+        storage[..., : value.shape[-1]].copy_(value)
+        actual = storage[..., : value.shape[-1]].detach().requires_grad_(True)
+        assert not actual.is_contiguous()
+        actual_inputs.append(actual)
+    grad = (
+        torch.randn(edges, 512, device=device),
+        torch.randn(edges, 2, 384, device=device),
+        torch.randn(edges, 2, 256, device=device),
+    )
+
+    expected = _reference_so2_gate_bridge(*reference_inputs, mapping)
+    torch.autograd.backward(expected, grad)
+    actual = _SO2GateBridge.apply(
+        *actual_inputs, _m_degree_index(mapping)
+    )
+    torch.autograd.backward(actual, grad)
+
+    for actual_part, expected_part in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_part, expected_part, rtol=RTOL, atol=ATOL
+        )
+    for actual_input, expected_input in zip(actual_inputs, reference_inputs):
+        torch.testing.assert_close(
+            actual_input.grad, expected_input.grad, rtol=RTOL, atol=ATOL
+        )
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_gate_bridge_accepts_empty_edges():
+    mapping = CoefficientMapping(3, 2).cuda()
+    values = (
+        torch.empty(0, 896, device="cuda", requires_grad=True),
+        torch.empty(0, 2, 768, device="cuda", requires_grad=True),
+        torch.empty(0, 2, 512, device="cuda", requires_grad=True),
+    )
+    outputs = _SO2GateBridge.apply(*values, _m_degree_index(mapping))
+    sum(output.sum() for output in outputs).backward()
+    assert [tuple(output.shape) for output in outputs] == [
+        (0, 512),
+        (0, 2, 384),
+        (0, 2, 256),
+    ]
+    assert all(
+        value.grad is not None and value.grad.shape == value.shape
+        for value in values
+    )
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_gate_bridge_is_cuda_graph_capture_safe():
+    torch.manual_seed(42)
+    mapping = CoefficientMapping(3, 2).cuda()
+    values = (
+        torch.randn(24, 896, device="cuda", requires_grad=True),
+        torch.randn(24, 2, 768, device="cuda", requires_grad=True),
+        torch.randn(24, 2, 512, device="cuda", requires_grad=True),
+    )
+    degree = _m_degree_index(mapping)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            outputs = _SO2GateBridge.apply(*values, degree)
+            torch.autograd.grad(sum(output.sum() for output in outputs), values)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outputs = _SO2GateBridge.apply(*values, degree)
+        gradients = torch.autograd.grad(
+            sum(output.sum() for output in outputs), values
+        )
+    addresses = tuple(output.data_ptr() for output in outputs) + tuple(
+        gradient.data_ptr() for gradient in gradients
+    )
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert addresses == tuple(output.data_ptr() for output in outputs) + tuple(
+        gradient.data_ptr() for gradient in gradients
+    )
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_gate_bridge_module_validates_and_runs_30m_pair():
+    mapping = CoefficientMapping(3, 2).cuda()
+    conv1 = SO2_Convolution(
+        256,
+        128,
+        3,
+        2,
+        mapping,
+        internal_weights=False,
+        edge_channels_list=[32, 64],
+        extra_m0_output_channels=384,
+    ).cuda()
+    conv2 = SO2_Convolution(
+        128, 128, 3, 2, mapping, internal_weights=True
+    ).cuda()
+    bridge = FusedSO2GateBridge(
+        FusedSO2Convolution(conv1), FusedSO2Convolution(conv2)
+    )
+    outputs = bridge(
+        torch.randn(1, 896, device="cuda"),
+        torch.randn(1, 2, 768, device="cuda"),
+        torch.randn(1, 2, 512, device="cuda"),
+    )
+    assert [tuple(output.shape) for output in outputs] == [
+        (1, 512),
+        (1, 2, 384),
+        (1, 2, 256),
+    ]
 
 
 @pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")

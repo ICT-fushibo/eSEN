@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - exercised by CPU-only import tests
 
 FUSION_KERNEL_VERSION = "opt4-model-fusion-v2"
 SO2_FUSION_KERNEL_VERSION = "opt4-model-fusion-v3-so2"
+SO2_GATE_BRIDGE_KERNEL_VERSION = "opt4-model-fusion-v4-so2-gate"
 SO2_KERNEL_BLOCK = 512
 SUPPORTED_FUSIONS = (
     "gather-wigner",
@@ -44,6 +45,7 @@ SUPPORTED_FUSIONS = (
     "so3-mlp",
     "energy-head",
     "so2-epilogue",
+    "so2-gate-bridge",
 )
 
 
@@ -66,6 +68,13 @@ def parse_model_fusions(value: str | Iterable[str]) -> tuple[str, ...]:
             "Unknown Opt4 model fusion(s): " + ", ".join(unknown)
         )
     requested_set = set(requested)
+    if (
+        "so2-gate-bridge" in requested_set
+        and "so2-epilogue" not in requested_set
+    ):
+        raise UnsupportedFusionConfigError(
+            "so2-gate-bridge requires so2-epilogue to be requested explicitly"
+        )
     return tuple(name for name in SUPPORTED_FUSIONS if name in requested_set)
 
 
@@ -901,6 +910,380 @@ if triton is not None:
                 ),
                 mask=gate_mask,
             )
+
+    @triton.jit
+    def _so2_gate_bridge_kernel(
+        m0_ptr,
+        m1_ptr,
+        m2_ptr,
+        m_degree_ptr,
+        out0_ptr,
+        out1_ptr,
+        out2_ptr,
+        rows: tl.constexpr,
+        coefficients: tl.constexpr,
+        channels: tl.constexpr,
+        extra_channels: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Apply the Edgewise gate while remaining in the m-order layout."""
+        row = tl.program_id(0)
+        tile = tl.program_id(1)
+        offset = tile * block + tl.arange(0, block)
+        active = offset < coefficients * channels
+        coefficient = offset // channels
+        channel = offset % channels
+        degree = tl.load(m_degree_ptr + coefficient, mask=active, other=0)
+
+        m0_offset = (
+            row * (extra_channels + 4 * channels)
+            + extra_channels
+            + coefficient * channels
+            + channel
+        )
+        m0_value = tl.load(
+            m0_ptr + m0_offset,
+            mask=active & (coefficient < 4),
+            other=0.0,
+        )
+
+        m1_local = coefficient - 4
+        m1_part = m1_local // 3
+        m1_coefficient = m1_local % 3
+        m1_half_width = 3 * channels
+        m1_linear_width = 2 * m1_half_width
+        m1_edge_stride = 2 * m1_linear_width
+        m1_base = row * m1_edge_stride + m1_coefficient * channels + channel
+        m1_mask = active & (coefficient >= 4) & (coefficient < 10)
+        m1_row0_first = tl.load(m1_ptr + m1_base, mask=m1_mask, other=0.0)
+        m1_row0_second = tl.load(
+            m1_ptr + m1_base + m1_half_width, mask=m1_mask, other=0.0
+        )
+        m1_row1_first = tl.load(
+            m1_ptr + m1_base + m1_linear_width, mask=m1_mask, other=0.0
+        )
+        m1_row1_second = tl.load(
+            m1_ptr + m1_base + m1_linear_width + m1_half_width,
+            mask=m1_mask,
+            other=0.0,
+        )
+        m1_value = tl.where(
+            m1_part == 0,
+            m1_row0_first - m1_row1_second,
+            m1_row1_first + m1_row0_second,
+        )
+
+        m2_local = coefficient - 10
+        m2_part = m2_local // 2
+        m2_coefficient = m2_local % 2
+        m2_half_width = 2 * channels
+        m2_linear_width = 2 * m2_half_width
+        m2_edge_stride = 2 * m2_linear_width
+        m2_base = row * m2_edge_stride + m2_coefficient * channels + channel
+        m2_mask = active & (coefficient >= 10)
+        m2_row0_first = tl.load(m2_ptr + m2_base, mask=m2_mask, other=0.0)
+        m2_row0_second = tl.load(
+            m2_ptr + m2_base + m2_half_width, mask=m2_mask, other=0.0
+        )
+        m2_row1_first = tl.load(
+            m2_ptr + m2_base + m2_linear_width, mask=m2_mask, other=0.0
+        )
+        m2_row1_second = tl.load(
+            m2_ptr + m2_base + m2_linear_width + m2_half_width,
+            mask=m2_mask,
+            other=0.0,
+        )
+        m2_value = tl.where(
+            m2_part == 0,
+            m2_row0_first - m2_row1_second,
+            m2_row1_first + m2_row0_second,
+        )
+
+        value = tl.where(
+            coefficient < 4,
+            m0_value,
+            tl.where(coefficient < 10, m1_value, m2_value),
+        )
+        gate_offset = (
+            row * (extra_channels + 4 * channels)
+            + (degree - 1) * channels
+            + channel
+        )
+        gate = tl.load(
+            m0_ptr + gate_offset,
+            mask=active & (degree > 0),
+            other=0.0,
+        )
+        gate_sigmoid = 1.0 / (1.0 + tl.exp(-gate))
+        scalar_sigmoid = 1.0 / (1.0 + tl.exp(-value))
+        activated = tl.where(
+            degree == 0, value * scalar_sigmoid, value * gate_sigmoid
+        )
+
+        tl.store(
+            out0_ptr + row * 4 * channels + coefficient * channels + channel,
+            activated,
+            mask=active & (coefficient < 4),
+        )
+        tl.store(
+            out1_ptr
+            + row * 6 * channels
+            + (coefficient - 4) * channels
+            + channel,
+            activated,
+            mask=active & (coefficient >= 4) & (coefficient < 10),
+        )
+        tl.store(
+            out2_ptr
+            + row * 4 * channels
+            + (coefficient - 10) * channels
+            + channel,
+            activated,
+            mask=active & (coefficient >= 10),
+        )
+
+    @triton.jit
+    def _so2_gate_bridge_backward_kernel(
+        grad_out0_ptr,
+        grad_out1_ptr,
+        grad_out2_ptr,
+        m0_ptr,
+        m1_ptr,
+        m2_ptr,
+        m_degree_ptr,
+        grad_m0_ptr,
+        grad_m1_ptr,
+        grad_m2_ptr,
+        rows: tl.constexpr,
+        channels: tl.constexpr,
+        extra_channels: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Differentiate the bridge with one non-atomic gate reduction."""
+        row = tl.program_id(0)
+        channel = tl.arange(0, block)
+        active = channel < channels
+        gate_grad_1 = tl.zeros((block,), tl.float32)
+        gate_grad_2 = tl.zeros((block,), tl.float32)
+        gate_grad_3 = tl.zeros((block,), tl.float32)
+
+        for coefficient in range(14):
+            degree = tl.load(m_degree_ptr + coefficient)
+            m0_value = tl.load(
+                m0_ptr
+                + row * (extra_channels + 4 * channels)
+                + extra_channels
+                + coefficient * channels
+                + channel,
+                mask=active & (coefficient < 4),
+                other=0.0,
+            )
+
+            m1_local = coefficient - 4
+            m1_part = m1_local // 3
+            m1_coefficient = m1_local % 3
+            m1_half_width = 3 * channels
+            m1_linear_width = 2 * m1_half_width
+            m1_edge_stride = 2 * m1_linear_width
+            m1_base = (
+                row * m1_edge_stride + m1_coefficient * channels + channel
+            )
+            m1_mask = active & (coefficient >= 4) & (coefficient < 10)
+            m1_row0_first = tl.load(
+                m1_ptr + m1_base, mask=m1_mask, other=0.0
+            )
+            m1_row0_second = tl.load(
+                m1_ptr + m1_base + m1_half_width,
+                mask=m1_mask,
+                other=0.0,
+            )
+            m1_row1_first = tl.load(
+                m1_ptr + m1_base + m1_linear_width,
+                mask=m1_mask,
+                other=0.0,
+            )
+            m1_row1_second = tl.load(
+                m1_ptr + m1_base + m1_linear_width + m1_half_width,
+                mask=m1_mask,
+                other=0.0,
+            )
+            m1_value = tl.where(
+                m1_part == 0,
+                m1_row0_first - m1_row1_second,
+                m1_row1_first + m1_row0_second,
+            )
+
+            m2_local = coefficient - 10
+            m2_part = m2_local // 2
+            m2_coefficient = m2_local % 2
+            m2_half_width = 2 * channels
+            m2_linear_width = 2 * m2_half_width
+            m2_edge_stride = 2 * m2_linear_width
+            m2_base = (
+                row * m2_edge_stride + m2_coefficient * channels + channel
+            )
+            m2_mask = active & (coefficient >= 10)
+            m2_row0_first = tl.load(
+                m2_ptr + m2_base, mask=m2_mask, other=0.0
+            )
+            m2_row0_second = tl.load(
+                m2_ptr + m2_base + m2_half_width,
+                mask=m2_mask,
+                other=0.0,
+            )
+            m2_row1_first = tl.load(
+                m2_ptr + m2_base + m2_linear_width,
+                mask=m2_mask,
+                other=0.0,
+            )
+            m2_row1_second = tl.load(
+                m2_ptr + m2_base + m2_linear_width + m2_half_width,
+                mask=m2_mask,
+                other=0.0,
+            )
+            m2_value = tl.where(
+                m2_part == 0,
+                m2_row0_first - m2_row1_second,
+                m2_row1_first + m2_row0_second,
+            )
+            value = tl.where(
+                coefficient < 4,
+                m0_value,
+                tl.where(coefficient < 10, m1_value, m2_value),
+            )
+
+            grad0 = tl.load(
+                grad_out0_ptr
+                + row * 4 * channels
+                + coefficient * channels
+                + channel,
+                mask=active & (coefficient < 4),
+                other=0.0,
+            )
+            grad1 = tl.load(
+                grad_out1_ptr
+                + row * 6 * channels
+                + (coefficient - 4) * channels
+                + channel,
+                mask=active & (coefficient >= 4) & (coefficient < 10),
+                other=0.0,
+            )
+            grad2 = tl.load(
+                grad_out2_ptr
+                + row * 4 * channels
+                + (coefficient - 10) * channels
+                + channel,
+                mask=active & (coefficient >= 10),
+                other=0.0,
+            )
+            grad_out = tl.where(
+                coefficient < 4,
+                grad0,
+                tl.where(coefficient < 10, grad1, grad2),
+            )
+
+            gate_offset = (
+                row * (extra_channels + 4 * channels)
+                + (degree - 1) * channels
+                + channel
+            )
+            gate = tl.load(
+                m0_ptr + gate_offset,
+                mask=active & (degree > 0),
+                other=0.0,
+            )
+            gate_sigmoid = 1.0 / (1.0 + tl.exp(-gate))
+            scalar_sigmoid = 1.0 / (1.0 + tl.exp(-value))
+            scalar_derivative = scalar_sigmoid * (
+                1.0 + value * (1.0 - scalar_sigmoid)
+            )
+            grad_value = grad_out * tl.where(
+                degree == 0, scalar_derivative, gate_sigmoid
+            )
+            gate_term = (
+                grad_out * value * gate_sigmoid * (1.0 - gate_sigmoid)
+            )
+            gate_grad_1 += tl.where(degree == 1, gate_term, 0.0)
+            gate_grad_2 += tl.where(degree == 2, gate_term, 0.0)
+            gate_grad_3 += tl.where(degree == 3, gate_term, 0.0)
+
+            tl.store(
+                grad_m0_ptr
+                + row * (extra_channels + 4 * channels)
+                + extra_channels
+                + coefficient * channels
+                + channel,
+                grad_value,
+                mask=active & (coefficient < 4),
+            )
+            m1_real_mask = m1_mask & (m1_part == 0)
+            m1_imag_mask = m1_mask & (m1_part == 1)
+            tl.store(
+                grad_m1_ptr + m1_base, grad_value, mask=m1_real_mask
+            )
+            tl.store(
+                grad_m1_ptr + m1_base + m1_half_width,
+                grad_value,
+                mask=m1_imag_mask,
+            )
+            tl.store(
+                grad_m1_ptr + m1_base + m1_linear_width,
+                grad_value,
+                mask=m1_imag_mask,
+            )
+            tl.store(
+                grad_m1_ptr
+                + m1_base
+                + m1_linear_width
+                + m1_half_width,
+                -grad_value,
+                mask=m1_real_mask,
+            )
+            m2_real_mask = m2_mask & (m2_part == 0)
+            m2_imag_mask = m2_mask & (m2_part == 1)
+            tl.store(
+                grad_m2_ptr + m2_base, grad_value, mask=m2_real_mask
+            )
+            tl.store(
+                grad_m2_ptr + m2_base + m2_half_width,
+                grad_value,
+                mask=m2_imag_mask,
+            )
+            tl.store(
+                grad_m2_ptr + m2_base + m2_linear_width,
+                grad_value,
+                mask=m2_imag_mask,
+            )
+            tl.store(
+                grad_m2_ptr
+                + m2_base
+                + m2_linear_width
+                + m2_half_width,
+                -grad_value,
+                mask=m2_real_mask,
+            )
+
+        tl.store(
+            grad_m0_ptr + row * (extra_channels + 4 * channels) + channel,
+            gate_grad_1,
+            mask=active,
+        )
+        tl.store(
+            grad_m0_ptr
+            + row * (extra_channels + 4 * channels)
+            + channels
+            + channel,
+            gate_grad_2,
+            mask=active,
+        )
+        tl.store(
+            grad_m0_ptr
+            + row * (extra_channels + 4 * channels)
+            + 2 * channels
+            + channel,
+            gate_grad_3,
+            mask=active,
+        )
 
     @triton.jit
     def _radial_mlp_forward_kernel(
@@ -1844,6 +2227,110 @@ class _SO2Epilogue(torch.autograd.Function):
         return grad_m0, grad_m1, grad_m2, None, None
 
 
+class _SO2GateBridge(torch.autograd.Function):
+    """Bridge conv1 Linear outputs directly to conv2 Linear inputs.
+
+    The supported Edgewise layout has 128 channels, 384 degree gates, and a
+    fixed 14-coefficient reduced spherical-harmonic representation.  The
+    l-to-m permutation before and after GateActivation cancels, so the gate
+    can be applied directly to the reconstructed m-order coefficients.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        m0: Tensor,
+        m1: Tensor,
+        m2: Tensor,
+        m_degree_index: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if m0.ndim != 2 or m1.ndim != 3 or m2.ndim != 3:
+            raise UnsupportedFusionConfigError(
+                "SO2 gate bridge received invalid conv1 Linear output ranks"
+            )
+        expected = (
+            (m0.shape[0], 896),
+            (m0.shape[0], 2, 768),
+            (m0.shape[0], 2, 512),
+        )
+        if (
+            tuple(m0.shape) != expected[0]
+            or tuple(m1.shape) != expected[1]
+            or tuple(m2.shape) != expected[2]
+        ):
+            raise UnsupportedFusionConfigError(
+                "SO2 gate bridge requires m0=[E,896], m1=[E,2,768], "
+                f"m2=[E,2,512], got {tuple(m0.shape)}, {tuple(m1.shape)}, "
+                f"{tuple(m2.shape)}"
+            )
+        m0 = m0.contiguous()
+        m1 = m1.contiguous()
+        m2 = m2.contiguous()
+        m_degree_index = m_degree_index.contiguous()
+        _require_triton_cuda_fp32(m0, m1, m2, m_degree_index)
+        if not (m0.device == m1.device == m2.device == m_degree_index.device):
+            raise UnsupportedFusionConfigError(
+                "SO2 gate bridge tensors must be on the same CUDA device"
+            )
+        if m_degree_index.dtype != torch.long or m_degree_index.shape != (14,):
+            raise UnsupportedFusionConfigError(
+                "SO2 gate bridge requires a [14] int64 degree mapping"
+            )
+        out0 = m0.new_empty((m0.shape[0], 512))
+        out1 = m0.new_empty((m0.shape[0], 2, 384))
+        out2 = m0.new_empty((m0.shape[0], 2, 256))
+        if m0.shape[0] > 0:
+            total = 14 * 128
+            _so2_gate_bridge_kernel[
+                (m0.shape[0], triton.cdiv(total, SO2_KERNEL_BLOCK))
+            ](
+                m0,
+                m1,
+                m2,
+                m_degree_index,
+                out0,
+                out1,
+                out2,
+                rows=m0.shape[0],
+                coefficients=14,
+                channels=128,
+                extra_channels=384,
+                block=SO2_KERNEL_BLOCK,
+                num_warps=4,
+            )
+        ctx.save_for_backward(m0, m1, m2, m_degree_index)
+        return out0, out1, out2
+
+    @staticmethod
+    def backward(ctx, grad_out0: Tensor, grad_out1: Tensor, grad_out2: Tensor):
+        m0, m1, m2, m_degree_index = ctx.saved_tensors
+        grad_out0 = grad_out0.contiguous()
+        grad_out1 = grad_out1.contiguous()
+        grad_out2 = grad_out2.contiguous()
+        grad_m0 = torch.empty_like(m0)
+        grad_m1 = torch.empty_like(m1)
+        grad_m2 = torch.empty_like(m2)
+        if m0.shape[0] > 0:
+            _so2_gate_bridge_backward_kernel[(m0.shape[0],)](
+                grad_out0,
+                grad_out1,
+                grad_out2,
+                m0,
+                m1,
+                m2,
+                m_degree_index,
+                grad_m0,
+                grad_m1,
+                grad_m2,
+                rows=m0.shape[0],
+                channels=128,
+                extra_channels=384,
+                block=128,
+                num_warps=4,
+            )
+        return grad_m0, grad_m1, grad_m2, None
+
+
 class _FusedRadialMLP(torch.autograd.Function):
     """One Triton kernel for the whole RadialMLP row chain."""
 
@@ -2150,7 +2637,7 @@ class FusedSO2Convolution(nn.Module):
                 "SO2 radial feature width does not match m=0/m=1/m=2 inputs"
             )
 
-    def forward(self, x: Tensor, x_edge: Tensor):
+    def prepare(self, x: Tensor, x_edge: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         if x.ndim != 3 or x.shape[1:] != (14, self.sphere_channels):
             raise UnsupportedFusionConfigError(
                 f"FusedSO2Convolution expected x=[E,14,{self.sphere_channels}], got {tuple(x.shape)}"
@@ -2161,18 +2648,90 @@ class FusedSO2Convolution(nn.Module):
         else:
             radial = x.new_empty((x.shape[0], 0))
             use_radial = False
-        x0, x1, x2 = _SO2Prepare.apply(
+        return _SO2Prepare.apply(
             x.contiguous(), radial, self.to_m_index, use_radial, self.radial_channels
         )
-        m0 = self.fc_m0(x0)
-        m1 = self.so2_m_conv[0].fc(x1)
-        m2 = self.so2_m_conv[1].fc(x2)
+
+    def linear_from_prepared(
+        self, x0: Tensor, x1: Tensor, x2: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        return (
+            self.fc_m0(x0),
+            self.so2_m_conv[0].fc(x1),
+            self.so2_m_conv[1].fc(x2),
+        )
+
+    def prepare_and_linear(
+        self, x: Tensor, x_edge: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        return self.linear_from_prepared(*self.prepare(x, x_edge))
+
+    def epilogue(self, m0: Tensor, m1: Tensor, m2: Tensor):
         out, gating = _SO2Epilogue.apply(
             m0, m1, m2, self.l_to_m_index, self.extra_m0_output_channels
         )
         if self.extra_m0_output_channels:
             return out, gating
         return out
+
+    def forward(self, x: Tensor, x_edge: Tensor):
+        return self.epilogue(*self.prepare_and_linear(x, x_edge))
+
+
+class FusedSO2GateBridge(nn.Module):
+    """Fused conv1-epilogue, gate activation, and conv2-prepare bridge."""
+
+    def __init__(
+        self, conv1: FusedSO2Convolution, conv2: FusedSO2Convolution
+    ) -> None:
+        super().__init__()
+        if not isinstance(conv1, FusedSO2Convolution) or not isinstance(
+            conv2, FusedSO2Convolution
+        ):
+            raise UnsupportedFusionConfigError(
+                "SO2 gate bridge requires two fused SO2 convolutions"
+            )
+        if (
+            conv1.sphere_channels != 256
+            or conv1.m_output_channels != 128
+            or conv1.extra_m0_output_channels != 384
+            or conv2.sphere_channels != 128
+            or conv2.m_output_channels != 128
+            or conv2.extra_m0_output_channels != 0
+        ):
+            raise UnsupportedFusionConfigError(
+                "SO2 gate bridge only supports the 30M Edgewise conv1/conv2 pair"
+            )
+        if not torch.equal(conv1.to_m_index, conv2.to_m_index):
+            raise UnsupportedFusionConfigError(
+                "SO2 gate bridge requires matching conv1/conv2 permutations"
+            )
+        l_degree = torch.tensor(
+            [0, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3],
+            dtype=torch.long,
+            device=conv1.to_m_index.device,
+        )
+        m_degree = l_degree.index_select(0, conv1.to_m_index)
+        expected = torch.tensor(
+            [0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3, 2, 3],
+            dtype=torch.long,
+            device=m_degree.device,
+        )
+        if not torch.equal(m_degree, expected):
+            raise UnsupportedFusionConfigError(
+                "SO2 gate bridge received an unsupported coefficient permutation"
+            )
+        self.register_buffer("m_degree_index", m_degree, persistent=False)
+
+    def forward(
+        self, m0: Tensor, m1: Tensor, m2: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        return _SO2GateBridge.apply(
+            m0.contiguous(),
+            m1.contiguous(),
+            m2.contiguous(),
+            self.m_degree_index,
+        )
 
 
 def gather_cat_wigner(x: Tensor, edge_index: Tensor, wigner: Tensor, out_mask: Tensor) -> Tensor:
@@ -2255,6 +2814,7 @@ class FusedEdgewise(nn.Module):
         gather: bool,
         reverse: bool,
         so2_epilogue: bool = False,
+        so2_gate_bridge: bool = False,
     ) -> None:
         super().__init__()
         self.sphere_channels = original.sphere_channels
@@ -2275,6 +2835,17 @@ class FusedEdgewise(nn.Module):
         self.fuse_gather = gather
         self.fuse_reverse = reverse
         self.fuse_so2_epilogue = so2_epilogue
+        self.fuse_so2_gate_bridge = so2_gate_bridge
+        if so2_gate_bridge:
+            if not isinstance(self.act, GateActivation):
+                raise UnsupportedFusionConfigError(
+                    "SO2 gate bridge requires the official Edgewise GateActivation"
+                )
+            self.so2_gate_bridge = FusedSO2GateBridge(
+                self.so2_conv_1, self.so2_conv_2
+            )
+        else:
+            self.so2_gate_bridge = None
 
     def forward(self, x, x_edge, edge_distance, edge_index, wigner, wigner_inv, node_offset: int = 0):
         out_mask = self.out_mask.to(device=x.device)
@@ -2283,9 +2854,16 @@ class FusedEdgewise(nn.Module):
         else:
             x_message = torch.cat((x[edge_index[0]], x[edge_index[1]]), dim=2)
             x_message = torch.bmm(wigner[:, out_mask, :], x_message)
-        x_message, x_0_gating = self.so2_conv_1(x_message, x_edge)
-        x_message = self.act(x_0_gating, x_message)
-        x_message = self.so2_conv_2(x_message, x_edge)
+        if self.fuse_so2_gate_bridge:
+            m0, m1, m2 = self.so2_conv_1.prepare_and_linear(x_message, x_edge)
+            x0, x1, x2 = self.so2_gate_bridge(m0, m1, m2)
+            x_message = self.so2_conv_2.epilogue(
+                *self.so2_conv_2.linear_from_prepared(x0, x1, x2)
+            )
+        else:
+            x_message, x_0_gating = self.so2_conv_1(x_message, x_edge)
+            x_message = self.act(x_0_gating, x_message)
+            x_message = self.so2_conv_2(x_message, x_edge)
         if self.fuse_reverse:
             return reverse_envelope_scatter(
                 x_message, wigner_inv, out_mask, edge_distance,
@@ -2468,6 +3046,10 @@ class FusionMetadata:
     so2_prepare_kernel_count: int
     so2_epilogue_kernel_count: int
     so2_fusion_kernel_version: str
+    so2_gate_bridge_replacements: int
+    so2_gate_bridge_forward_kernel_count: int
+    so2_gate_bridge_backward_kernel_count: int
+    so2_gate_bridge_kernel_version: str
     configure_wall_time_s: float
     torch_version: str
     triton_version: str
@@ -2487,6 +3069,18 @@ class FusionMetadata:
             "model_fusion_so2_prepare_kernel_count": self.so2_prepare_kernel_count,
             "model_fusion_so2_epilogue_kernel_count": self.so2_epilogue_kernel_count,
             "model_fusion_so2_kernel_version": self.so2_fusion_kernel_version,
+            "model_fusion_so2_gate_bridge_replacements": (
+                self.so2_gate_bridge_replacements
+            ),
+            "model_fusion_so2_gate_bridge_forward_kernel_count": (
+                self.so2_gate_bridge_forward_kernel_count
+            ),
+            "model_fusion_so2_gate_bridge_backward_kernel_count": (
+                self.so2_gate_bridge_backward_kernel_count
+            ),
+            "model_fusion_so2_gate_bridge_kernel_version": (
+                self.so2_gate_bridge_kernel_version
+            ),
             "model_fusion_configure_wall_time_s": self.configure_wall_time_s,
             "model_fusion_torch_version": self.torch_version,
             "model_fusion_triton_version": self.triton_version,
@@ -2553,6 +3147,7 @@ def configure_esen_30m_model_fusions(
     gather = "gather-wigner" in selected
     reverse = "reverse-scatter" in selected
     so2 = "so2-epilogue" in selected
+    so2_gate_bridge = "so2-gate-bridge" in selected
     edgewise_count = 0
     edge_embedding_count = 0
     rmsnorm_count = 0
@@ -2561,6 +3156,7 @@ def configure_esen_30m_model_fusions(
     so3_count = 0
     energy_count = 0
     so2_count = 0
+    so2_gate_bridge_count = 0
 
     # radial-mlp first: the FusedEdgewise / FusedEdgeDegreeEmbedding wrappers
     # installed below hold references to these rad_func objects.
@@ -2611,8 +3207,16 @@ def configure_esen_30m_model_fusions(
                 gather=gather,
                 reverse=reverse,
                 so2_epilogue=so2,
+                so2_gate_bridge=so2_gate_bridge,
             )
             edgewise_count += 1
+            if so2_gate_bridge:
+                so2_gate_bridge_count += 1
+    if so2_gate_bridge and so2_gate_bridge_count != 10:
+        raise UnsupportedFusionConfigError(
+            "SO2 gate bridge must replace all 10 Edgewise blocks, replaced "
+            f"{so2_gate_bridge_count}"
+        )
 
     if "rmsnorm" in selected:
         norms = [backbone.norm]
@@ -2669,9 +3273,16 @@ def configure_esen_30m_model_fusions(
         so3_mlp_replacements=so3_count,
         energy_head_replacements=energy_count,
         so2_convolution_replacements=so2_count,
-        so2_prepare_kernel_count=so2_count,
-        so2_epilogue_kernel_count=so2_count,
+        # KF10 bypasses conv1 epilogue and conv2 prepare once per Edgewise.
+        so2_prepare_kernel_count=so2_count - so2_gate_bridge_count,
+        so2_epilogue_kernel_count=so2_count - so2_gate_bridge_count,
         so2_fusion_kernel_version=(SO2_FUSION_KERNEL_VERSION if so2 else ""),
+        so2_gate_bridge_replacements=so2_gate_bridge_count,
+        so2_gate_bridge_forward_kernel_count=so2_gate_bridge_count,
+        so2_gate_bridge_backward_kernel_count=so2_gate_bridge_count,
+        so2_gate_bridge_kernel_version=(
+            SO2_GATE_BRIDGE_KERNEL_VERSION if so2_gate_bridge else ""
+        ),
         configure_wall_time_s=time.perf_counter() - start,
         torch_version=torch.__version__,
         triton_version=str(getattr(triton, "__version__", "unknown")),

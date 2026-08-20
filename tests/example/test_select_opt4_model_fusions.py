@@ -22,6 +22,7 @@ def _record(
     seconds: float,
     *,
     scope: str = "whole-step",
+    peak_reserved_gib: float = 1.0,
 ) -> dict[str, object]:
     if scope == "model-only":
         base_backend = "esen_gpu_resident_model_cg"
@@ -40,6 +41,7 @@ def _record(
         "graph_invariants_pass": True,
         "cuda_graph_capacity_misses": 0,
         "cuda_graph_capture_count": 1,
+        "peak_reserved_gib": peak_reserved_gib,
     }
 
 
@@ -150,3 +152,53 @@ def test_selector_supports_model_only_scope(tmp_path, monkeypatch):
     result = json.loads(output.read_text(encoding="utf-8"))
     assert result["scope"] == "model-only"
     assert result["accepted"] is True
+
+
+def test_selector_rejects_peak_reserved_guardrail(tmp_path, monkeypatch):
+    module = _load_module()
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    for repeat in range(1, 4):
+        records = (
+            _record("KF9", repeat, 1.0, peak_reserved_gib=2.0),
+            _record("KF10", repeat, 0.9, peak_reserved_gib=3.25),
+        )
+        for index, record in enumerate(records):
+            (result_dir / f"{repeat}_{index}.json").write_text(
+                json.dumps(record), encoding="utf-8"
+            )
+    _write_status_tsv(tmp_path, "whole-step", "KF10", "success")
+    # Keep status coverage aligned with the three result pairs used here.
+    status = (tmp_path / "run_status.tsv").read_text(encoding="utf-8")
+    (tmp_path / "run_status.tsv").write_text(
+        "\n".join(status.splitlines()[:4]) + "\n", encoding="utf-8"
+    )
+    output = tmp_path / "selection.json"
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        [
+            str(SCRIPT),
+            "--input-dir",
+            str(tmp_path),
+            "--scope",
+            "whole-step",
+            "--base-stage",
+            "KF9",
+            "--candidate-stage",
+            "KF10",
+            "--candidate-fusion",
+            "so2-gate-bridge",
+            "--min-paired-repeats",
+            "3",
+            "--min-faster-directions",
+            "3",
+            "--maximum-peak-reserved-increase-gib",
+            "1.0",
+            "--output",
+            str(output),
+        ],
+    )
+    assert module.main() == 1
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["reserved_memory_ok"] is False

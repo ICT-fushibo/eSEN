@@ -224,6 +224,12 @@ class Config:
     model_candidate_fusions: str
     whole_base_fusions: str
     whole_candidate_fusions: str
+    model_base_stage: str
+    model_candidate_stage: str
+    whole_base_stage: str
+    whole_candidate_stage: str
+    run_kind: str
+    status_filename: str
     resume: bool
     python: str
 
@@ -231,6 +237,8 @@ class Config:
     def from_environment(cls) -> "Config":
         repo = Path(_env("REPO_ROOT", str(Path(__file__).resolve().parents[1]))).resolve()
         baseline = os.environ.get("BASELINE_DIR", "").strip()
+        model_base_fusions = _env("MODEL_BASE_FUSIONS", "")
+        whole_base_fusions = _env("WHOLE_BASE_FUSIONS", "")
         return cls(
             repo_root=repo,
             root_output=Path(
@@ -256,12 +264,22 @@ class Config:
             idle_memory_mib=_env_int("GPU_IDLE_MEMORY_MIB", 1024),
             idle_utilization_percent=_env_int("GPU_IDLE_UTILIZATION_PERCENT", 5),
             scopes=_scope_choices(_env("SCOPES", "both")),
-            model_base_fusions=_env("MODEL_BASE_FUSIONS", ""),
+            model_base_fusions=model_base_fusions,
             model_candidate_fusions=_env("MODEL_CANDIDATE_FUSIONS", "so2-epilogue"),
-            whole_base_fusions=_env("WHOLE_BASE_FUSIONS", ""),
+            whole_base_fusions=whole_base_fusions,
             whole_candidate_fusions=_env(
                 "WHOLE_CANDIDATE_FUSIONS", "rmsnorm,so2-epilogue"
             ),
+            model_base_stage=_env(
+                "MODEL_BASE_STAGE", "MODEL_BASE" if model_base_fusions else "OPT2"
+            ),
+            model_candidate_stage=_env("MODEL_CANDIDATE_STAGE", "OPT4V1"),
+            whole_base_stage=_env(
+                "WHOLE_BASE_STAGE", "WHOLE_BASE" if whole_base_fusions else "OPT3"
+            ),
+            whole_candidate_stage=_env("WHOLE_CANDIDATE_STAGE", "OPT4V1"),
+            run_kind=_env("RUN_KIND", "opt4_v1_kf9_formal_performance"),
+            status_filename=_env("STATUS_FILENAME", "v1_status.tsv"),
             resume=_env("RESUME", "1") not in {"0", "false", "False"},
             python=sys.executable,
         )
@@ -393,13 +411,13 @@ class Scheduler:
             log_dir.mkdir(parents=True, exist_ok=True)
             _ensure_status(status_path)
             if scope == "model-only":
-                base_stage = "OPT2" if not self.config.model_base_fusions else "MODEL_BASE"
-                candidate_stage = "OPT4V1"
+                base_stage = self.config.model_base_stage
+                candidate_stage = self.config.model_candidate_stage
                 base_fusions = self.config.model_base_fusions
                 candidate_fusions = self.config.model_candidate_fusions
             else:
-                base_stage = "OPT3" if not self.config.whole_base_fusions else "WHOLE_BASE"
-                candidate_stage = "OPT4V1"
+                base_stage = self.config.whole_base_stage
+                candidate_stage = self.config.whole_candidate_stage
                 base_fusions = self.config.whole_base_fusions
                 candidate_fusions = self.config.whole_candidate_fusions
 
@@ -548,7 +566,7 @@ class Scheduler:
         _write_json(
             self.config.root_output / "run_metadata.json",
             {
-                "kind": "opt4_v1_kf9_formal_performance",
+                "kind": self.config.run_kind,
                 "repo_commit": subprocess.run(
                     ["git", "-C", str(self.config.repo_root), "rev-parse", "HEAD"],
                     check=False,
@@ -566,6 +584,10 @@ class Scheduler:
                 "model_candidate_fusions": self.config.model_candidate_fusions,
                 "whole_base_fusions": self.config.whole_base_fusions,
                 "whole_candidate_fusions": self.config.whole_candidate_fusions,
+                "model_base_stage": self.config.model_base_stage,
+                "model_candidate_stage": self.config.model_candidate_stage,
+                "whole_base_stage": self.config.whole_base_stage,
+                "whole_candidate_stage": self.config.whole_candidate_stage,
                 "gpus": self.config.gpus,
                 "gpu_idle_seconds": self.config.idle_seconds,
                 "gpu_poll_seconds": self.config.poll_seconds,
@@ -590,7 +612,7 @@ class Scheduler:
                 for row in csv.DictReader(handle, delimiter="\t"):
                     rows.append((row["scope"], row["status"], 1))
         counts = Counter((scope, status) for scope, status, _ in rows)
-        summary_path = self.config.root_output / "v1_status.tsv"
+        summary_path = self.config.root_output / self.config.status_filename
         with summary_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
             writer.writerow(("scope", "status", "count"))
@@ -609,7 +631,8 @@ class Scheduler:
         )
         self._write_metadata(expected)
         print(
-            f"Opt4 v1 queue: pending={len(tasks)} expected_total={expected} "
+            f"{self.config.run_kind} queue: pending={len(tasks)} "
+            f"expected_total={expected} "
             f"scopes={self.config.scopes} GPUs={self.config.gpus} "
             f"idle_window={self.config.idle_seconds:.0f}s",
             flush=True,
@@ -626,9 +649,16 @@ class Scheduler:
                 time.sleep(self.config.poll_seconds)
         self._write_summary()
         if self.stop_requested:
-            print("Opt4 v1 queue interrupted; active tasks were terminated", file=sys.stderr)
+            print(
+                f"{self.config.run_kind} queue interrupted; "
+                "active tasks were terminated",
+                file=sys.stderr,
+            )
             return 130
-        print(f"Opt4 v1 queue completed: {self.config.root_output}", flush=True)
+        print(
+            f"{self.config.run_kind} queue completed: {self.config.root_output}",
+            flush=True,
+        )
         return 0
 
     def stop(self) -> None:

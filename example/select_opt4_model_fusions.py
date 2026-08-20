@@ -94,11 +94,18 @@ def main() -> int:
     parser.add_argument("--maximum-system-regression", type=float, default=0.01)
     parser.add_argument("--min-paired-repeats", type=int, default=5)
     parser.add_argument("--min-faster-directions", type=int, default=4)
+    parser.add_argument(
+        "--maximum-peak-reserved-increase-gib",
+        type=float,
+        default=None,
+        help="Optional median candidate-minus-base peak reserved memory guardrail",
+    )
     args = parser.parse_args()
 
     statuses = _read_status(args.input_dir / "run_status.tsv")
     records = _load_records(args.input_dir, args.scope)
     grouped: dict[tuple[str, int, str], dict[int, float]] = defaultdict(dict)
+    reserved_grouped: dict[tuple[str, int, str], dict[int, float]] = defaultdict(dict)
     records_by_stage: dict[str, list[dict[str, object]]] = defaultdict(list)
     for record in records:
         stage = str(record.get("kernel_fusion_stage", ""))
@@ -106,6 +113,10 @@ def main() -> int:
         grouped[key][int(record.get("repeat", 1))] = float(
             record["seconds_per_step"]
         )
+        if record.get("peak_reserved_gib") is not None:
+            reserved_grouped[key][int(record.get("repeat", 1))] = float(
+                record["peak_reserved_gib"]
+            )
         records_by_stage[stage].append(record)
 
     systems = sorted(
@@ -126,6 +137,20 @@ def main() -> int:
             candidate_by_repeat[repeat] < base_by_repeat[repeat]
             for repeat in repeats
         )
+        base_reserved = reserved_grouped[(system, temperature, args.base_stage)]
+        candidate_reserved = reserved_grouped[
+            (system, temperature, args.candidate_stage)
+        ]
+        reserved_repeats = sorted(set(base_reserved) & set(candidate_reserved))
+        reserved_deltas = [
+            candidate_reserved[repeat] - base_reserved[repeat]
+            for repeat in reserved_repeats
+        ]
+        reserved_delta = (
+            median(reserved_deltas)
+            if reserved_repeats
+            else None
+        )
         comparisons.append(
             {
                 "system": system,
@@ -137,6 +162,16 @@ def main() -> int:
                 "paired_repeats": paired,
                 "delta_exceeds_mad_sum": (
                     abs(base_median - candidate_median) > _mad(base) + _mad(candidate)
+                ),
+                "peak_reserved_increase_gib_median": reserved_delta,
+                "peak_reserved_paired_repeats": len(reserved_repeats),
+                "peak_reserved_increase_over_limit_directions": (
+                    None
+                    if args.maximum_peak_reserved_increase_gib is None
+                    else sum(
+                        delta > args.maximum_peak_reserved_increase_gib
+                        for delta in reserved_deltas
+                    )
                 ),
             }
         )
@@ -176,6 +211,8 @@ def main() -> int:
         and record.get("performance_sample_eligible", True) is not False
         and int(record.get("cuda_graph_capacity_misses", 0)) == 0
         and int(record.get("cuda_graph_capture_count", 0)) == 1
+        and int(record.get("cuda_graph_production_capture_count", 0)) == 0
+        and float(record.get("cuda_graph_hit_rate", 1.0)) == 1.0
         for record in candidate_records
     )
     engineering_validation_ok = bool(candidate_records) and all(
@@ -241,6 +278,22 @@ def main() -> int:
         row["speedup"] >= 1.0 - args.maximum_system_regression
         for row in guardrail_comparisons
     )
+    reserved_memory_ok = (
+        args.maximum_peak_reserved_increase_gib is None
+        or (
+            bool(comparisons)
+            and all(
+                row["peak_reserved_increase_gib_median"] is not None
+                and not (
+                    row["peak_reserved_paired_repeats"]
+                    >= args.min_paired_repeats
+                    and row["peak_reserved_increase_over_limit_directions"]
+                    == row["peak_reserved_paired_repeats"]
+                )
+                for row in comparisons
+            )
+        )
+    )
     if focus_set:
         accepted = (
             structural_ok
@@ -249,6 +302,7 @@ def main() -> int:
             and focus_no_regression
             and focus_geomean >= args.minimum_geomean_speedup
             and guardrail_ok
+            and reserved_memory_ok
         )
     else:
         accepted = (
@@ -257,6 +311,7 @@ def main() -> int:
             and stable
             and no_regression
             and geomean >= args.minimum_geomean_speedup
+            and reserved_memory_ok
         )
     before = [item for item in args.accepted_before.split(",") if item]
     after = before + ([args.candidate_fusion] if accepted else [])
@@ -274,6 +329,8 @@ def main() -> int:
         "focus_stable": focus_stable,
         "focus_no_system_regression": focus_no_regression,
         "guardrail_ok": guardrail_ok,
+        "reserved_memory_ok": reserved_memory_ok,
+        "maximum_peak_reserved_increase_gib": args.maximum_peak_reserved_increase_gib,
         "structural_ok": structural_ok,
         "coverage_ok": coverage_ok,
         "engineering_validation_ok": engineering_validation_ok,
