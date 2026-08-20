@@ -85,6 +85,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--triton-block-size", type=int, default=256)
     parser.add_argument("--model-fusions", default="")
     parser.add_argument("--fusion-stage", default="")
+    parser.add_argument(
+        "--external-profiler",
+        action="store_true",
+        help=(
+            "Call cudaProfilerStart/Stop around the timed production region. "
+            "This is intended for Nsight capture-range=cudaProfilerApi runs."
+        ),
+    )
     parser.add_argument("--md-dtype", choices=("float64",), default="float64")
     args = parser.parse_args()
     if args.steps < 1 or args.warmup_steps < 0 or args.probe_steps < 0:
@@ -118,6 +126,18 @@ def _device_memory_used(torch_module, device) -> int | None:
     except (AttributeError, RuntimeError):
         return None
     return int(total_bytes - free_bytes)
+
+
+def _start_external_profiler(torch_module) -> None:
+    result = torch_module.cuda.cudart().cudaProfilerStart()
+    if result not in (None, 0):
+        raise RuntimeError(f"cudaProfilerStart failed: {result}")
+
+
+def _stop_external_profiler(torch_module) -> None:
+    result = torch_module.cuda.cudart().cudaProfilerStop()
+    if result not in (None, 0):
+        raise RuntimeError(f"cudaProfilerStop failed: {result}")
 
 
 def _engineering_energy_validation(
@@ -418,6 +438,8 @@ def main() -> int:
     torch.cuda.reset_peak_memory_stats()
     device_used_before_timing = _device_memory_used(torch, device)
     torch.cuda.synchronize()
+    if args.external_profiler:
+        _start_external_profiler(torch)
     timed_start = time.perf_counter()
     if fixed_builder_backend:
         assert dynamics is not None
@@ -440,6 +462,8 @@ def main() -> int:
         final_state = whole_md.state_view()
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - timed_start
+    if args.external_profiler:
+        _stop_external_profiler(torch)
     device_used_after_timing = _device_memory_used(torch, device)
     checkpoint_energies = {
         step: float(value.item()) for step, value in checkpoint_tensors.items()
@@ -551,6 +575,7 @@ def main() -> int:
         "amp": False,
         "tf32": False,
         "torch_compile": False,
+        "external_profiler_range": args.external_profiler,
         "kernel_fusion": kf1_backend or opt4_backend,
         "kernel_fusion_stage": (
             "KF1" if kf1_backend else (args.fusion_stage if opt4_backend else "KF0")

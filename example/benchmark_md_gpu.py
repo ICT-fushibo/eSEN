@@ -114,6 +114,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cg-eager-force-atol", type=float, default=2e-4)
     parser.add_argument("--model-fusions", default="")
     parser.add_argument("--fusion-stage", default="")
+    parser.add_argument(
+        "--external-profiler",
+        action="store_true",
+        help=(
+            "Call cudaProfilerStart/Stop around the timed production region. "
+            "This is intended for Nsight capture-range=cudaProfilerApi runs."
+        ),
+    )
     parser.add_argument("--energy-per-atom-atol", type=float, default=1e-5)
     parser.add_argument("--force-max-atol", type=float, default=2e-4)
     args = parser.parse_args()
@@ -171,6 +179,18 @@ def package_version(name: str) -> str:
         return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
         return "unknown"
+
+
+def _start_external_profiler(torch_module) -> None:
+    result = torch_module.cuda.cudart().cudaProfilerStart()
+    if result not in (None, 0):
+        raise RuntimeError(f"cudaProfilerStart failed: {result}")
+
+
+def _stop_external_profiler(torch_module) -> None:
+    result = torch_module.cuda.cudart().cudaProfilerStop()
+    if result not in (None, 0):
+        raise RuntimeError(f"cudaProfilerStop failed: {result}")
 
 
 def git_commit() -> str:
@@ -529,6 +549,8 @@ def main() -> int:
     completed_steps = 0
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
+    if args.external_profiler:
+        _start_external_profiler(torch)
     start = time.perf_counter()
     for checkpoint_step in reached_energy_checkpoints(args.steps):
         dynamics.run(checkpoint_step - completed_steps)
@@ -544,6 +566,8 @@ def main() -> int:
         dynamics.run(args.steps - completed_steps)
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
+    if args.external_profiler:
+        _stop_external_profiler(torch)
     checkpoint_energies = {
         step: float(value.item()) for step, value in checkpoint_energy_tensors.items()
     }
@@ -611,6 +635,7 @@ def main() -> int:
         "amp": False,
         "tf32": False,
         "torch_compile": False,
+        "external_profiler_range": args.external_profiler,
         "cuda_graph": model_cg_backend,
         "cuda_graph_scope": "model_only" if model_cg_backend else "none",
         "cuda_graph_neighbor_build_outside": model_cg_backend,
