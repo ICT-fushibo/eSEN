@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 
@@ -8,8 +10,11 @@ from fairchem.core.applications.esen_opt4_model_fusion import (
     FusedGateActivation,
     FusedRadialMLP,
     FusedRMSNormSH,
+    FusedSO2Convolution,
     FusedSpectralAtomwise,
     UnsupportedFusionConfigError,
+    _SO2Epilogue,
+    _SO2Prepare,
     gather_cat_wigner,
     model_fusion_available,
     parse_model_fusions,
@@ -22,11 +27,62 @@ from fairchem.core.models.esen.nn.layer_norm import (
     EquivariantRMSNormArraySphericalHarmonicsV2,
 )
 from fairchem.core.models.esen.nn.radial import RadialMLP
+from fairchem.core.models.esen.common.so3 import CoefficientMapping
+from fairchem.core.models.esen.nn.so2_layers import SO2_Convolution
 
 
 RTOL = 2e-4
 ATOL = 2e-5
 CUDA_TRITON = torch.cuda.is_available() and model_fusion_available()
+
+
+def _so2_indices(mapping):
+    to_m = mapping.to_m.argmax(dim=1).to(dtype=torch.long)
+    l_to_m = torch.empty_like(to_m)
+    l_to_m[to_m] = torch.arange(14, device=to_m.device)
+    return to_m, l_to_m
+
+
+def _reference_so2_prepare(x, radial, mapping):
+    channels = x.shape[2]
+    mapped = torch.einsum("nac,ba->nbc", x, mapping.to_m)
+    m0 = mapped[:, :4] * radial[:, : 4 * channels].reshape(-1, 4, channels)
+    m1 = mapped[:, 4:10].reshape(-1, 2, 3 * channels)
+    m1 = m1 * radial[:, 4 * channels : 7 * channels].reshape(
+        -1, 1, 3 * channels
+    )
+    m2 = mapped[:, 10:14].reshape(-1, 2, 2 * channels)
+    m2 = m2 * radial[:, 7 * channels :].reshape(-1, 1, 2 * channels)
+    return (
+        m0.reshape(-1, 4 * channels),
+        m1,
+        m2,
+    )
+
+
+def _reference_so2_epilogue(m0, m1, m2, mapping, extra_channels):
+    channels = m1.shape[2] // 6
+
+    def combine(value, coefficients):
+        half = coefficients * channels
+        real = value[:, :, :half]
+        imag = value[:, :, half:]
+        combined_real = real[:, 0:1] - imag[:, 1:2]
+        combined_imag = real[:, 1:2] + imag[:, 0:1]
+        return torch.cat((combined_real, combined_imag), dim=1).reshape(
+            -1, 2 * coefficients, channels
+        )
+
+    gating = m0[:, :extra_channels]
+    m_order = torch.cat(
+        (
+            m0[:, extra_channels:].reshape(-1, 4, channels),
+            combine(m1, 3),
+            combine(m2, 2),
+        ),
+        dim=1,
+    )
+    return torch.einsum("nac,ab->nbc", m_order, mapping.to_m), gating
 
 
 def test_energy_head_discovery_supports_moduledict_and_legacy_layouts():
@@ -48,6 +104,189 @@ def test_parse_model_fusions_is_ordered_and_strict():
     )
     with pytest.raises(UnsupportedFusionConfigError, match="unknown"):
         parse_model_fusions("unknown")
+    assert parse_model_fusions("so2-epilogue,rmsnorm") == (
+        "rmsnorm",
+        "so2-epilogue",
+    )
+
+
+def test_so2_epilogue_rejects_non_permutation_mapping():
+    mapping = CoefficientMapping(3, 2)
+    mapping.to_m[1].zero_()
+    mapping.to_m[1, 0] = 1.0
+    reference = SO2_Convolution(128, 128, 3, 2, mapping)
+    with pytest.raises(UnsupportedFusionConfigError, match="permutation"):
+        FusedSO2Convolution(reference)
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_prepare_forward_and_gradients_match_torch():
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    mapping = CoefficientMapping(3, 2).to(device)
+    to_m, _ = _so2_indices(mapping)
+    edges, channels = 5, 256
+    x_values = torch.randn(edges, 14, channels, device=device)
+    x_values[1] = x_values[0]
+    x_values[-1].zero_()
+    radial_values = torch.randn(edges, 9 * channels, device=device)
+    x_ref = x_values.detach().clone().requires_grad_(True)
+    radial_ref = radial_values.detach().clone().requires_grad_(True)
+    x_actual = (
+        x_values.detach().transpose(1, 2).contiguous().transpose(1, 2)
+        .requires_grad_(True)
+    )
+    radial_storage = torch.empty(
+        edges, 9 * channels + 1, device=device, dtype=radial_values.dtype
+    )
+    radial_storage[:, : 9 * channels].copy_(radial_values)
+    radial_actual = radial_storage[:, : 9 * channels].detach().requires_grad_(True)
+    assert not x_actual.is_contiguous()
+    assert not radial_actual.is_contiguous()
+    grad = (
+        torch.randn(edges, 4 * channels, device=device),
+        torch.randn(edges, 2, 3 * channels, device=device),
+        torch.randn(edges, 2, 2 * channels, device=device),
+    )
+
+    expected = _reference_so2_prepare(x_ref, radial_ref, mapping)
+    torch.autograd.backward(expected, grad)
+    actual = _SO2Prepare.apply(
+        x_actual, radial_actual, to_m, True, 9 * channels
+    )
+    torch.autograd.backward(actual, grad)
+
+    for actual_part, expected_part in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_part, expected_part, rtol=RTOL, atol=ATOL
+        )
+    torch.testing.assert_close(x_actual.grad, x_ref.grad, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(
+        radial_actual.grad, radial_ref.grad, rtol=RTOL, atol=ATOL
+    )
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_epilogue_forward_and_gradients_match_torch():
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    mapping = CoefficientMapping(3, 2).to(device)
+    _, l_to_m = _so2_indices(mapping)
+    edges, channels, extra = 3, 128, 384
+    values = (
+        torch.randn(edges, 4 * channels + extra, device=device),
+        torch.randn(edges, 2, 6 * channels, device=device),
+        torch.randn(edges, 2, 4 * channels, device=device),
+    )
+    reference_inputs = [value.detach().clone().requires_grad_(True) for value in values]
+    actual_inputs = [value.detach().clone().requires_grad_(True) for value in values]
+    grad_out = torch.randn(edges, 14, channels, device=device)
+    grad_gate = torch.randn(edges, extra, device=device)
+
+    expected = _reference_so2_epilogue(
+        *reference_inputs, mapping, extra
+    )
+    torch.autograd.backward(expected, (grad_out, grad_gate))
+    actual = _SO2Epilogue.apply(*actual_inputs, l_to_m, extra)
+    torch.autograd.backward(actual, (grad_out, grad_gate))
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual[1], expected[1], rtol=RTOL, atol=ATOL)
+    for actual_input, expected_input in zip(actual_inputs, reference_inputs):
+        torch.testing.assert_close(
+            actual_input.grad, expected_input.grad, rtol=RTOL, atol=ATOL
+        )
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_epilogue_external_radial_forward_and_gradients_match_torch():
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    mapping = CoefficientMapping(3, 2).to(device)
+    reference = SO2_Convolution(
+        256,
+        128,
+        3,
+        2,
+        mapping,
+        internal_weights=False,
+        edge_channels_list=[32, 64],
+        extra_m0_output_channels=384,
+    ).cuda().eval()
+    fused = FusedSO2Convolution(copy.deepcopy(reference).cuda().eval())
+    reference.requires_grad_(False)
+    fused.requires_grad_(False)
+    edges = 13
+    x_ref = torch.randn(edges, 14, 256, device=device, requires_grad=True)
+    edge_ref = torch.randn(edges, 32, device=device, requires_grad=True)
+    x_fused = x_ref.detach().clone().requires_grad_(True)
+    edge_fused = edge_ref.detach().clone().requires_grad_(True)
+    grad_out = torch.randn(edges, 14, 128, device=device)
+    grad_gate = torch.randn(edges, 384, device=device)
+
+    expected, expected_gate = reference(x_ref, edge_ref)
+    torch.autograd.backward((expected, expected_gate), (grad_out, grad_gate))
+    actual, actual_gate = fused(x_fused, edge_fused)
+    torch.autograd.backward((actual, actual_gate), (grad_out, grad_gate))
+
+    torch.testing.assert_close(actual, expected, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual_gate, expected_gate, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(x_fused.grad, x_ref.grad, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(edge_fused.grad, edge_ref.grad, rtol=RTOL, atol=ATOL)
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_epilogue_accepts_empty_edge_set():
+    device = torch.device("cuda")
+    mapping = CoefficientMapping(3, 2).to(device)
+    reference = SO2_Convolution(
+        128, 128, 3, 2, mapping, internal_weights=True
+    ).cuda().eval()
+    fused = FusedSO2Convolution(copy.deepcopy(reference).cuda().eval())
+    reference.requires_grad_(False)
+    fused.requires_grad_(False)
+    x_ref = torch.empty(0, 14, 128, device=device, requires_grad=True)
+    x_fused = x_ref.detach().clone().requires_grad_(True)
+    x_edge = torch.empty(0, 0, device=device)
+
+    expected = reference(x_ref, x_edge)
+    actual = fused(x_fused, x_edge)
+    expected.sum().backward()
+    actual.sum().backward()
+
+    torch.testing.assert_close(actual, expected, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(x_fused.grad, x_ref.grad, rtol=RTOL, atol=ATOL)
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_epilogue_internal_weights_is_cuda_graph_capture_safe():
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    mapping = CoefficientMapping(3, 2).to(device)
+    reference = SO2_Convolution(
+        128, 128, 3, 2, mapping, internal_weights=True
+    ).cuda().eval()
+    fused = FusedSO2Convolution(copy.deepcopy(reference).cuda().eval())
+    reference.requires_grad_(False)
+    fused.requires_grad_(False)
+    x = torch.randn(24, 14, 128, device=device, requires_grad=True)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            output = fused(x, x.new_empty((x.shape[0], 0)))
+            torch.autograd.grad(output.sum(), (x,), retain_graph=False)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = fused(x, x.new_empty((x.shape[0], 0)))
+        gradient = torch.autograd.grad(output.sum(), (x,))[0]
+    addresses = (output.data_ptr(), gradient.data_ptr())
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert addresses == (output.data_ptr(), gradient.data_ptr())
 
 
 @pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")

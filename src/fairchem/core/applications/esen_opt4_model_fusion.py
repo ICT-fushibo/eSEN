@@ -22,6 +22,7 @@ from fairchem.core.models.esen.nn.layer_norm import (
     EquivariantRMSNormArraySphericalHarmonicsV2,
 )
 from fairchem.core.models.esen.nn.radial import RadialMLP
+from fairchem.core.models.esen.nn.so2_layers import SO2_Convolution
 
 try:
     import triton
@@ -32,6 +33,8 @@ except ImportError:  # pragma: no cover - exercised by CPU-only import tests
 
 
 FUSION_KERNEL_VERSION = "opt4-model-fusion-v2"
+SO2_FUSION_KERNEL_VERSION = "opt4-model-fusion-v3-so2"
+SO2_KERNEL_BLOCK = 512
 SUPPORTED_FUSIONS = (
     "gather-wigner",
     "reverse-scatter",
@@ -40,6 +43,7 @@ SUPPORTED_FUSIONS = (
     "radial-mlp",
     "so3-mlp",
     "energy-head",
+    "so2-epilogue",
 )
 
 
@@ -589,6 +593,314 @@ if triton is not None:
             total * sigmoid * (1.0 - sigmoid),
             mask=active,
         )
+
+    @triton.jit
+    def _so2_prepare_kernel(
+        x_ptr,
+        radial_ptr,
+        to_m_ptr,
+        m0_ptr,
+        m1_ptr,
+        m2_ptr,
+        rows: tl.constexpr,
+        coefficients: tl.constexpr,
+        channels: tl.constexpr,
+        radial_channels: tl.constexpr,
+        use_radial: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Move l-order coefficients to m-order and apply radial weights.
+
+        The eSEN mapping is a permutation for the supported 30M model.  Keeping
+        this operation in one kernel avoids the generic einsum and the three
+        separate radial multiplication kernels around the cuBLAS Linear calls.
+        """
+        row = tl.program_id(0)
+        tile = tl.program_id(1)
+        offset = tile * block + tl.arange(0, block)
+        active = offset < coefficients * channels
+        coefficient = offset // channels
+        channel = offset % channels
+        source_coefficient = tl.load(to_m_ptr + coefficient, mask=active, other=0)
+        x_offset = (
+            row * coefficients * channels
+            + source_coefficient * channels
+            + channel
+        )
+        value = tl.load(x_ptr + x_offset, mask=active, other=0.0)
+        if use_radial:
+            radial_coefficient = tl.where(
+                coefficient < 4,
+                coefficient,
+                tl.where(
+                    coefficient < 10,
+                    4 + ((coefficient - 4) % 3),
+                    7 + ((coefficient - 10) % 2),
+                ),
+            )
+            radial_offset = row * radial_channels + radial_coefficient * channels + channel
+            value = value * tl.load(radial_ptr + radial_offset, mask=active, other=0.0)
+        m0_mask = active & (coefficient < 4)
+        m1_mask = active & (coefficient >= 4) & (coefficient < 10)
+        m2_mask = active & (coefficient >= 10)
+        tl.store(
+            m0_ptr + row * 4 * channels + coefficient * channels + channel,
+            value,
+            mask=m0_mask,
+        )
+        tl.store(
+            m1_ptr
+            + row * 6 * channels
+            + (coefficient - 4) * channels
+            + channel,
+            value,
+            mask=m1_mask,
+        )
+        tl.store(
+            m2_ptr
+            + row * 4 * channels
+            + (coefficient - 10) * channels
+            + channel,
+            value,
+            mask=m2_mask,
+        )
+
+    @triton.jit
+    def _so2_prepare_backward_kernel(
+        grad_m0_ptr,
+        grad_m1_ptr,
+        grad_m2_ptr,
+        x_ptr,
+        radial_ptr,
+        to_m_ptr,
+        grad_x_ptr,
+        grad_radial_ptr,
+        rows: tl.constexpr,
+        coefficients: tl.constexpr,
+        channels: tl.constexpr,
+        radial_channels: tl.constexpr,
+        use_radial: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        tile = tl.program_id(1)
+        offset = tile * block + tl.arange(0, block)
+        active = offset < coefficients * channels
+        coefficient = offset // channels
+        channel = offset % channels
+        source_coefficient = tl.load(to_m_ptr + coefficient, mask=active, other=0)
+        source_offset = (
+            row * coefficients * channels
+            + source_coefficient * channels
+            + channel
+        )
+        grad_m0 = tl.load(
+            grad_m0_ptr
+            + row * 4 * channels
+            + coefficient * channels
+            + channel,
+            mask=active & (coefficient < 4),
+            other=0.0,
+        )
+        grad_m1 = tl.load(
+            grad_m1_ptr
+            + row * 6 * channels
+            + (coefficient - 4) * channels
+            + channel,
+            mask=active & (coefficient >= 4) & (coefficient < 10),
+            other=0.0,
+        )
+        grad_m2 = tl.load(
+            grad_m2_ptr
+            + row * 4 * channels
+            + (coefficient - 10) * channels
+            + channel,
+            mask=active & (coefficient >= 10),
+            other=0.0,
+        )
+        grad = tl.where(
+            coefficient < 4,
+            grad_m0,
+            tl.where(coefficient < 10, grad_m1, grad_m2),
+        )
+        x_value = tl.load(x_ptr + source_offset, mask=active, other=0.0)
+        if use_radial:
+            radial_coefficient = tl.where(
+                coefficient < 4,
+                coefficient,
+                tl.where(
+                    coefficient < 10,
+                    4 + ((coefficient - 4) % 3),
+                    7 + ((coefficient - 10) % 2),
+                ),
+            )
+            radial_offset = row * radial_channels + radial_coefficient * channels + channel
+            radial_value = tl.load(radial_ptr + radial_offset, mask=active, other=0.0)
+            tl.atomic_add(grad_radial_ptr + radial_offset, grad * x_value, mask=active)
+            grad = grad * radial_value
+        # ``to_m`` is a permutation, so every input coefficient is written by
+        # exactly one output coefficient.  A direct store avoids an unnecessary
+        # zero-fill and atomic operation on the feature gradient.
+        tl.store(grad_x_ptr + source_offset, grad, mask=active)
+
+    @triton.jit
+    def _so2_epilogue_kernel(
+        m0_ptr,
+        m1_ptr,
+        m2_ptr,
+        l_to_m_ptr,
+        out_ptr,
+        gating_ptr,
+        rows: tl.constexpr,
+        output_coefficients: tl.constexpr,
+        output_channels: tl.constexpr,
+        m0_channels: tl.constexpr,
+        m1_coefficients: tl.constexpr,
+        m2_coefficients: tl.constexpr,
+        extra_channels: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        tile = tl.program_id(1)
+        offset = tile * block + tl.arange(0, block)
+        main_size = output_coefficients * output_channels
+        main_active = offset < main_size
+        gate_active = offset >= main_size
+        l_coefficient = offset // output_channels
+        channel = offset % output_channels
+        m_coefficient = tl.load(l_to_m_ptr + l_coefficient, mask=main_active, other=0)
+
+        m0_offset = (
+            row * m0_channels
+            + extra_channels
+            + m_coefficient * output_channels
+            + channel
+        )
+        m0_value = tl.load(m0_ptr + m0_offset, mask=main_active & (m_coefficient < 4), other=0.0)
+
+        m1_local = m_coefficient - 4
+        m1_part = m1_local // m1_coefficients
+        m1_coefficient = m1_local % m1_coefficients
+        m1_half_width = m1_coefficients * output_channels
+        m1_linear_width = 2 * m1_half_width
+        m1_edge_stride = 2 * m1_linear_width
+        m1_base = row * m1_edge_stride + m1_coefficient * output_channels + channel
+        m1_row0_first = tl.load(m1_ptr + m1_base, mask=main_active & (m_coefficient >= 4) & (m_coefficient < 10), other=0.0)
+        m1_row0_second = tl.load(m1_ptr + m1_base + m1_half_width, mask=main_active & (m_coefficient >= 4) & (m_coefficient < 10), other=0.0)
+        m1_row1_first = tl.load(m1_ptr + m1_base + m1_linear_width, mask=main_active & (m_coefficient >= 4) & (m_coefficient < 10), other=0.0)
+        m1_row1_second = tl.load(m1_ptr + m1_base + m1_linear_width + m1_half_width, mask=main_active & (m_coefficient >= 4) & (m_coefficient < 10), other=0.0)
+        m1_value = tl.where(m1_part == 0, m1_row0_first - m1_row1_second, m1_row1_first + m1_row0_second)
+
+        m2_local = m_coefficient - 10
+        m2_part = m2_local // m2_coefficients
+        m2_coefficient = m2_local % m2_coefficients
+        m2_half_width = m2_coefficients * output_channels
+        m2_linear_width = 2 * m2_half_width
+        m2_edge_stride = 2 * m2_linear_width
+        m2_base = row * m2_edge_stride + m2_coefficient * output_channels + channel
+        m2_row0_first = tl.load(m2_ptr + m2_base, mask=main_active & (m_coefficient >= 10), other=0.0)
+        m2_row0_second = tl.load(m2_ptr + m2_base + m2_half_width, mask=main_active & (m_coefficient >= 10), other=0.0)
+        m2_row1_first = tl.load(m2_ptr + m2_base + m2_linear_width, mask=main_active & (m_coefficient >= 10), other=0.0)
+        m2_row1_second = tl.load(m2_ptr + m2_base + m2_linear_width + m2_half_width, mask=main_active & (m_coefficient >= 10), other=0.0)
+        m2_value = tl.where(m2_part == 0, m2_row0_first - m2_row1_second, m2_row1_first + m2_row0_second)
+        value = tl.where(m_coefficient < 4, m0_value, tl.where(m_coefficient < 10, m1_value, m2_value))
+        tl.store(out_ptr + row * main_size + offset, value, mask=main_active)
+
+        if extra_channels > 0:
+            gate_offset = offset - main_size
+            gate_mask = gate_active & (gate_offset < extra_channels)
+            tl.store(
+                gating_ptr + row * extra_channels + gate_offset,
+                tl.load(
+                    m0_ptr + row * m0_channels + gate_offset,
+                    mask=gate_mask,
+                    other=0.0,
+                ),
+                mask=gate_mask,
+            )
+
+    @triton.jit
+    def _so2_epilogue_backward_kernel(
+        grad_out_ptr,
+        grad_gating_ptr,
+        l_to_m_ptr,
+        grad_m0_ptr,
+        grad_m1_ptr,
+        grad_m2_ptr,
+        rows: tl.constexpr,
+        output_coefficients: tl.constexpr,
+        output_channels: tl.constexpr,
+        m0_channels: tl.constexpr,
+        m1_coefficients: tl.constexpr,
+        m2_coefficients: tl.constexpr,
+        extra_channels: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        tile = tl.program_id(1)
+        offset = tile * block + tl.arange(0, block)
+        main_size = output_coefficients * output_channels
+        main_active = offset < main_size
+        gate_active = offset >= main_size
+        l_coefficient = offset // output_channels
+        channel = offset % output_channels
+        m_coefficient = tl.load(l_to_m_ptr + l_coefficient, mask=main_active, other=0)
+        grad = tl.load(grad_out_ptr + row * main_size + offset, mask=main_active, other=0.0)
+
+        m0_mask = main_active & (m_coefficient < 4)
+        m0_offset = row * m0_channels + extra_channels + m_coefficient * output_channels + channel
+        tl.store(grad_m0_ptr + m0_offset, grad, mask=m0_mask)
+
+        m1_mask = main_active & (m_coefficient >= 4) & (m_coefficient < 10)
+        m1_local = m_coefficient - 4
+        m1_part = m1_local // m1_coefficients
+        m1_coefficient = m1_local % m1_coefficients
+        m1_half_width = m1_coefficients * output_channels
+        m1_linear_width = 2 * m1_half_width
+        m1_edge_stride = 2 * m1_linear_width
+        m1_base = row * m1_edge_stride + m1_coefficient * output_channels + channel
+        m1_row0_first = m1_base
+        m1_row0_second = m1_base + m1_half_width
+        m1_row1_first = m1_base + m1_linear_width
+        m1_row1_second = m1_row1_first + m1_half_width
+        m1_real_mask = m1_mask & (m1_part == 0)
+        m1_imag_mask = m1_mask & (m1_part == 1)
+        tl.store(grad_m1_ptr + m1_row0_first, grad, mask=m1_real_mask)
+        tl.store(grad_m1_ptr + m1_row0_second, grad, mask=m1_imag_mask)
+        tl.store(grad_m1_ptr + m1_row1_first, grad, mask=m1_imag_mask)
+        tl.store(grad_m1_ptr + m1_row1_second, -grad, mask=m1_real_mask)
+
+        m2_mask = main_active & (m_coefficient >= 10)
+        m2_local = m_coefficient - 10
+        m2_part = m2_local // m2_coefficients
+        m2_coefficient = m2_local % m2_coefficients
+        m2_half_width = m2_coefficients * output_channels
+        m2_linear_width = 2 * m2_half_width
+        m2_edge_stride = 2 * m2_linear_width
+        m2_base = row * m2_edge_stride + m2_coefficient * output_channels + channel
+        m2_row0_first = m2_base
+        m2_row0_second = m2_base + m2_half_width
+        m2_row1_first = m2_base + m2_linear_width
+        m2_row1_second = m2_row1_first + m2_half_width
+        m2_real_mask = m2_mask & (m2_part == 0)
+        m2_imag_mask = m2_mask & (m2_part == 1)
+        tl.store(grad_m2_ptr + m2_row0_first, grad, mask=m2_real_mask)
+        tl.store(grad_m2_ptr + m2_row0_second, grad, mask=m2_imag_mask)
+        tl.store(grad_m2_ptr + m2_row1_first, grad, mask=m2_imag_mask)
+        tl.store(grad_m2_ptr + m2_row1_second, -grad, mask=m2_real_mask)
+
+        if extra_channels > 0:
+            gate_offset = offset - main_size
+            gate_mask = gate_active & (gate_offset < extra_channels)
+            tl.store(
+                grad_m0_ptr + row * m0_channels + gate_offset,
+                tl.load(
+                    grad_gating_ptr + row * extra_channels + gate_offset,
+                    mask=gate_mask,
+                    other=0.0,
+                ),
+                mask=gate_mask,
+            )
 
     @triton.jit
     def _radial_mlp_forward_kernel(
@@ -1352,6 +1664,183 @@ class _Gate(torch.autograd.Function):
         return grad_gating, grad_x
 
 
+class _SO2Prepare(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: Tensor,
+        radial: Tensor,
+        to_m_index: Tensor,
+        use_radial: bool,
+        radial_channels: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if x.ndim != 3 or x.shape[1] != 14:
+            raise UnsupportedFusionConfigError(
+                f"SO2 prepare expected x=[E,14,C], got {tuple(x.shape)}"
+            )
+        if radial.ndim != 2 or radial.shape[0] != x.shape[0]:
+            raise UnsupportedFusionConfigError(
+                "SO2 prepare expected radial=[E,R] with the same E as x, "
+                f"got {tuple(radial.shape)}"
+            )
+        x = x.contiguous()
+        radial = radial.contiguous()
+        to_m_index = to_m_index.contiguous()
+        _require_triton_cuda_fp32(x, radial, to_m_index)
+        if radial.device != x.device or to_m_index.device != x.device:
+            raise UnsupportedFusionConfigError(
+                "SO2 prepare tensors must be on the same CUDA device"
+            )
+        if to_m_index.dtype != torch.long or to_m_index.shape != (14,):
+            raise UnsupportedFusionConfigError("SO2 prepare requires a [14] int64 permutation")
+        if use_radial and radial.shape[1] != radial_channels:
+            raise UnsupportedFusionConfigError(
+                f"SO2 prepare radial width {radial.shape[1]} != {radial_channels}"
+            )
+        if not use_radial and radial.shape[1] != 0:
+            raise UnsupportedFusionConfigError(
+                "SO2 prepare without radial modulation requires radial=[E,0]"
+            )
+        channels = x.shape[2]
+        m0 = x.new_empty((x.shape[0], 4 * channels))
+        m1 = x.new_empty((x.shape[0], 2, 3 * channels))
+        m2 = x.new_empty((x.shape[0], 2, 2 * channels))
+        if x.shape[0] > 0:
+            total = 14 * x.shape[2]
+            _so2_prepare_kernel[
+                (x.shape[0], triton.cdiv(total, SO2_KERNEL_BLOCK))
+            ](
+                x, radial, to_m_index, m0, m1, m2,
+                rows=x.shape[0], coefficients=14, channels=x.shape[2],
+                radial_channels=int(radial_channels), use_radial=bool(use_radial),
+                block=SO2_KERNEL_BLOCK, num_warps=4,
+            )
+        ctx.save_for_backward(x, radial, to_m_index)
+        ctx.use_radial = bool(use_radial)
+        ctx.radial_channels = int(radial_channels)
+        return m0, m1, m2
+
+    @staticmethod
+    def backward(ctx, grad_m0: Tensor, grad_m1: Tensor, grad_m2: Tensor):
+        x, radial, to_m_index = ctx.saved_tensors
+        grad_m0 = grad_m0.contiguous()
+        grad_m1 = grad_m1.contiguous()
+        grad_m2 = grad_m2.contiguous()
+        grad_x = torch.empty_like(x)
+        grad_radial = torch.zeros_like(radial)
+        if x.shape[0] > 0:
+            total = 14 * x.shape[2]
+            _so2_prepare_backward_kernel[
+                (x.shape[0], triton.cdiv(total, SO2_KERNEL_BLOCK))
+            ](
+                grad_m0, grad_m1, grad_m2,
+                x, radial, to_m_index, grad_x, grad_radial,
+                rows=x.shape[0], coefficients=14, channels=x.shape[2],
+                radial_channels=ctx.radial_channels,
+                use_radial=ctx.use_radial, block=SO2_KERNEL_BLOCK, num_warps=4,
+            )
+        return grad_x, (grad_radial if ctx.use_radial else None), None, None, None
+
+
+class _SO2Epilogue(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        m0: Tensor,
+        m1: Tensor,
+        m2: Tensor,
+        l_to_m_index: Tensor,
+        extra_channels: int,
+    ) -> tuple[Tensor, Tensor]:
+        if m0.ndim != 2 or m1.ndim != 3 or m2.ndim != 3:
+            raise UnsupportedFusionConfigError("SO2 epilogue received invalid Linear shapes")
+        if m1.shape[1] != 2 or m2.shape[1] != 2:
+            raise UnsupportedFusionConfigError("SO2 epilogue requires real/imag Linear outputs")
+        if m0.shape[0] != m1.shape[0] or m0.shape[0] != m2.shape[0]:
+            raise UnsupportedFusionConfigError(
+                "SO2 epilogue Linear outputs must have the same edge count"
+            )
+        if int(extra_channels) < 0:
+            raise UnsupportedFusionConfigError(
+                "SO2 epilogue extra channel count cannot be negative"
+            )
+        m0 = m0.contiguous()
+        m1 = m1.contiguous()
+        m2 = m2.contiguous()
+        l_to_m_index = l_to_m_index.contiguous()
+        _require_triton_cuda_fp32(m0, m1, m2, l_to_m_index)
+        if not (
+            m0.device == m1.device == m2.device == l_to_m_index.device
+        ):
+            raise UnsupportedFusionConfigError(
+                "SO2 epilogue tensors must be on the same CUDA device"
+            )
+        if l_to_m_index.dtype != torch.long or l_to_m_index.shape != (14,):
+            raise UnsupportedFusionConfigError("SO2 epilogue requires a [14] int64 permutation")
+        output_channels = m1.shape[2] // 2 // 3
+        if output_channels <= 0:
+            raise UnsupportedFusionConfigError(
+                "SO2 epilogue output channel count must be positive"
+            )
+        if m1.shape[2] != 2 * 3 * output_channels:
+            raise UnsupportedFusionConfigError("SO2 m=1 Linear output width is unsupported")
+        if m2.shape[2] != 2 * 2 * output_channels:
+            raise UnsupportedFusionConfigError("SO2 m=2 Linear output width is unsupported")
+        if m0.shape[1] != 4 * output_channels + int(extra_channels):
+            raise UnsupportedFusionConfigError("SO2 m=0 Linear output width is unsupported")
+        out = m0.new_empty((m0.shape[0], 14, output_channels))
+        gating = m0.new_empty((m0.shape[0], int(extra_channels)))
+        total = 14 * output_channels + int(extra_channels)
+        if m0.shape[0] > 0:
+            _so2_epilogue_kernel[
+                (m0.shape[0], triton.cdiv(total, SO2_KERNEL_BLOCK))
+            ](
+                m0, m1, m2, l_to_m_index, out, gating,
+                rows=m0.shape[0], output_coefficients=14,
+                output_channels=output_channels, m0_channels=m0.shape[1],
+                m1_coefficients=3, m2_coefficients=2,
+                extra_channels=int(extra_channels), block=SO2_KERNEL_BLOCK,
+                num_warps=4,
+            )
+        ctx.save_for_backward(l_to_m_index)
+        ctx.output_channels = int(output_channels)
+        ctx.m0_channels = int(m0.shape[1])
+        ctx.extra_channels = int(extra_channels)
+        return out, gating
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor, grad_gating: Tensor):
+        (l_to_m_index,) = ctx.saved_tensors
+        grad_out = grad_out.contiguous()
+        if grad_gating is None:
+            grad_gating = grad_out.new_zeros(
+                (grad_out.shape[0], ctx.extra_channels)
+            )
+        else:
+            grad_gating = grad_gating.contiguous()
+        output_channels = ctx.output_channels
+        grad_m0 = grad_out.new_empty((grad_out.shape[0], ctx.m0_channels))
+        grad_m1 = grad_out.new_empty(
+            (grad_out.shape[0], 2, 3 * 2 * output_channels)
+        )
+        grad_m2 = grad_out.new_empty(
+            (grad_out.shape[0], 2, 2 * 2 * output_channels)
+        )
+        total = 14 * output_channels + ctx.extra_channels
+        if grad_out.shape[0] > 0:
+            _so2_epilogue_backward_kernel[
+                (grad_out.shape[0], triton.cdiv(total, SO2_KERNEL_BLOCK))
+            ](
+                grad_out, grad_gating, l_to_m_index, grad_m0, grad_m1, grad_m2,
+                rows=grad_out.shape[0], output_coefficients=14,
+                output_channels=output_channels, m0_channels=ctx.m0_channels,
+                m1_coefficients=3, m2_coefficients=2,
+                extra_channels=ctx.extra_channels, block=SO2_KERNEL_BLOCK,
+                num_warps=4,
+            )
+        return grad_m0, grad_m1, grad_m2, None, None
+
+
 class _FusedRadialMLP(torch.autograd.Function):
     """One Triton kernel for the whole RadialMLP row chain."""
 
@@ -1571,6 +2060,118 @@ def _require_triton_cuda_fp32(*tensors: Tensor) -> None:
             )
 
 
+class FusedSO2Convolution(nn.Module):
+    """SO2 convolution with fused m-layout and epilogue operations.
+
+    The three Linear modules remain the original cuBLAS-backed modules.  Only
+    the fixed coefficient permutation, radial modulation, complex
+    recombination, and inverse permutation are handled by Triton.
+    """
+
+    def __init__(self, original: SO2_Convolution) -> None:
+        super().__init__()
+        if not isinstance(original, SO2_Convolution):
+            raise UnsupportedFusionConfigError("Expected an SO2_Convolution")
+        if (original.lmax, original.mmax) != (3, 2):
+            raise UnsupportedFusionConfigError(
+                "FusedSO2Convolution requires lmax=3 and mmax=2"
+            )
+        external_radial = (
+            not original.internal_weights
+            and original.sphere_channels == 256
+            and original.m_output_channels == 128
+            and original.rad_func is not None
+            and int(original.extra_m0_output_channels or 0) == 384
+        )
+        internal_weights = (
+            original.internal_weights
+            and original.sphere_channels == 128
+            and original.m_output_channels == 128
+            and original.rad_func is None
+            and original.extra_m0_output_channels is None
+        )
+        if not (external_radial or internal_weights):
+            raise UnsupportedFusionConfigError(
+                "FusedSO2Convolution only supports the 30M Edgewise "
+                "so2_conv_1/so2_conv_2 layouts"
+            )
+        mapping = original.mappingReduced.to_m.detach()
+        if tuple(mapping.shape) != (14, 14):
+            raise UnsupportedFusionConfigError(
+                f"FusedSO2Convolution requires a [14,14] mapping, got {tuple(mapping.shape)}"
+            )
+        to_m_index = mapping.argmax(dim=1).to(dtype=torch.long)
+        if torch.unique(to_m_index).numel() != 14:
+            raise UnsupportedFusionConfigError(
+                "FusedSO2Convolution requires a bijective permutation mapping"
+            )
+        expected = torch.zeros_like(mapping)
+        expected.scatter_(1, to_m_index[:, None], 1.0)
+        if not torch.equal(mapping, expected):
+            raise UnsupportedFusionConfigError(
+                "FusedSO2Convolution requires a fixed permutation mapping"
+            )
+        l_to_m_index = torch.empty_like(to_m_index)
+        l_to_m_index[to_m_index] = torch.arange(
+            14, device=to_m_index.device, dtype=torch.long
+        )
+
+        self.sphere_channels = original.sphere_channels
+        self.m_output_channels = original.m_output_channels
+        self.lmax = original.lmax
+        self.mmax = original.mmax
+        self.mappingReduced = original.mappingReduced
+        self.internal_weights = original.internal_weights
+        self.edge_channels_list = original.edge_channels_list
+        self.extra_m0_output_channels = int(original.extra_m0_output_channels or 0)
+        self.fc_m0 = original.fc_m0
+        self.so2_m_conv = original.so2_m_conv
+        self.rad_func = original.rad_func
+        self.register_buffer("to_m_index", to_m_index, persistent=False)
+        self.register_buffer("l_to_m_index", l_to_m_index, persistent=False)
+
+        self.radial_channels = sum(
+            [
+                self.fc_m0.in_features,
+                self.so2_m_conv[0].fc.in_features,
+                self.so2_m_conv[1].fc.in_features,
+            ]
+        )
+        radial_width = None
+        if self.rad_func is not None:
+            radial_width = getattr(self.rad_func, "out_channels", None)
+            if radial_width is None and hasattr(self.rad_func, "net"):
+                radial_width = self.rad_func.net[-1].out_features
+        if self.rad_func is not None and radial_width != self.radial_channels:
+            raise UnsupportedFusionConfigError(
+                "SO2 radial feature width does not match m=0/m=1/m=2 inputs"
+            )
+
+    def forward(self, x: Tensor, x_edge: Tensor):
+        if x.ndim != 3 or x.shape[1:] != (14, self.sphere_channels):
+            raise UnsupportedFusionConfigError(
+                f"FusedSO2Convolution expected x=[E,14,{self.sphere_channels}], got {tuple(x.shape)}"
+            )
+        if self.rad_func is not None:
+            radial = self.rad_func(x_edge)
+            use_radial = True
+        else:
+            radial = x.new_empty((x.shape[0], 0))
+            use_radial = False
+        x0, x1, x2 = _SO2Prepare.apply(
+            x.contiguous(), radial, self.to_m_index, use_radial, self.radial_channels
+        )
+        m0 = self.fc_m0(x0)
+        m1 = self.so2_m_conv[0].fc(x1)
+        m2 = self.so2_m_conv[1].fc(x2)
+        out, gating = _SO2Epilogue.apply(
+            m0, m1, m2, self.l_to_m_index, self.extra_m0_output_channels
+        )
+        if self.extra_m0_output_channels:
+            return out, gating
+        return out
+
+
 def gather_cat_wigner(x: Tensor, edge_index: Tensor, wigner: Tensor, out_mask: Tensor) -> Tensor:
     # The official model can hand us views even though the logical shapes are
     # fixed.  Normalize their layout before entering Triton.  ``contiguous`` is
@@ -1644,7 +2245,14 @@ class FusedRMSNormSH(nn.Module):
 
 
 class FusedEdgewise(nn.Module):
-    def __init__(self, original: Edgewise, *, gather: bool, reverse: bool) -> None:
+    def __init__(
+        self,
+        original: Edgewise,
+        *,
+        gather: bool,
+        reverse: bool,
+        so2_epilogue: bool = False,
+    ) -> None:
         super().__init__()
         self.sphere_channels = original.sphere_channels
         self.hidden_channels = original.hidden_channels
@@ -1663,6 +2271,7 @@ class FusedEdgewise(nn.Module):
         self.out_mask = original.out_mask
         self.fuse_gather = gather
         self.fuse_reverse = reverse
+        self.fuse_so2_epilogue = so2_epilogue
 
     def forward(self, x, x_edge, edge_distance, edge_index, wigner, wigner_inv, node_offset: int = 0):
         out_mask = self.out_mask.to(device=x.device)
@@ -1852,6 +2461,10 @@ class FusionMetadata:
     radial_mlp_replacements: int
     so3_mlp_replacements: int
     energy_head_replacements: int
+    so2_convolution_replacements: int
+    so2_prepare_kernel_count: int
+    so2_epilogue_kernel_count: int
+    so2_fusion_kernel_version: str
     configure_wall_time_s: float
     torch_version: str
     triton_version: str
@@ -1867,6 +2480,10 @@ class FusionMetadata:
             "model_fusion_radial_mlp_replacements": self.radial_mlp_replacements,
             "model_fusion_so3_mlp_replacements": self.so3_mlp_replacements,
             "model_fusion_energy_head_replacements": self.energy_head_replacements,
+            "model_fusion_so2_convolution_replacements": self.so2_convolution_replacements,
+            "model_fusion_so2_prepare_kernel_count": self.so2_prepare_kernel_count,
+            "model_fusion_so2_epilogue_kernel_count": self.so2_epilogue_kernel_count,
+            "model_fusion_so2_kernel_version": self.so2_fusion_kernel_version,
             "model_fusion_configure_wall_time_s": self.configure_wall_time_s,
             "model_fusion_torch_version": self.torch_version,
             "model_fusion_triton_version": self.triton_version,
@@ -1932,6 +2549,7 @@ def configure_esen_30m_model_fusions(
     backbone = _validate_30m_model(model)
     gather = "gather-wigner" in selected
     reverse = "reverse-scatter" in selected
+    so2 = "so2-epilogue" in selected
     edgewise_count = 0
     edge_embedding_count = 0
     rmsnorm_count = 0
@@ -1939,6 +2557,7 @@ def configure_esen_30m_model_fusions(
     radial_count = 0
     so3_count = 0
     energy_count = 0
+    so2_count = 0
 
     # radial-mlp first: the FusedEdgewise / FusedEdgeDegreeEmbedding wrappers
     # installed below hold references to these rad_func objects.
@@ -1968,12 +2587,27 @@ def configure_esen_30m_model_fusions(
         )
         edge_embedding_count = 1
 
-    if gather or reverse:
+    if so2:
+        for block in backbone.blocks:
+            if not isinstance(block.edge_wise, Edgewise):
+                raise UnsupportedFusionConfigError("Unexpected Edgewise implementation")
+            if not isinstance(block.edge_wise.so2_conv_1, SO2_Convolution):
+                raise UnsupportedFusionConfigError("Unexpected SO2 convolution 1 implementation")
+            if not isinstance(block.edge_wise.so2_conv_2, SO2_Convolution):
+                raise UnsupportedFusionConfigError("Unexpected SO2 convolution 2 implementation")
+            block.edge_wise.so2_conv_1 = FusedSO2Convolution(block.edge_wise.so2_conv_1)
+            block.edge_wise.so2_conv_2 = FusedSO2Convolution(block.edge_wise.so2_conv_2)
+            so2_count += 2
+
+    if gather or reverse or so2:
         for block in backbone.blocks:
             if not isinstance(block.edge_wise, Edgewise):
                 raise UnsupportedFusionConfigError("Unexpected Edgewise implementation")
             block.edge_wise = FusedEdgewise(
-                block.edge_wise, gather=gather, reverse=reverse
+                block.edge_wise,
+                gather=gather,
+                reverse=reverse,
+                so2_epilogue=so2,
             )
             edgewise_count += 1
 
@@ -2031,6 +2665,10 @@ def configure_esen_30m_model_fusions(
         radial_mlp_replacements=radial_count,
         so3_mlp_replacements=so3_count,
         energy_head_replacements=energy_count,
+        so2_convolution_replacements=so2_count,
+        so2_prepare_kernel_count=so2_count,
+        so2_epilogue_kernel_count=so2_count,
+        so2_fusion_kernel_version=(SO2_FUSION_KERNEL_VERSION if so2 else ""),
         configure_wall_time_s=time.perf_counter() - start,
         torch_version=torch.__version__,
         triton_version=str(getattr(triton, "__version__", "unknown")),
