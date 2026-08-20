@@ -1307,6 +1307,7 @@ if triton is not None:
                 g_h,
                 mask=rmask[:, None],
             )
+            grad_x_acc = tl.zeros((BLOCK_R, channels), tl.float32)
             for k0 in range(0, channels, BLOCK_K):
                 k = k0 + tl.arange(0, BLOCK_K)
                 gh_t = tl.load(
@@ -1319,12 +1320,14 @@ if triton is not None:
                     mask=(k[:, None] < channels) & (c[None, :] < channels),
                     other=0.0,
                 )
-                acc = tl.dot(gh_t, w_t, input_precision="ieee")
-                tl.store(
-                    grad_x_ptr + r[:, None] * coeffs * channels + m * channels + c[None, :],
-                    acc,
-                    mask=rmask[:, None],
+                grad_x_acc = tl.dot(
+                    gh_t, w_t, grad_x_acc, input_precision="ieee"
                 )
+            tl.store(
+                grad_x_ptr + r[:, None] * coeffs * channels + m * channels + c[None, :],
+                grad_x_acc,
+                mask=rmask[:, None],
+            )
 
     @triton.jit
     def _energy_mlp_forward_kernel(

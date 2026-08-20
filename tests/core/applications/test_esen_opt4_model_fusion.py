@@ -239,23 +239,23 @@ def test_so2_epilogue_external_radial_forward_and_gradients_match_torch():
 def test_so2_epilogue_accepts_empty_edge_set():
     device = torch.device("cuda")
     mapping = CoefficientMapping(3, 2).to(device)
-    reference = SO2_Convolution(
+    original = SO2_Convolution(
         128, 128, 3, 2, mapping, internal_weights=True
     ).cuda().eval()
-    fused = FusedSO2Convolution(copy.deepcopy(reference).cuda().eval())
-    reference.requires_grad_(False)
+    fused = FusedSO2Convolution(copy.deepcopy(original).cuda().eval())
     fused.requires_grad_(False)
-    x_ref = torch.empty(0, 14, 128, device=device, requires_grad=True)
-    x_fused = x_ref.detach().clone().requires_grad_(True)
+    x_fused = torch.empty(0, 14, 128, device=device, requires_grad=True)
     x_edge = torch.empty(0, 0, device=device)
 
-    expected = reference(x_ref, x_edge)
+    # The upstream SO2 implementation uses ``reshape(0, -1)`` and therefore
+    # cannot serve as an empty-edge reference.  The fused contract is still
+    # well-defined: all outputs and input gradients have zero rows.
     actual = fused(x_fused, x_edge)
-    expected.sum().backward()
     actual.sum().backward()
 
-    torch.testing.assert_close(actual, expected, rtol=RTOL, atol=ATOL)
-    torch.testing.assert_close(x_fused.grad, x_ref.grad, rtol=RTOL, atol=ATOL)
+    assert actual.shape == (0, 14, 128)
+    assert x_fused.grad is not None
+    assert x_fused.grad.shape == x_fused.shape
 
 
 @pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
