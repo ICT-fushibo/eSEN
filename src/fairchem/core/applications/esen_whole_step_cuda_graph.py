@@ -8,6 +8,7 @@ capture used to isolate the incremental benefit of widening CUDA Graph scope.
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -33,6 +34,28 @@ def _pbc_vector(batch, device: torch.device) -> Tensor:
     if pbc is None:
         return torch.ones(3, device=device, dtype=torch.bool)
     return torch.as_tensor(pbc, device=device, dtype=torch.bool).reshape(-1, 3)[0]
+
+
+def _normalize_neighbor_capacities(
+    num_atoms: int,
+    neighbors_per_atom: int,
+    neighbor_capacities: Tensor | Sequence[int] | None,
+) -> tuple[int, tuple[int, ...] | None]:
+    """Validate optional heterogeneous slots and return total edge capacity."""
+
+    if neighbor_capacities is None:
+        return num_atoms * int(neighbors_per_atom), None
+    values = torch.as_tensor(
+        neighbor_capacities, device="cpu", dtype=torch.long
+    ).reshape(-1)
+    if values.shape != (num_atoms,):
+        raise ValueError(
+            "neighbor_capacities must contain one value per real atom"
+        )
+    if bool((values < 1).any()):
+        raise ValueError("neighbor capacities must be positive")
+    normalized = tuple(int(value) for value in values.tolist())
+    return sum(normalized), normalized
 
 
 def _device_memory_used(device: torch.device) -> int | None:
@@ -105,6 +128,8 @@ class ESENFixedBuilderModelCUDAGraphEvaluator(ESENModelCUDAGraphEvaluator):
         eager_evaluator: ESENEnergyForceEvaluator,
         *,
         neighbors_per_atom: int,
+        neighbor_capacities: Tensor | Sequence[int] | None = None,
+        neighbor_capacity_policy: str = "uniform",
         dummy_atoms: int = 32,
         capture_warmup: int = 3,
         max_neighbors: int = 300,
@@ -113,7 +138,12 @@ class ESENFixedBuilderModelCUDAGraphEvaluator(ESENModelCUDAGraphEvaluator):
         replay_force_atol: float = 1e-6,
     ) -> None:
         self.neighbors_per_atom = int(neighbors_per_atom)
-        edge_capacity = eager_evaluator.num_atoms * self.neighbors_per_atom
+        edge_capacity, self.neighbor_capacities = _normalize_neighbor_capacities(
+            eager_evaluator.num_atoms,
+            self.neighbors_per_atom,
+            neighbor_capacities,
+        )
+        self.neighbor_capacity_policy = str(neighbor_capacity_policy)
         super().__init__(
             eager_evaluator,
             edge_capacity=edge_capacity,
@@ -135,6 +165,8 @@ class ESENFixedBuilderModelCUDAGraphEvaluator(ESENModelCUDAGraphEvaluator):
             pbc=_pbc_vector(self.static_batch, self.device),
             cutoff=float(self.model.backbone.cutoff),
             neighbors_per_atom=self.neighbors_per_atom,
+            neighbor_capacities=self.neighbor_capacities,
+            capacity_policy=self.neighbor_capacity_policy,
             dummy_atoms=self.dummy_atoms,
             max_neighbors=max_neighbors,
             degeneracy_tolerance=degeneracy_tolerance,
@@ -178,8 +210,9 @@ class ESENFixedBuilderModelCUDAGraphEvaluator(ESENModelCUDAGraphEvaluator):
         stats = self.fixed_builder.stats()
         misses = int(stats["fixed_builder_capacity_misses"])
         if misses:
-            required = int(stats["fixed_builder_max_included_neighbors"])
-            raise CUDAGraphCapacityError(required, self.neighbors_per_atom)
+            required = int(stats["fixed_builder_max_overflow_required"])
+            capacity = int(stats["fixed_builder_max_overflow_capacity"])
+            raise CUDAGraphCapacityError(required, capacity)
 
     def stats(self) -> dict[str, Any]:
         record = super().stats()
@@ -218,6 +251,8 @@ class ESENWholeStepCUDAGraphMD:
         integrator: GPUIntegrator,
         *,
         neighbors_per_atom: int,
+        neighbor_capacities: Tensor | Sequence[int] | None = None,
+        neighbor_capacity_policy: str = "uniform",
         dummy_atoms: int = 32,
         capture_warmup: int = 3,
         max_neighbors: int = 300,
@@ -235,7 +270,14 @@ class ESENWholeStepCUDAGraphMD:
         self.device = eager_evaluator.device
         self.num_atoms = eager_evaluator.num_atoms
         self.neighbors_per_atom = int(neighbors_per_atom)
-        self.edge_capacity = self.num_atoms * self.neighbors_per_atom
+        self.edge_capacity, self.neighbor_capacities = (
+            _normalize_neighbor_capacities(
+                self.num_atoms,
+                self.neighbors_per_atom,
+                neighbor_capacities,
+            )
+        )
+        self.neighbor_capacity_policy = str(neighbor_capacity_policy)
         self.capture_warmup = int(capture_warmup)
         self.integrator = integrator
         self.core = ESENModelCUDAGraphEvaluator(
@@ -254,6 +296,8 @@ class ESENWholeStepCUDAGraphMD:
             pbc=_pbc_vector(self.core.static_batch, self.device),
             cutoff=float(self.core.model.backbone.cutoff),
             neighbors_per_atom=self.neighbors_per_atom,
+            neighbor_capacities=self.neighbor_capacities,
+            capacity_policy=self.neighbor_capacity_policy,
             dummy_atoms=dummy_atoms,
             max_neighbors=max_neighbors,
             degeneracy_tolerance=degeneracy_tolerance,
@@ -449,8 +493,9 @@ class ESENWholeStepCUDAGraphMD:
         stats = self.fixed_builder.stats()
         misses = int(stats["fixed_builder_capacity_misses"])
         if misses:
-            required = int(stats["fixed_builder_max_included_neighbors"])
-            raise CUDAGraphCapacityError(required, self.neighbors_per_atom)
+            required = int(stats["fixed_builder_max_overflow_required"])
+            capacity = int(stats["fixed_builder_max_overflow_capacity"])
+            raise CUDAGraphCapacityError(required, capacity)
 
     def stats(self) -> dict[str, Any]:
         builder_stats = self.fixed_builder.stats()

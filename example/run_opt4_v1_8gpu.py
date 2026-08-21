@@ -100,6 +100,14 @@ def _temperature_label(value: str) -> str:
     return format(float(value), "g")
 
 
+def _capacity_policy(value: str) -> str:
+    if value not in {"uniform", "species", "atom"}:
+        raise ValueError(
+            "neighbor capacity policy must be uniform, species, or atom"
+        )
+    return value
+
+
 def _shuffle_variants(scope: str, system: str, temperature: str, repeat: int) -> list[str]:
     salt = f"42|opt4-v1|{scope}|{system}|{temperature}|{repeat}"
     seed = int.from_bytes(hashlib.sha256(salt.encode()).digest()[:8], "big")
@@ -228,6 +236,10 @@ class Config:
     model_candidate_stage: str
     whole_base_stage: str
     whole_candidate_stage: str
+    model_base_capacity_policy: str
+    model_candidate_capacity_policy: str
+    whole_base_capacity_policy: str
+    whole_candidate_capacity_policy: str
     run_kind: str
     status_filename: str
     resume: bool
@@ -278,6 +290,18 @@ class Config:
                 "WHOLE_BASE_STAGE", "WHOLE_BASE" if whole_base_fusions else "OPT3"
             ),
             whole_candidate_stage=_env("WHOLE_CANDIDATE_STAGE", "OPT4V1"),
+            model_base_capacity_policy=_capacity_policy(
+                _env("MODEL_BASE_NEIGHBOR_CAPACITY_POLICY", "uniform")
+            ),
+            model_candidate_capacity_policy=_capacity_policy(
+                _env("MODEL_CANDIDATE_NEIGHBOR_CAPACITY_POLICY", "uniform")
+            ),
+            whole_base_capacity_policy=_capacity_policy(
+                _env("WHOLE_BASE_NEIGHBOR_CAPACITY_POLICY", "uniform")
+            ),
+            whole_candidate_capacity_policy=_capacity_policy(
+                _env("WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY", "uniform")
+            ),
             run_kind=_env("RUN_KIND", "opt4_v1_kf9_formal_performance"),
             status_filename=_env("STATUS_FILENAME", "v1_status.tsv"),
             resume=_env("RESUME", "1") not in {"0", "false", "False"},
@@ -292,6 +316,7 @@ class Task:
     base_stage: str
     fusion_stage: str
     model_fusions: str
+    neighbor_capacity_policy: str
     system: str
     temperature: str
     repeat: int
@@ -337,6 +362,7 @@ class Scheduler:
         base_stage: str,
         fusion_stage: str,
         model_fusions: str,
+        neighbor_capacity_policy: str,
     ) -> list[str]:
         if scope == "model-only":
             script = self.config.repo_root / "example" / "benchmark_md_gpu.py"
@@ -386,6 +412,7 @@ class Scheduler:
                 "--probe-steps", "50",
                 "--neighbor-margin", "0.10",
                 "--neighbor-slot-step", "8",
+                "--neighbor-capacity-policy", neighbor_capacity_policy,
                 "--dummy-atoms", "32",
                 "--capture-warmup", "3",
                 "--max-neighbors", "300",
@@ -415,11 +442,19 @@ class Scheduler:
                 candidate_stage = self.config.model_candidate_stage
                 base_fusions = self.config.model_base_fusions
                 candidate_fusions = self.config.model_candidate_fusions
+                base_capacity_policy = self.config.model_base_capacity_policy
+                candidate_capacity_policy = (
+                    self.config.model_candidate_capacity_policy
+                )
             else:
                 base_stage = self.config.whole_base_stage
                 candidate_stage = self.config.whole_candidate_stage
                 base_fusions = self.config.whole_base_fusions
                 candidate_fusions = self.config.whole_candidate_fusions
+                base_capacity_policy = self.config.whole_base_capacity_policy
+                candidate_capacity_policy = (
+                    self.config.whole_candidate_capacity_policy
+                )
 
             for repeat in range(1, self.config.repeats + 1):
                 for system in self.config.systems:
@@ -427,6 +462,11 @@ class Scheduler:
                         for variant in _shuffle_variants(scope, system, temperature, repeat):
                             is_candidate = variant == "candidate"
                             fusions = candidate_fusions if is_candidate else base_fusions
+                            capacity_policy = (
+                                candidate_capacity_policy
+                                if is_candidate
+                                else base_capacity_policy
+                            )
                             stage = candidate_stage if is_candidate else base_stage
                             label = stage
                             scope_label = scope.replace("-", "_")
@@ -445,6 +485,7 @@ class Scheduler:
                                     base_stage=base_stage,
                                     fusion_stage=stage,
                                     model_fusions=fusions,
+                                    neighbor_capacity_policy=capacity_policy,
                                     system=system,
                                     temperature=temperature,
                                     repeat=repeat,
@@ -463,6 +504,7 @@ class Scheduler:
                                         base_stage,
                                         stage,
                                         fusions,
+                                        capacity_policy,
                                     ),
                                 )
                             )
@@ -588,6 +630,18 @@ class Scheduler:
                 "model_candidate_stage": self.config.model_candidate_stage,
                 "whole_base_stage": self.config.whole_base_stage,
                 "whole_candidate_stage": self.config.whole_candidate_stage,
+                "model_base_neighbor_capacity_policy": (
+                    self.config.model_base_capacity_policy
+                ),
+                "model_candidate_neighbor_capacity_policy": (
+                    self.config.model_candidate_capacity_policy
+                ),
+                "whole_base_neighbor_capacity_policy": (
+                    self.config.whole_base_capacity_policy
+                ),
+                "whole_candidate_neighbor_capacity_policy": (
+                    self.config.whole_candidate_capacity_policy
+                ),
                 "gpus": self.config.gpus,
                 "gpu_idle_seconds": self.config.idle_seconds,
                 "gpu_poll_seconds": self.config.poll_seconds,

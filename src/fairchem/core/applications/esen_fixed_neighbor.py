@@ -10,6 +10,7 @@ are routed exclusively between dummy atoms.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -46,8 +47,94 @@ def maximum_neighbors_in_graph(edge_index: Tensor, num_atoms: int) -> int:
         raise ValueError("num_atoms must be positive")
     if edge_index.shape[1] == 0:
         return 0
-    counts = torch.bincount(edge_index[1], minlength=num_atoms)
+    counts = neighbor_counts_in_graph(edge_index, num_atoms)
     return int(counts.max().item())
+
+
+def neighbor_counts_in_graph(edge_index: Tensor, num_atoms: int) -> Tensor:
+    """Return the centre-atom degree vector for an official eSEN graph."""
+
+    if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+        raise ValueError("edge_index must have shape [2, num_edges]")
+    if num_atoms < 1:
+        raise ValueError("num_atoms must be positive")
+    if edge_index.shape[1] == 0:
+        return torch.zeros(
+            num_atoms, device=edge_index.device, dtype=torch.long
+        )
+    return torch.bincount(edge_index[1], minlength=num_atoms)[:num_atoms]
+
+
+def species_neighbor_capacities_from_probe(
+    maximum_neighbors_by_atom: Tensor | Sequence[int],
+    atomic_numbers: Tensor | Sequence[int],
+    *,
+    margin: float = 0.10,
+    slot_step: int = 8,
+) -> tuple[int, ...]:
+    """Derive one conservative static slot capacity per chemical species.
+
+    Every atom of a species receives the largest capacity required by any atom
+    of that species during the probe.  This remains safe when equivalent atoms
+    exchange local environments while avoiding the global worst-case padding
+    imposed by a single uniform capacity.
+    """
+
+    maxima = torch.as_tensor(
+        maximum_neighbors_by_atom, device="cpu", dtype=torch.long
+    ).reshape(-1)
+    numbers = torch.as_tensor(
+        atomic_numbers, device="cpu", dtype=torch.long
+    ).reshape(-1)
+    if maxima.numel() < 1 or maxima.shape != numbers.shape:
+        raise ValueError(
+            "maximum_neighbors_by_atom and atomic_numbers must be non-empty "
+            "vectors with the same shape"
+        )
+    if bool((maxima < 0).any()):
+        raise ValueError("maximum neighbor counts must be non-negative")
+    if bool((numbers < 1).any()):
+        raise ValueError("atomic numbers must be positive")
+
+    capacities = torch.empty_like(maxima)
+    for atomic_number in torch.unique(numbers, sorted=True):
+        species_mask = numbers == atomic_number
+        species_maximum = int(maxima[species_mask].max().item())
+        # An isolated species still needs at least one static padding slot.
+        capacity = neighbor_capacity_from_probe(
+            max(1, species_maximum), margin=margin, slot_step=slot_step
+        )
+        capacities[species_mask] = capacity
+    return tuple(int(value) for value in capacities.tolist())
+
+
+def atom_neighbor_capacities_from_probe(
+    maximum_neighbors_by_atom: Tensor | Sequence[int],
+    *,
+    margin: float = 0.10,
+    slot_step: int = 8,
+) -> tuple[int, ...]:
+    """Derive a rounded static slot capacity for every atom.
+
+    This policy targets systems with heterogeneous local coordination even
+    when atoms share the same element.  It is intentionally opt-in because a
+    long diffusive trajectory can outgrow a probe-derived per-atom bound; the
+    fixed builder's device-side capacity-miss telemetry remains authoritative.
+    """
+
+    maxima = torch.as_tensor(
+        maximum_neighbors_by_atom, device="cpu", dtype=torch.long
+    ).reshape(-1)
+    if maxima.numel() < 1:
+        raise ValueError("maximum_neighbors_by_atom must be non-empty")
+    if bool((maxima < 0).any()):
+        raise ValueError("maximum neighbor counts must be non-negative")
+    return tuple(
+        neighbor_capacity_from_probe(
+            max(1, int(maximum)), margin=margin, slot_step=slot_step
+        )
+        for maximum in maxima.tolist()
+    )
 
 
 def _pbc_repetitions(cell: Tensor, cutoff: float, pbc: Tensor) -> tuple[int, int, int]:
@@ -79,9 +166,11 @@ def _pbc_repetitions(cell: Tensor, cutoff: float, pbc: Tensor) -> tuple[int, int
 class FixedShapePBCNeighborBuilder:
     """Build one fixed-capacity graph for a single periodic structure.
 
-    The output tensors always have ``num_atoms * neighbors_per_atom`` edges.
-    Active edges preserve the official candidate-enumeration order.  Inactive
-    slots are dummy self-edges with a far periodic offset.
+    With uniform slots the output tensors have
+    ``num_atoms * neighbors_per_atom`` edges; optional heterogeneous capacities
+    use their fixed sum instead.  Active edges preserve the official candidate
+    enumeration order.  Inactive slots are dummy self-edges with a far
+    periodic offset.
     """
 
     def __init__(
@@ -92,6 +181,8 @@ class FixedShapePBCNeighborBuilder:
         pbc: Tensor,
         cutoff: float,
         neighbors_per_atom: int,
+        neighbor_capacities: Tensor | Sequence[int] | None = None,
+        capacity_policy: str = "uniform",
         dummy_atoms: int,
         max_neighbors: int = 300,
         degeneracy_tolerance: float = 0.01,
@@ -113,13 +204,31 @@ class FixedShapePBCNeighborBuilder:
 
         self.num_atoms = int(num_atoms)
         self.cutoff = float(cutoff)
-        self.neighbors_per_atom = int(neighbors_per_atom)
+        if neighbor_capacities is None:
+            capacity_values = torch.full(
+                (self.num_atoms,), int(neighbors_per_atom), dtype=torch.long
+            )
+        else:
+            capacity_values = torch.as_tensor(
+                neighbor_capacities, device="cpu", dtype=torch.long
+            ).reshape(-1)
+            if capacity_values.shape != (self.num_atoms,):
+                raise ValueError(
+                    "neighbor_capacities must contain one value per real atom"
+                )
+            if bool((capacity_values < 1).any()):
+                raise ValueError("neighbor capacities must be positive")
+        self.capacity_policy = str(capacity_policy)
+        self.neighbors_per_atom = int(capacity_values.max().item())
+        self._neighbor_capacities_cpu = tuple(
+            int(value) for value in capacity_values.tolist()
+        )
         self.dummy_atoms = int(dummy_atoms)
         self.max_neighbors = int(max_neighbors)
         self.degeneracy_tolerance = float(degeneracy_tolerance)
         self.device = cell.device
         self.position_dtype = cell.dtype
-        self.edge_capacity = self.num_atoms * self.neighbors_per_atom
+        self.edge_capacity = int(capacity_values.sum().item())
         self.repetitions = _pbc_repetitions(cell, cutoff, pbc)
 
         axes = [
@@ -140,6 +249,31 @@ class FixedShapePBCNeighborBuilder:
                 "neighbors_per_atom cannot exceed the fixed candidate count: "
                 f"{self.neighbors_per_atom} > {self.candidates_per_atom}"
             )
+
+        self.neighbor_capacities = capacity_values.to(device=self.device)
+        self.slot_centres = torch.repeat_interleave(
+            torch.arange(self.num_atoms, device=self.device, dtype=torch.long),
+            self.neighbor_capacities,
+        )
+        capacity_starts = (
+            torch.cumsum(self.neighbor_capacities, dim=0)
+            - self.neighbor_capacities
+        )
+        self.slot_ranks = torch.arange(
+            self.edge_capacity, device=self.device, dtype=torch.long
+        ) - capacity_starts.index_select(0, self.slot_centres)
+        self.slot_selection_indices = (
+            self.slot_centres * self.neighbors_per_atom + self.slot_ranks
+        )
+        unique_capacities, unique_counts = torch.unique(
+            capacity_values, sorted=True, return_counts=True
+        )
+        self.capacity_histogram = {
+            int(capacity): int(count)
+            for capacity, count in zip(
+                unique_capacities.tolist(), unique_counts.tolist()
+            )
+        }
 
         self.cell = cell.detach().reshape(3, 3)
         self.candidate_sources = torch.arange(
@@ -211,6 +345,15 @@ class FixedShapePBCNeighborBuilder:
         self.maximum_included_neighbors = torch.zeros(
             (), device=self.device, dtype=torch.long
         )
+        self.maximum_capacity_excess = torch.zeros(
+            (), device=self.device, dtype=torch.long
+        )
+        self.maximum_overflow_required = torch.zeros(
+            (), device=self.device, dtype=torch.long
+        )
+        self.maximum_overflow_capacity = torch.zeros(
+            (), device=self.device, dtype=torch.long
+        )
 
     def reset_stats(self) -> None:
         """Reset production counters without changing their addresses."""
@@ -223,6 +366,9 @@ class FixedShapePBCNeighborBuilder:
         self.maximum_real_edges.zero_()
         self.maximum_raw_neighbors.zero_()
         self.maximum_included_neighbors.zero_()
+        self.maximum_capacity_excess.zero_()
+        self.maximum_overflow_required.zero_()
+        self.maximum_overflow_capacity.zero_()
 
     def build(
         self,
@@ -288,75 +434,119 @@ class FixedShapePBCNeighborBuilder:
             )
             included_counts = included.sum(dim=1)
 
-            # Selecting the smallest original candidate indices restores the
-            # enumeration order used by masked_select in radius_graph_pbc.
-            candidate_order = torch.where(
+            self._select_write_and_update_stats(
                 included,
-                self.candidate_ids.expand(self.num_atoms, -1),
-                torch.full_like(
-                    self.candidate_ids.expand(self.num_atoms, -1),
-                    self.candidates_per_atom,
-                ),
+                raw_counts,
+                included_counts,
+                step=step,
             )
-            selected = torch.topk(
-                candidate_order,
-                k=self.neighbors_per_atom,
-                dim=1,
-                largest=False,
-                sorted=True,
-            ).values
-            slot_valid = selected < self.candidates_per_atom
-            safe_selected = selected.clamp_max(self.candidates_per_atom - 1)
-
-            sources = self.candidate_sources.index_select(
-                0, safe_selected.reshape(-1)
-            )
-            centres = torch.arange(
-                self.num_atoms, device=self.device, dtype=torch.long
-            ).view(-1, 1).expand(-1, self.neighbors_per_atom).reshape(-1)
-            selected_offsets = self.candidate_cell_offsets.index_select(
-                0, safe_selected.reshape(-1)
-            )
-            flat_valid = slot_valid.reshape(-1)
-            self.edge_index[0].copy_(
-                torch.where(flat_valid, sources, self.dummy_sinks)
-            )
-            self.edge_index[1].copy_(
-                torch.where(flat_valid, centres, self.dummy_sinks)
-            )
-            self.cell_offsets.copy_(
-                torch.where(
-                    flat_valid.unsqueeze(1),
-                    selected_offsets.to(dtype=self.cell_offsets.dtype),
-                    self.padding_cell_offsets,
-                )
-            )
-
-            real_edges = flat_valid.sum()
-            overflow = (included_counts > self.neighbors_per_atom).any()
-            call_step = self.build_calls if step is None else step
-            self.current_real_edges.copy_(real_edges)
-            self.minimum_real_edges.copy_(
-                torch.minimum(self.minimum_real_edges, real_edges)
-            )
-            self.maximum_real_edges.copy_(
-                torch.maximum(self.maximum_real_edges, real_edges)
-            )
-            self.maximum_raw_neighbors.copy_(
-                torch.maximum(self.maximum_raw_neighbors, raw_counts.max())
-            )
-            self.maximum_included_neighbors.copy_(
-                torch.maximum(
-                    self.maximum_included_neighbors, included_counts.max()
-                )
-            )
-            self.capacity_misses.add_(overflow.to(dtype=torch.long))
-            first = (self.first_overflow_step < 0) & overflow
-            self.first_overflow_step.copy_(
-                torch.where(first, call_step, self.first_overflow_step)
-            )
-            self.build_calls.add_(1)
         return self.edge_index, self.cell_offsets
+
+    def _select_write_and_update_stats(
+        self,
+        included: Tensor,
+        raw_counts: Tensor,
+        included_counts: Tensor,
+        *,
+        step: Tensor | None,
+    ) -> None:
+        """Select configured slots, write static outputs, and update counters."""
+
+        # Selecting the smallest original candidate indices restores the
+        # enumeration order used by masked_select in radius_graph_pbc.
+        candidate_ids = self.candidate_ids.expand(self.num_atoms, -1)
+        candidate_order = torch.where(
+            included,
+            candidate_ids,
+            torch.full_like(candidate_ids, self.candidates_per_atom),
+        )
+        selected = torch.topk(
+            candidate_order,
+            k=self.neighbors_per_atom,
+            dim=1,
+            largest=False,
+            sorted=True,
+        ).values
+        flat_selected = selected.reshape(-1).index_select(
+            0, self.slot_selection_indices
+        )
+        flat_valid = flat_selected < self.candidates_per_atom
+        safe_selected = flat_selected.clamp_max(self.candidates_per_atom - 1)
+
+        sources = self.candidate_sources.index_select(0, safe_selected)
+        selected_offsets = self.candidate_cell_offsets.index_select(
+            0, safe_selected
+        )
+        self.edge_index[0].copy_(
+            torch.where(flat_valid, sources, self.dummy_sinks)
+        )
+        self.edge_index[1].copy_(
+            torch.where(flat_valid, self.slot_centres, self.dummy_sinks)
+        )
+        self.cell_offsets.copy_(
+            torch.where(
+                flat_valid.unsqueeze(1),
+                selected_offsets.to(dtype=self.cell_offsets.dtype),
+                self.padding_cell_offsets,
+            )
+        )
+
+        real_edges = flat_valid.sum()
+        capacity_excess = torch.clamp_min(
+            included_counts - self.neighbor_capacities, 0
+        )
+        current_excess, overflow_atom = capacity_excess.max(dim=0)
+        overflow = current_excess > 0
+        call_step = self.build_calls if step is None else step
+        self.current_real_edges.copy_(real_edges)
+        self.minimum_real_edges.copy_(
+            torch.minimum(self.minimum_real_edges, real_edges)
+        )
+        self.maximum_real_edges.copy_(
+            torch.maximum(self.maximum_real_edges, real_edges)
+        )
+        self.maximum_raw_neighbors.copy_(
+            torch.maximum(self.maximum_raw_neighbors, raw_counts.max())
+        )
+        self.maximum_included_neighbors.copy_(
+            torch.maximum(
+                self.maximum_included_neighbors, included_counts.max()
+            )
+        )
+        replace_overflow = current_excess > self.maximum_capacity_excess
+        current_required = included_counts.index_select(
+            0, overflow_atom.reshape(1)
+        ).reshape(())
+        current_capacity = self.neighbor_capacities.index_select(
+            0, overflow_atom.reshape(1)
+        ).reshape(())
+        self.maximum_capacity_excess.copy_(
+            torch.where(
+                replace_overflow,
+                current_excess,
+                self.maximum_capacity_excess,
+            )
+        )
+        self.maximum_overflow_required.copy_(
+            torch.where(
+                replace_overflow,
+                current_required,
+                self.maximum_overflow_required,
+            )
+        )
+        self.maximum_overflow_capacity.copy_(
+            torch.where(
+                replace_overflow,
+                current_capacity,
+                self.maximum_overflow_capacity,
+            )
+        )
+        self.capacity_misses.add_(overflow.to(dtype=torch.long))
+        first = (self.first_overflow_step < 0) & overflow
+        self.first_overflow_step.copy_(
+            torch.where(first, call_step, self.first_overflow_step)
+        )
+        self.build_calls.add_(1)
 
     def stats(self) -> dict[str, Any]:
         """Synchronize once and return host-side builder diagnostics."""
@@ -374,6 +564,20 @@ class FixedShapePBCNeighborBuilder:
             ),
             "fixed_builder_edge_capacity": self.edge_capacity,
             "fixed_builder_neighbors_per_atom": self.neighbors_per_atom,
+            "fixed_builder_capacity_policy": self.capacity_policy,
+            "fixed_builder_neighbor_capacity_min": min(
+                self._neighbor_capacities_cpu
+            ),
+            "fixed_builder_neighbor_capacity_max": max(
+                self._neighbor_capacities_cpu
+            ),
+            "fixed_builder_neighbor_capacity_mean": (
+                self.edge_capacity / self.num_atoms
+            ),
+            "fixed_builder_neighbor_capacity_histogram": {
+                str(capacity): count
+                for capacity, count in self.capacity_histogram.items()
+            },
             "fixed_builder_min_real_edges": minimum,
             "fixed_builder_max_real_edges": maximum,
             "fixed_builder_max_padding_fraction": (
@@ -386,6 +590,15 @@ class FixedShapePBCNeighborBuilder:
             ),
             "fixed_builder_max_included_neighbors": int(
                 self.maximum_included_neighbors.item()
+            ),
+            "fixed_builder_max_capacity_excess": int(
+                self.maximum_capacity_excess.item()
+            ),
+            "fixed_builder_max_overflow_required": int(
+                self.maximum_overflow_required.item()
+            ),
+            "fixed_builder_max_overflow_capacity": int(
+                self.maximum_overflow_capacity.item()
             ),
             "fixed_builder_candidate_universe_size": (
                 self.num_atoms * self.candidates_per_atom

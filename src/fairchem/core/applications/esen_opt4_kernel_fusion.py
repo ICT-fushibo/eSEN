@@ -222,77 +222,12 @@ class TritonDistanceFixedShapePBCNeighborBuilder(
             )
             included_counts = included.sum(dim=1)
 
-            candidate_order = torch.where(
+            self._select_write_and_update_stats(
                 included,
-                self.candidate_ids.expand(self.num_atoms, -1),
-                torch.full_like(
-                    self.candidate_ids.expand(self.num_atoms, -1),
-                    self.candidates_per_atom,
-                ),
+                raw_counts,
+                included_counts,
+                step=step,
             )
-            selected = torch.topk(
-                candidate_order,
-                k=self.neighbors_per_atom,
-                dim=1,
-                largest=False,
-                sorted=True,
-            ).values
-            slot_valid = selected < self.candidates_per_atom
-            safe_selected = selected.clamp_max(self.candidates_per_atom - 1)
-
-            sources = self.candidate_sources.index_select(
-                0, safe_selected.reshape(-1)
-            )
-            centres = (
-                torch.arange(
-                    self.num_atoms, device=self.device, dtype=torch.long
-                )
-                .view(-1, 1)
-                .expand(-1, self.neighbors_per_atom)
-                .reshape(-1)
-            )
-            selected_offsets = self.candidate_cell_offsets.index_select(
-                0, safe_selected.reshape(-1)
-            )
-            flat_valid = slot_valid.reshape(-1)
-            self.edge_index[0].copy_(
-                torch.where(flat_valid, sources, self.dummy_sinks)
-            )
-            self.edge_index[1].copy_(
-                torch.where(flat_valid, centres, self.dummy_sinks)
-            )
-            self.cell_offsets.copy_(
-                torch.where(
-                    flat_valid.unsqueeze(1),
-                    selected_offsets.to(dtype=self.cell_offsets.dtype),
-                    self.padding_cell_offsets,
-                )
-            )
-
-            real_edges = flat_valid.sum()
-            overflow = (included_counts > self.neighbors_per_atom).any()
-            call_step = self.build_calls if step is None else step
-            self.current_real_edges.copy_(real_edges)
-            self.minimum_real_edges.copy_(
-                torch.minimum(self.minimum_real_edges, real_edges)
-            )
-            self.maximum_real_edges.copy_(
-                torch.maximum(self.maximum_real_edges, real_edges)
-            )
-            self.maximum_raw_neighbors.copy_(
-                torch.maximum(self.maximum_raw_neighbors, raw_counts.max())
-            )
-            self.maximum_included_neighbors.copy_(
-                torch.maximum(
-                    self.maximum_included_neighbors, included_counts.max()
-                )
-            )
-            self.capacity_misses.add_(overflow.to(dtype=torch.long))
-            first = (self.first_overflow_step < 0) & overflow
-            self.first_overflow_step.copy_(
-                torch.where(first, call_step, self.first_overflow_step)
-            )
-            self.build_calls.add_(1)
         return self.edge_index, self.cell_offsets
 
     def stats(self) -> dict[str, Any]:
@@ -327,6 +262,10 @@ def _make_triton_builder(
         pbc=_pbc_vector(core.static_batch, owner.device),
         cutoff=float(core.model.backbone.cutoff),
         neighbors_per_atom=owner.neighbors_per_atom,
+        neighbor_capacities=getattr(owner, "neighbor_capacities", None),
+        capacity_policy=getattr(
+            owner, "neighbor_capacity_policy", "uniform"
+        ),
         dummy_atoms=dummy_atoms,
         max_neighbors=max_neighbors,
         degeneracy_tolerance=degeneracy_tolerance,
@@ -346,6 +285,8 @@ class ESENKF1FixedBuilderModelCUDAGraphEvaluator(
         eager_evaluator: ESENEnergyForceEvaluator,
         *,
         neighbors_per_atom: int,
+        neighbor_capacities=None,
+        neighbor_capacity_policy: str = "uniform",
         dummy_atoms: int = 32,
         capture_warmup: int = 3,
         max_neighbors: int = 300,
@@ -357,6 +298,8 @@ class ESENKF1FixedBuilderModelCUDAGraphEvaluator(
         super().__init__(
             eager_evaluator,
             neighbors_per_atom=neighbors_per_atom,
+            neighbor_capacities=neighbor_capacities,
+            neighbor_capacity_policy=neighbor_capacity_policy,
             dummy_atoms=dummy_atoms,
             capture_warmup=capture_warmup,
             max_neighbors=max_neighbors,
@@ -383,6 +326,8 @@ class ESENKF1WholeStepCUDAGraphMD(ESENWholeStepCUDAGraphMD):
         integrator: GPUIntegrator,
         *,
         neighbors_per_atom: int,
+        neighbor_capacities=None,
+        neighbor_capacity_policy: str = "uniform",
         dummy_atoms: int = 32,
         capture_warmup: int = 3,
         max_neighbors: int = 300,
@@ -394,6 +339,8 @@ class ESENKF1WholeStepCUDAGraphMD(ESENWholeStepCUDAGraphMD):
             eager_evaluator,
             integrator,
             neighbors_per_atom=neighbors_per_atom,
+            neighbor_capacities=neighbor_capacities,
+            neighbor_capacity_policy=neighbor_capacity_policy,
             dummy_atoms=dummy_atoms,
             capture_warmup=capture_warmup,
             max_neighbors=max_neighbors,

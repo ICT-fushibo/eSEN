@@ -7,8 +7,11 @@ import torch
 
 from fairchem.core.applications.esen_fixed_neighbor import (
     FixedShapePBCNeighborBuilder,
+    atom_neighbor_capacities_from_probe,
     maximum_neighbors_in_graph,
+    neighbor_counts_in_graph,
     neighbor_capacity_from_probe,
+    species_neighbor_capacities_from_probe,
 )
 from fairchem.core.common.utils import radius_graph_pbc
 
@@ -39,6 +42,30 @@ def test_neighbor_capacity_from_probe_adds_margin_and_rounds():
     assert neighbor_capacity_from_probe(8, margin=0.0, slot_step=8) == 16
     with pytest.raises(ValueError):
         neighbor_capacity_from_probe(0)
+
+
+def test_species_neighbor_capacities_use_each_species_probe_maximum():
+    capacities = species_neighbor_capacities_from_probe(
+        [8, 10, 20, 19],
+        [1, 1, 8, 8],
+        margin=0.0,
+        slot_step=8,
+    )
+    assert capacities == (16, 16, 24, 24)
+
+
+def test_atom_neighbor_capacities_preserve_local_probe_distribution():
+    capacities = atom_neighbor_capacities_from_probe(
+        [8, 17, 20, 10], margin=0.0, slot_step=8
+    )
+    assert capacities == (16, 24, 24, 16)
+
+
+def test_neighbor_counts_in_graph_includes_isolated_atoms():
+    edges = torch.tensor([[1, 0, 2], [0, 1, 1]])
+    torch.testing.assert_close(
+        neighbor_counts_in_graph(edges, 4), torch.tensor([1, 2, 0, 0])
+    )
 
 
 @pytest.mark.parametrize(
@@ -125,3 +152,66 @@ def test_fixed_builder_padding_never_touches_real_atoms():
     builder.build(torch.tensor([[0.0, 0.0, 0.0], [0.8, 0.0, 0.0]]))
     assert builder.edge_index.data_ptr() == edge_address
     assert builder.cell_offsets.data_ptr() == offset_address
+
+
+def test_fixed_builder_supports_heterogeneous_static_slots():
+    positions = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.8, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+        ]
+    )
+    cell = torch.diag(torch.tensor([20.0, 20.0, 20.0]))
+    pbc = torch.tensor([False, False, False])
+    official_edges, official_offsets = _official_graph(
+        positions, cell, pbc
+    )
+    builder = FixedShapePBCNeighborBuilder(
+        num_atoms=4,
+        cell=cell,
+        pbc=pbc,
+        cutoff=1.25,
+        neighbors_per_atom=3,
+        neighbor_capacities=(2, 3, 2, 1),
+        capacity_policy="species",
+        dummy_atoms=2,
+    )
+    builder.build(positions)
+    fixed_edges, fixed_offsets = _active_builder_edges(builder)
+
+    assert builder.edge_capacity == 8
+    assert builder.edge_index.shape == (2, 8)
+    torch.testing.assert_close(fixed_edges, official_edges)
+    torch.testing.assert_close(fixed_offsets, official_offsets)
+    stats = builder.stats()
+    assert stats["fixed_builder_capacity_policy"] == "species"
+    assert stats["fixed_builder_neighbor_capacity_histogram"] == {
+        "1": 1,
+        "2": 2,
+        "3": 1,
+    }
+    assert stats["fixed_builder_capacity_misses"] == 0
+
+
+def test_fixed_builder_detects_heterogeneous_slot_overflow():
+    positions = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.8, 0.0, 0.0], [1.6, 0.0, 0.0]]
+    )
+    builder = FixedShapePBCNeighborBuilder(
+        num_atoms=3,
+        cell=torch.diag(torch.tensor([20.0, 20.0, 20.0])),
+        pbc=torch.tensor([False, False, False]),
+        cutoff=1.0,
+        neighbors_per_atom=2,
+        neighbor_capacities=(2, 1, 2),
+        capacity_policy="species",
+        dummy_atoms=2,
+    )
+    builder.build(positions)
+    stats = builder.stats()
+    assert stats["fixed_builder_capacity_misses"] == 1
+    assert stats["fixed_builder_max_capacity_excess"] == 1
+    assert stats["fixed_builder_max_overflow_required"] == 2
+    assert stats["fixed_builder_max_overflow_capacity"] == 1

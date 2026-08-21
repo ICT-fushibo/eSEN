@@ -28,6 +28,8 @@ WHOLE_BASE_STAGE=${WHOLE_BASE_STAGE:-OPT3}
 WHOLE_BASE_FUSIONS=${WHOLE_BASE_FUSIONS:-}
 WHOLE_CANDIDATE_STAGE=${WHOLE_CANDIDATE_STAGE:-OPT4V1}
 WHOLE_CANDIDATE_FUSIONS=${WHOLE_CANDIDATE_FUSIONS:-rmsnorm,so2-epilogue}
+WHOLE_BASE_NEIGHBOR_CAPACITY_POLICY=${WHOLE_BASE_NEIGHBOR_CAPACITY_POLICY:-uniform}
+WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY=${WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY:-uniform}
 
 if [[ ! -x "$NSYS" ]]; then
     echo "Nsight Systems is not executable: $NSYS" >&2
@@ -74,6 +76,7 @@ record_status() {
 run_one() {
     local scope=$1 variant=$2 system=$3 mode=$4
     local stage backend script scope_label run_name prefix log_path fusion_value
+    local capacity_policy=uniform
     local -a target_args fusion_args
 
     if [[ ! -f "$STRUCTURE_DIR/$system.cif" ]]; then
@@ -88,9 +91,11 @@ run_one() {
         if [[ "$variant" == "base" ]]; then
             stage=$WHOLE_BASE_STAGE
             fusion_value=$WHOLE_BASE_FUSIONS
+            capacity_policy=$WHOLE_BASE_NEIGHBOR_CAPACITY_POLICY
         else
             stage=$WHOLE_CANDIDATE_STAGE
             fusion_value=$WHOLE_CANDIDATE_FUSIONS
+            capacity_policy=$WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY
         fi
         if [[ -n "$fusion_value" ]]; then
             backend=whole-step-cg-opt4
@@ -116,6 +121,7 @@ run_one() {
             --probe-steps 50
             --neighbor-margin 0.10
             --neighbor-slot-step 8
+            --neighbor-capacity-policy "$capacity_policy"
             --dummy-atoms 32
             --capture-warmup 3
             --max-neighbors 300
@@ -258,6 +264,8 @@ run_one() {
     echo "whole_base_fusions=$WHOLE_BASE_FUSIONS"
     echo "whole_candidate_stage=$WHOLE_CANDIDATE_STAGE"
     echo "whole_candidate_fusions=$WHOLE_CANDIDATE_FUSIONS"
+    echo "whole_base_neighbor_capacity_policy=$WHOLE_BASE_NEIGHBOR_CAPACITY_POLICY"
+    echo "whole_candidate_neighbor_capacity_policy=$WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY"
     echo "checkpoint=$CHECKPOINT"
     echo "structure_dir=$STRUCTURE_DIR"
     "$NSYS" --version | tr '\n' ' '

@@ -74,6 +74,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-steps", type=int, default=50)
     parser.add_argument("--neighbor-margin", type=float, default=0.10)
     parser.add_argument("--neighbor-slot-step", type=int, default=8)
+    parser.add_argument(
+        "--neighbor-capacity-policy",
+        choices=("uniform", "species", "atom"),
+        default="uniform",
+        help=(
+            "Static neighbor-slot allocation. 'uniform' preserves Opt3/Opt4 "
+            "behavior; 'species' assigns each element its probed maximum; "
+            "'atom' assigns rounded probe bounds per atom."
+        ),
+    )
     parser.add_argument("--dummy-atoms", type=int, default=32)
     parser.add_argument("--capture-warmup", type=int, default=3)
     parser.add_argument("--max-neighbors", type=int, default=300)
@@ -188,8 +198,10 @@ def main() -> int:
     from ase.io import read
     from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
     from fairchem.core.applications.esen_fixed_neighbor import (
-        maximum_neighbors_in_graph,
+        atom_neighbor_capacities_from_probe,
+        neighbor_counts_in_graph,
         neighbor_capacity_from_probe,
+        species_neighbor_capacities_from_probe,
     )
     from fairchem.core.applications.esen_gpu_md import (
         ESENEnergyForceEvaluator,
@@ -295,24 +307,76 @@ def main() -> int:
 
     setup_start = time.perf_counter()
     probe_rng = capture_rng_state(torch)
-    probe_degrees = []
     initial_graph = evaluator.build_neighbor_graph(state.positions)
-    probe_degrees.append(
-        maximum_neighbors_in_graph(initial_graph["edge_index"], len(atoms))
+    probe_max_degrees = neighbor_counts_in_graph(
+        initial_graph["edge_index"], len(atoms)
     )
     for _ in range(args.probe_steps):
         eager_md.run(1)
         graph = evaluator.build_neighbor_graph(state.positions)
-        probe_degrees.append(
-            maximum_neighbors_in_graph(graph["edge_index"], len(atoms))
+        probe_max_degrees = torch.maximum(
+            probe_max_degrees,
+            neighbor_counts_in_graph(graph["edge_index"], len(atoms)),
         )
     torch.cuda.synchronize()
-    probe_max_neighbors = max(probe_degrees)
-    neighbor_capacity = neighbor_capacity_from_probe(
+    probe_max_neighbors = int(probe_max_degrees.max().item())
+    uniform_neighbor_capacity = neighbor_capacity_from_probe(
         probe_max_neighbors,
         margin=args.neighbor_margin,
         slot_step=args.neighbor_slot_step,
     )
+    if args.neighbor_capacity_policy == "species":
+        neighbor_capacities = species_neighbor_capacities_from_probe(
+            probe_max_degrees,
+            atoms.numbers,
+            margin=args.neighbor_margin,
+            slot_step=args.neighbor_slot_step,
+        )
+    elif args.neighbor_capacity_policy == "atom":
+        neighbor_capacities = atom_neighbor_capacities_from_probe(
+            probe_max_degrees,
+            margin=args.neighbor_margin,
+            slot_step=args.neighbor_slot_step,
+        )
+    else:
+        neighbor_capacities = None
+    effective_neighbor_capacities = (
+        neighbor_capacities
+        if neighbor_capacities is not None
+        else (uniform_neighbor_capacity,) * len(atoms)
+    )
+    neighbor_capacity = max(effective_neighbor_capacities)
+    neighbor_edge_capacity = sum(effective_neighbor_capacities)
+    uniform_edge_capacity = len(atoms) * uniform_neighbor_capacity
+    probe_max_degrees_cpu = probe_max_degrees.detach().to(device="cpu")
+    atomic_numbers_cpu = torch.as_tensor(atoms.numbers, dtype=torch.long)
+    neighbor_capacity_by_species = {}
+    for atomic_number in torch.unique(atomic_numbers_cpu, sorted=True):
+        mask = atomic_numbers_cpu == atomic_number
+        indices = torch.nonzero(mask, as_tuple=False).reshape(-1)
+        species_capacities = [
+            effective_neighbor_capacities[int(index)] for index in indices
+        ]
+        unique_species_capacities = sorted(set(species_capacities))
+        neighbor_capacity_by_species[str(int(atomic_number))] = {
+            "atomic_number": int(atomic_number),
+            "atom_count": int(mask.sum().item()),
+            "probe_max_neighbors": int(
+                probe_max_degrees_cpu[mask].max().item()
+            ),
+            "capacity_per_atom": (
+                unique_species_capacities[0]
+                if len(unique_species_capacities) == 1
+                else None
+            ),
+            "capacity_min": min(species_capacities),
+            "capacity_max": max(species_capacities),
+            "capacity_mean": sum(species_capacities) / len(species_capacities),
+            "capacity_histogram": {
+                str(capacity): species_capacities.count(capacity)
+                for capacity in unique_species_capacities
+            },
+        }
     del initial_graph
     if args.probe_steps:
         del graph
@@ -348,6 +412,8 @@ def main() -> int:
         fixed_evaluator = evaluator_class(
             evaluator,
             neighbors_per_atom=neighbor_capacity,
+            neighbor_capacities=neighbor_capacities,
+            neighbor_capacity_policy=args.neighbor_capacity_policy,
             dummy_atoms=args.dummy_atoms,
             capture_warmup=args.capture_warmup,
             max_neighbors=args.max_neighbors,
@@ -379,6 +445,8 @@ def main() -> int:
             evaluator,
             integrator,
             neighbors_per_atom=neighbor_capacity,
+            neighbor_capacities=neighbor_capacities,
+            neighbor_capacity_policy=args.neighbor_capacity_policy,
             dummy_atoms=args.dummy_atoms,
             capture_warmup=args.capture_warmup,
             max_neighbors=args.max_neighbors,
@@ -609,6 +677,15 @@ def main() -> int:
         "probe_steps": args.probe_steps,
         "probe_max_neighbors_per_atom": probe_max_neighbors,
         "neighbor_capacity_per_atom": neighbor_capacity,
+        "neighbor_capacity_policy": args.neighbor_capacity_policy,
+        "neighbor_capacity_by_species": neighbor_capacity_by_species,
+        "neighbor_edge_capacity": neighbor_edge_capacity,
+        "neighbor_uniform_capacity_per_atom": uniform_neighbor_capacity,
+        "neighbor_uniform_edge_capacity": uniform_edge_capacity,
+        "neighbor_capacity_reduction_vs_uniform": (
+            (uniform_edge_capacity - neighbor_edge_capacity)
+            / uniform_edge_capacity
+        ),
         "neighbor_capacity_margin": args.neighbor_margin,
         "neighbor_slot_step": args.neighbor_slot_step,
         "max_neighbors": args.max_neighbors,

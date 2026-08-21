@@ -14,6 +14,8 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${CANDIDATE_STAGE:?Set CANDIDATE_STAGE}"
 : "${CANDIDATE_FUSIONS:?Set CANDIDATE_FUSIONS}"
 BASE_FUSIONS=${BASE_FUSIONS:-}
+BASE_NEIGHBOR_CAPACITY_POLICY=${BASE_NEIGHBOR_CAPACITY_POLICY:-uniform}
+CANDIDATE_NEIGHBOR_CAPACITY_POLICY=${CANDIDATE_NEIGHBOR_CAPACITY_POLICY:-uniform}
 CHECKPOINT=${CHECKPOINT:-"$REPO_ROOT/esen_30m_oam.pt"}
 STRUCTURE_DIR=${STRUCTURE_DIR:-"$REPO_ROOT/../MatRIS-09bk/example/cif_file"}
 BASELINE_DIR=${BASELINE_DIR:-}
@@ -33,7 +35,7 @@ esac
 
 mkdir -p "$OUTPUT_DIR"/{results,logs}
 STATUS_TSV="$OUTPUT_DIR/run_status.tsv"
-printf 'scope\tvariant\tfusion_stage\tmodel_fusions\tsystem\ttemperature_K\trepeat\trun_name\tstatus\texit_code\tprocess_wall_time_s\n' > "$STATUS_TSV"
+printf 'scope\tvariant\tfusion_stage\tmodel_fusions\tneighbor_capacity_policy\tsystem\ttemperature_K\trepeat\trun_name\tstatus\texit_code\tprocess_wall_time_s\n' > "$STATUS_TSV"
 
 {
     echo "scope=$SCOPE"
@@ -41,6 +43,8 @@ printf 'scope\tvariant\tfusion_stage\tmodel_fusions\tsystem\ttemperature_K\trepe
     echo "base_fusions=$BASE_FUSIONS"
     echo "candidate_stage=$CANDIDATE_STAGE"
     echo "candidate_fusions=$CANDIDATE_FUSIONS"
+    echo "base_neighbor_capacity_policy=$BASE_NEIGHBOR_CAPACITY_POLICY"
+    echo "candidate_neighbor_capacity_policy=$CANDIDATE_NEIGHBOR_CAPACITY_POLICY"
     echo "repo_commit=$(git -C "$REPO_ROOT" rev-parse HEAD)"
     echo "source_bundle_sha256=$SOURCE_BUNDLE_SHA256"
     echo "physical_gpu=$GPU"
@@ -76,11 +80,13 @@ classify() {
 
 run_one() {
     local variant=$1 system=$2 temperature=$3 repeat=$4
-    local stage fusions backend
+    local stage fusions capacity_policy backend
     if [[ "$variant" == base ]]; then
         stage=$BASE_STAGE; fusions=$BASE_FUSIONS
+        capacity_policy=$BASE_NEIGHBOR_CAPACITY_POLICY
     else
         stage=$CANDIDATE_STAGE; fusions=$CANDIDATE_FUSIONS
+        capacity_policy=$CANDIDATE_NEIGHBOR_CAPACITY_POLICY
     fi
     if [[ "$SCOPE" == "model-only" ]]; then
         if [[ -n "$fusions" ]]; then backend=model-cg-opt4; else backend=model-cg; fi
@@ -146,7 +152,8 @@ run_one() {
                 --steps "$STEPS" --warmup-steps "$WARMUP_STEPS" \
                 --temperature "$temperature" --timestep 1.0 --taut 100.0 \
                 --seed 42 --repeat "$repeat" --probe-steps 50 \
-                --neighbor-margin 0.10 --neighbor-slot-step 8 --dummy-atoms 32 \
+                --neighbor-margin 0.10 --neighbor-slot-step 8 \
+                --neighbor-capacity-policy "$capacity_policy" --dummy-atoms 32 \
                 --capture-warmup 3 --max-neighbors 300 \
                 --degeneracy-tolerance 0.01 --energy-per-atom-atol 1e-5 \
                 --force-max-atol 2e-4 "${whole_args[@]}" \
@@ -157,8 +164,8 @@ run_one() {
     end=$(date +%s%N)
     elapsed=$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.6f",(b-a)/1e9}')
     status=$(classify "$code" "$log" "$result")
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$SCOPE" "$variant" "$stage" "$fusions" "$system" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$SCOPE" "$variant" "$stage" "$fusions" "$capacity_policy" "$system" \
         "$temperature" "$repeat" "$run_name" "$status" "$code" \
         "$elapsed" >> "$STATUS_TSV"
     echo "$status ($code): $run_name"
