@@ -73,6 +73,13 @@ def _env_int(name: str, default: int) -> int:
     return int(_env(name, str(default)))
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    value = _env_int(name, default)
+    if value < 1:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
 def _env_float(name: str, default: float) -> float:
     return float(_env(name, str(default)))
 
@@ -109,9 +116,10 @@ def _temperature_label(value: str) -> str:
 
 
 def _capacity_policy(value: str) -> str:
-    if value not in {"uniform", "species", "atom", "auto"}:
+    if value not in {"uniform", "species", "atom", "auto", "auto-safe"}:
         raise ValueError(
-            "neighbor capacity policy must be uniform, species, atom, or auto"
+            "neighbor capacity policy must be uniform, species, atom, auto, "
+            "or auto-safe"
         )
     return value
 
@@ -249,6 +257,8 @@ class Config:
     whole_base_capacity_policy: str
     whole_candidate_capacity_policy: str
     neighbor_auto_min_reduction: float
+    neighbor_auto_guard_slots: int
+    whole_probe_steps: int
     run_kind: str
     status_filename: str
     resume: bool
@@ -314,6 +324,10 @@ class Config:
             neighbor_auto_min_reduction=_env_fraction(
                 "NEIGHBOR_AUTO_MIN_REDUCTION", 0.05
             ),
+            neighbor_auto_guard_slots=_env_positive_int(
+                "NEIGHBOR_AUTO_GUARD_SLOTS", 1
+            ),
+            whole_probe_steps=_env_positive_int("WHOLE_PROBE_STEPS", 50),
             run_kind=_env("RUN_KIND", "opt4_v1_kf9_formal_performance"),
             status_filename=_env("STATUS_FILENAME", "v1_status.tsv"),
             resume=_env("RESUME", "1") not in {"0", "false", "False"},
@@ -421,12 +435,15 @@ class Scheduler:
                 "--taut", "100.0",
                 "--seed", "42",
                 "--repeat", str(repeat),
-                "--probe-steps", "50",
+                "--probe-steps", str(self.config.whole_probe_steps),
                 "--neighbor-margin", "0.10",
                 "--neighbor-slot-step", "8",
                 "--neighbor-capacity-policy", neighbor_capacity_policy,
                 "--neighbor-auto-min-reduction", str(
                     self.config.neighbor_auto_min_reduction
+                ),
+                "--neighbor-auto-guard-slots", str(
+                    self.config.neighbor_auto_guard_slots
                 ),
                 "--dummy-atoms", "32",
                 "--capture-warmup", "3",
@@ -660,6 +677,10 @@ class Scheduler:
                 "neighbor_auto_min_reduction": (
                     self.config.neighbor_auto_min_reduction
                 ),
+                "neighbor_auto_guard_slots": (
+                    self.config.neighbor_auto_guard_slots
+                ),
+                "whole_probe_steps": self.config.whole_probe_steps,
                 "gpus": self.config.gpus,
                 "gpu_idle_seconds": self.config.idle_seconds,
                 "gpu_poll_seconds": self.config.poll_seconds,

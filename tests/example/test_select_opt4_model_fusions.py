@@ -23,6 +23,8 @@ def _record(
     *,
     scope: str = "whole-step",
     peak_reserved_gib: float = 1.0,
+    system: str = "Cu32",
+    temperature: int = 300,
 ) -> dict[str, object]:
     if scope == "model-only":
         base_backend = "esen_gpu_resident_model_cg"
@@ -33,8 +35,8 @@ def _record(
     return {
         "backend": base_backend if stage.endswith("_base") else fused_backend,
         "kernel_fusion_stage": stage,
-        "system": "Cu32",
-        "temperature_K": 300,
+        "system": system,
+        "temperature_K": temperature,
         "repeat": repeat,
         "seconds_per_step": seconds,
         "engineering_validation_pass": True,
@@ -202,3 +204,77 @@ def test_selector_rejects_peak_reserved_guardrail(tmp_path, monkeypatch):
     assert module.main() == 1
     result = json.loads(output.read_text(encoding="utf-8"))
     assert result["reserved_memory_ok"] is False
+
+
+def test_selector_focus_system_supports_multiple_temperatures(
+    tmp_path, monkeypatch
+):
+    module = _load_module()
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    status_rows = []
+    for temperature in (300, 800):
+        for repeat in range(1, 4):
+            records = (
+                _record(
+                    "KF12",
+                    repeat,
+                    1.0,
+                    system="H2O192",
+                    temperature=temperature,
+                ),
+                _record(
+                    "KF12CAP1SAFE",
+                    repeat,
+                    0.9,
+                    system="H2O192",
+                    temperature=temperature,
+                ),
+            )
+            for index, record in enumerate(records):
+                (result_dir / f"{temperature}_{repeat}_{index}.json").write_text(
+                    json.dumps(record), encoding="utf-8"
+                )
+            status_rows.append(
+                "whole-step\tcandidate\tKF12CAP1SAFE\tauto-safe-capacity\t"
+                f"H2O192\t{temperature}\t{repeat}\trun_{temperature}_{repeat}"
+                "\tsuccess\t0\t1.0\n"
+            )
+    header = (
+        "scope\tvariant\tfusion_stage\tmodel_fusions\tsystem\t"
+        "temperature_K\trepeat\trun_name\tstatus\texit_code\t"
+        "process_wall_time_s\n"
+    )
+    (tmp_path / "run_status.tsv").write_text(
+        header + "".join(status_rows), encoding="utf-8"
+    )
+    output = tmp_path / "selection.json"
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        [
+            str(SCRIPT),
+            "--input-dir",
+            str(tmp_path),
+            "--scope",
+            "whole-step",
+            "--base-stage",
+            "KF12",
+            "--candidate-stage",
+            "KF12CAP1SAFE",
+            "--candidate-fusion",
+            "auto-safe-capacity",
+            "--focus-systems",
+            "H2O192",
+            "--min-paired-repeats",
+            "3",
+            "--min-faster-directions",
+            "3",
+            "--output",
+            str(output),
+        ],
+    )
+    assert module.main() == 0
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["focus_stable"] is True
+    assert len(result["comparisons"]) == 2

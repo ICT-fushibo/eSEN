@@ -76,14 +76,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neighbor-slot-step", type=int, default=8)
     parser.add_argument(
         "--neighbor-capacity-policy",
-        choices=("uniform", "species", "atom", "auto"),
+        choices=("uniform", "species", "atom", "auto", "auto-safe"),
         default="uniform",
         help=(
             "Static neighbor-slot allocation. 'uniform' preserves Opt3/Opt4 "
             "behavior; 'species' assigns each element its probed maximum; "
             "'atom' assigns rounded probe bounds per atom; 'auto' uses atom "
             "slots only when their capacity reduction reaches the configured "
-            "threshold."
+            "threshold; 'auto-safe' additionally promotes every atom by the "
+            "configured number of guard buckets before applying the threshold."
         ),
     )
     parser.add_argument(
@@ -93,6 +94,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Minimum fractional edge-capacity reduction required for the "
             "'auto' policy to select per-atom slots (default: 0.05)."
+        ),
+    )
+    parser.add_argument(
+        "--neighbor-auto-guard-slots",
+        type=int,
+        default=1,
+        help=(
+            "Additional neighbor-slot buckets used by 'auto-safe' before its "
+            "minimum-reduction decision (default: 1)."
         ),
     )
     parser.add_argument("--dummy-atoms", type=int, default=32)
@@ -126,6 +136,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("NVT parameters must be positive")
     if args.neighbor_margin < 0 or args.neighbor_slot_step < 1:
         parser.error("invalid neighbor capacity parameters")
+    if args.neighbor_auto_guard_slots < 1:
+        parser.error("neighbor auto-safe guard slots must be positive")
     if (
         not np.isfinite(args.neighbor_auto_min_reduction)
         or not 0.0 <= args.neighbor_auto_min_reduction <= 1.0
@@ -350,6 +362,28 @@ def main() -> int:
             minimum_reduction=args.neighbor_auto_min_reduction,
         )
     )
+    safe_auto_candidate_capacities, safe_auto_candidate_reduction = (
+        auto_neighbor_capacities_from_probe(
+            probe_max_degrees,
+            margin=args.neighbor_margin,
+            slot_step=args.neighbor_slot_step,
+            minimum_reduction=args.neighbor_auto_min_reduction,
+            guard_slots=args.neighbor_auto_guard_slots,
+        )
+    )
+    unprotected_atom_capacities = atom_neighbor_capacities_from_probe(
+        probe_max_degrees,
+        margin=args.neighbor_margin,
+        slot_step=args.neighbor_slot_step,
+    )
+    safe_atom_capacities = tuple(
+        min(
+            uniform_neighbor_capacity,
+            capacity
+            + args.neighbor_auto_guard_slots * args.neighbor_slot_step,
+        )
+        for capacity in unprotected_atom_capacities
+    )
     if args.neighbor_capacity_policy == "species":
         neighbor_capacities = species_neighbor_capacities_from_probe(
             probe_max_degrees,
@@ -365,14 +399,24 @@ def main() -> int:
         )
     elif args.neighbor_capacity_policy == "auto":
         neighbor_capacities = auto_candidate_capacities
+    elif args.neighbor_capacity_policy == "auto-safe":
+        neighbor_capacities = safe_auto_candidate_capacities
     else:
         neighbor_capacities = None
     effective_neighbor_capacity_policy = (
-        "atom" if neighbor_capacities is not None
-        and args.neighbor_capacity_policy in {"atom", "auto"}
+        (
+            "atom-safe"
+            if args.neighbor_capacity_policy == "auto-safe"
+            else "atom"
+        )
+        if neighbor_capacities is not None
+        and args.neighbor_capacity_policy in {"atom", "auto", "auto-safe"}
         else args.neighbor_capacity_policy
     )
-    if args.neighbor_capacity_policy == "auto" and neighbor_capacities is None:
+    if (
+        args.neighbor_capacity_policy in {"auto", "auto-safe"}
+        and neighbor_capacities is None
+    ):
         effective_neighbor_capacity_policy = "uniform"
     effective_neighbor_capacities = (
         neighbor_capacities
@@ -593,6 +637,7 @@ def main() -> int:
         graph_stats["cuda_graph_capture_count"] == 1
         and graph_stats["cuda_graph_production_capture_count"] == 0
         and graph_stats["cuda_graph_production_replays"] == expected_replays
+        and not capacity_overflow
         and graph_stats["cuda_graph_hit_rate"] == 1.0
         and graph_stats.get("cuda_graph_replay_stability_pass", True)
     )
@@ -717,19 +762,45 @@ def main() -> int:
         "neighbor_capacity_auto_min_reduction": (
             args.neighbor_auto_min_reduction
         ),
+        "neighbor_capacity_auto_guard_slots": (
+            args.neighbor_auto_guard_slots
+            if args.neighbor_capacity_policy == "auto-safe"
+            else 0
+        ),
+        "neighbor_capacity_auto_guard_neighbors": (
+            args.neighbor_auto_guard_slots * args.neighbor_slot_step
+            if args.neighbor_capacity_policy == "auto-safe"
+            else 0
+        ),
         "neighbor_capacity_auto_candidate_edge_capacity": sum(
-            atom_neighbor_capacities_from_probe(
-                probe_max_degrees,
-                margin=args.neighbor_margin,
-                slot_step=args.neighbor_slot_step,
-            )
+            safe_atom_capacities
+            if args.neighbor_capacity_policy == "auto-safe"
+            else unprotected_atom_capacities
         ),
         "neighbor_capacity_auto_candidate_reduction_vs_uniform": (
+            safe_auto_candidate_reduction
+            if args.neighbor_capacity_policy == "auto-safe"
+            else auto_candidate_reduction
+        ),
+        "neighbor_capacity_auto_unprotected_reduction_vs_uniform": (
             auto_candidate_reduction
         ),
+        "neighbor_capacity_auto_unprotected_edge_capacity": sum(
+            unprotected_atom_capacities
+        ),
+        "neighbor_capacity_auto_safe_reduction_vs_uniform": (
+            safe_auto_candidate_reduction
+        ),
+        "neighbor_capacity_auto_safe_edge_capacity": sum(
+            safe_atom_capacities
+        ),
         "neighbor_capacity_auto_selected": (
-            args.neighbor_capacity_policy == "auto"
-            and effective_neighbor_capacity_policy == "atom"
+            args.neighbor_capacity_policy in {"auto", "auto-safe"}
+            and effective_neighbor_capacity_policy in {"atom", "atom-safe"}
+        ),
+        "neighbor_capacity_auto_safe_selected": (
+            args.neighbor_capacity_policy == "auto-safe"
+            and effective_neighbor_capacity_policy == "atom-safe"
         ),
         "neighbor_capacity_by_species": neighbor_capacity_by_species,
         "neighbor_edge_capacity": neighbor_edge_capacity,

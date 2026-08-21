@@ -262,11 +262,18 @@ def main() -> int:
         )
 
     focus_geomean = _geomean(focus_comparisons)
-    focus_stable = bool(focus_set) and len(focus_comparisons) == len(focus_set) and all(
-        row["paired_repeats"] >= args.min_paired_repeats
-        and row["directions_faster"] >= args.min_faster_directions
-        and row["delta_exceeds_mad_sum"]
-        for row in focus_comparisons
+    focus_systems_present = {
+        str(row["system"]) for row in focus_comparisons
+    }
+    focus_stable = (
+        bool(focus_set)
+        and focus_systems_present == focus_set
+        and all(
+            row["paired_repeats"] >= args.min_paired_repeats
+            and row["directions_faster"] >= args.min_faster_directions
+            and row["delta_exceeds_mad_sum"]
+            for row in focus_comparisons
+        )
     )
     focus_no_regression = bool(focus_comparisons) and all(
         row["speedup"] >= 1.0 - args.maximum_system_regression

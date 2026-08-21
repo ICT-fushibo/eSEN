@@ -84,12 +84,41 @@ def test_auto_neighbor_capacities_keeps_uniform_below_threshold():
     assert reduction == 0.0
 
 
+def test_auto_safe_adds_one_guard_bucket_before_selection():
+    capacities, reduction = auto_neighbor_capacities_from_probe(
+        [1, 1, 1, 20],
+        margin=0.0,
+        slot_step=8,
+        minimum_reduction=0.05,
+        guard_slots=1,
+    )
+    assert capacities == (16, 16, 16, 24)
+    assert reduction == pytest.approx(0.25)
+
+
+def test_auto_safe_falls_back_when_guard_removes_material_reduction():
+    capacities, reduction = auto_neighbor_capacities_from_probe(
+        [8, 8, 20, 20],
+        margin=0.0,
+        slot_step=8,
+        minimum_reduction=0.05,
+        guard_slots=1,
+    )
+    assert capacities is None
+    assert reduction == 0.0
+
+
 @pytest.mark.parametrize("minimum_reduction", [-0.01, 1.01, float("nan")])
 def test_auto_neighbor_capacities_rejects_invalid_threshold(minimum_reduction):
     with pytest.raises(ValueError):
         auto_neighbor_capacities_from_probe(
             [8, 20], minimum_reduction=minimum_reduction
         )
+
+
+def test_auto_neighbor_capacities_rejects_negative_guard_slots():
+    with pytest.raises(ValueError):
+        auto_neighbor_capacities_from_probe([8, 20], guard_slots=-1)
 
 
 def test_neighbor_counts_in_graph_includes_isolated_atoms():

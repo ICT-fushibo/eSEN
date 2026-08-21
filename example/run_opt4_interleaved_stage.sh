@@ -17,6 +17,8 @@ BASE_FUSIONS=${BASE_FUSIONS:-}
 BASE_NEIGHBOR_CAPACITY_POLICY=${BASE_NEIGHBOR_CAPACITY_POLICY:-uniform}
 CANDIDATE_NEIGHBOR_CAPACITY_POLICY=${CANDIDATE_NEIGHBOR_CAPACITY_POLICY:-uniform}
 NEIGHBOR_AUTO_MIN_REDUCTION=${NEIGHBOR_AUTO_MIN_REDUCTION:-0.05}
+NEIGHBOR_AUTO_GUARD_SLOTS=${NEIGHBOR_AUTO_GUARD_SLOTS:-1}
+PROBE_STEPS=${PROBE_STEPS:-50}
 CHECKPOINT=${CHECKPOINT:-"$REPO_ROOT/esen_30m_oam.pt"}
 STRUCTURE_DIR=${STRUCTURE_DIR:-"$REPO_ROOT/../MatRIS-09bk/example/cif_file"}
 BASELINE_DIR=${BASELINE_DIR:-}
@@ -47,6 +49,8 @@ printf 'scope\tvariant\tfusion_stage\tmodel_fusions\tneighbor_capacity_policy\ts
     echo "base_neighbor_capacity_policy=$BASE_NEIGHBOR_CAPACITY_POLICY"
     echo "candidate_neighbor_capacity_policy=$CANDIDATE_NEIGHBOR_CAPACITY_POLICY"
     echo "neighbor_auto_min_reduction=$NEIGHBOR_AUTO_MIN_REDUCTION"
+    echo "neighbor_auto_guard_slots=$NEIGHBOR_AUTO_GUARD_SLOTS"
+    echo "probe_steps=$PROBE_STEPS"
     echo "repo_commit=$(git -C "$REPO_ROOT" rev-parse HEAD)"
     echo "source_bundle_sha256=$SOURCE_BUNDLE_SHA256"
     echo "physical_gpu=$GPU"
@@ -153,10 +157,11 @@ run_one() {
                 --output-dir "$OUTPUT_DIR/results" --run-name "$run_name" \
                 --steps "$STEPS" --warmup-steps "$WARMUP_STEPS" \
                 --temperature "$temperature" --timestep 1.0 --taut 100.0 \
-                --seed 42 --repeat "$repeat" --probe-steps 50 \
+                --seed 42 --repeat "$repeat" --probe-steps "$PROBE_STEPS" \
                 --neighbor-margin 0.10 --neighbor-slot-step 8 \
                 --neighbor-capacity-policy "$capacity_policy" \
                 --neighbor-auto-min-reduction "$NEIGHBOR_AUTO_MIN_REDUCTION" \
+                --neighbor-auto-guard-slots "$NEIGHBOR_AUTO_GUARD_SLOTS" \
                 --dummy-atoms 32 \
                 --capture-warmup 3 --max-neighbors 300 \
                 --degeneracy-tolerance 0.01 --energy-per-atom-atol 1e-5 \

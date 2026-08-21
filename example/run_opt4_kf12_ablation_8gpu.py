@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Poll idle GPUs for the Opt4 v2/CAP1-auto versus KF12 ablation."""
+"""Poll idle GPUs for KF12 while holding CAP1-auto-safe constant."""
 
 from __future__ import annotations
 
@@ -33,8 +33,8 @@ def _set_kf12_defaults() -> None:
         "MODEL_CANDIDATE_FUSIONS",
         "so2-epilogue,so2-gate-bridge,so2-block-gemm",
     )
-    os.environ.setdefault("WHOLE_BASE_STAGE", "OPT4V2")
-    os.environ.setdefault("WHOLE_CANDIDATE_STAGE", "KF12")
+    os.environ.setdefault("WHOLE_BASE_STAGE", "OPT4V2CAP1SAFE")
+    os.environ.setdefault("WHOLE_CANDIDATE_STAGE", "KF12CAP1SAFE")
     os.environ.setdefault(
         "WHOLE_BASE_FUSIONS", "rmsnorm,so2-epilogue,so2-gate-bridge"
     )
@@ -42,11 +42,15 @@ def _set_kf12_defaults() -> None:
         "WHOLE_CANDIDATE_FUSIONS",
         "rmsnorm,so2-epilogue,so2-gate-bridge,so2-block-gemm",
     )
-    # CAP1-auto is held constant in both whole-step variants.
-    os.environ.setdefault("WHOLE_BASE_NEIGHBOR_CAPACITY_POLICY", "auto")
-    os.environ.setdefault("WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY", "auto")
+    # CAP1-auto-safe is held constant in both whole-step variants.
+    os.environ.setdefault("WHOLE_BASE_NEIGHBOR_CAPACITY_POLICY", "auto-safe")
+    os.environ.setdefault(
+        "WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY", "auto-safe"
+    )
     os.environ.setdefault("NEIGHBOR_AUTO_MIN_REDUCTION", "0.05")
-    os.environ.setdefault("RUN_KIND", "opt4_v2_cap1_auto_kf12_ablation")
+    os.environ.setdefault("NEIGHBOR_AUTO_GUARD_SLOTS", "1")
+    os.environ.setdefault("WHOLE_PROBE_STEPS", "100")
+    os.environ.setdefault("RUN_KIND", "opt4_v2_cap1_auto_safe_kf12_ablation")
     os.environ.setdefault("STATUS_FILENAME", "kf12_status.tsv")
 
 

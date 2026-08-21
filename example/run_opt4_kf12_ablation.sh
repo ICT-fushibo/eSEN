@@ -17,15 +17,22 @@ STEPS=${STEPS:-100}
 WARMUP_STEPS=${WARMUP_STEPS:-3}
 REPEATS=${REPEATS:-3}
 SOURCE_BUNDLE_SHA256=${SOURCE_BUNDLE_SHA256:-}
+PROBE_STEPS=${PROBE_STEPS:-100}
+NEIGHBOR_AUTO_GUARD_SLOTS=${NEIGHBOR_AUTO_GUARD_SLOTS:-1}
 
 case "$SCOPE" in
     model-only)
         BASE_FUSIONS=so2-epilogue,so2-gate-bridge
         BASE_POLICY=uniform
+        BASE_STAGE_LABEL=OPT4V2
+        CANDIDATE_STAGE_LABEL=KF12
         ;;
     whole-step)
         BASE_FUSIONS=rmsnorm,so2-epilogue,so2-gate-bridge
-        BASE_POLICY=auto
+        # Hold guarded CAP1-auto constant so this round isolates KF12.
+        BASE_POLICY=auto-safe
+        BASE_STAGE_LABEL=OPT4V2CAP1SAFE
+        CANDIDATE_STAGE_LABEL=KF12CAP1SAFE
         ;;
     *) echo "SCOPE must be model-only or whole-step" >&2; exit 2 ;;
 esac
@@ -38,11 +45,14 @@ env GPU="$GPU" SCOPE="$SCOPE" CHECKPOINT="$CHECKPOINT" \
     BASELINE_STEPS="$BASELINE_STEPS" STEPS="$STEPS" REPEATS="$REPEATS" \
     WARMUP_STEPS="$WARMUP_STEPS" SYSTEMS="$SYSTEMS" \
     TEMPERATURES="$TEMPERATURES" OUTPUT_DIR="$ROUND_DIR" \
-    BASE_STAGE=OPT4V2 BASE_FUSIONS="$BASE_FUSIONS" \
-    CANDIDATE_STAGE=KF12 CANDIDATE_FUSIONS="$CANDIDATE_FUSIONS" \
+    BASE_STAGE="$BASE_STAGE_LABEL" BASE_FUSIONS="$BASE_FUSIONS" \
+    CANDIDATE_STAGE="$CANDIDATE_STAGE_LABEL" \
+    CANDIDATE_FUSIONS="$CANDIDATE_FUSIONS" \
     BASE_NEIGHBOR_CAPACITY_POLICY="$BASE_POLICY" \
     CANDIDATE_NEIGHBOR_CAPACITY_POLICY="$BASE_POLICY" \
     NEIGHBOR_AUTO_MIN_REDUCTION="${NEIGHBOR_AUTO_MIN_REDUCTION:-0.05}" \
+    NEIGHBOR_AUTO_GUARD_SLOTS="$NEIGHBOR_AUTO_GUARD_SLOTS" \
+    PROBE_STEPS="$PROBE_STEPS" \
     SOURCE_BUNDLE_SHA256="$SOURCE_BUNDLE_SHA256" \
     bash "$REPO_ROOT/example/run_opt4_interleaved_stage.sh"
 runner_code=$?
@@ -51,7 +61,8 @@ selection="$ROOT_OUTPUT_DIR/KF12_selection.json"
 set +e
 python "$REPO_ROOT/example/select_opt4_model_fusions.py" \
     --input-dir "$ROUND_DIR" --scope "$SCOPE" \
-    --base-stage OPT4V2 --candidate-stage KF12 \
+    --base-stage "$BASE_STAGE_LABEL" \
+    --candidate-stage "$CANDIDATE_STAGE_LABEL" \
     --candidate-fusion so2-block-gemm --accepted-before "$BASE_FUSIONS" \
     --focus-systems $FOCUS_SYSTEMS \
     --min-paired-repeats "$REPEATS" --min-faster-directions "$REPEATS" \
@@ -61,12 +72,12 @@ selected=$?
 set -e
 if [[ $runner_code -ne 0 ]]; then selected=$runner_code; fi
 
-python - "$ROOT_OUTPUT_DIR/accepted_fusions.json" "$SCOPE" "$FOCUS_SYSTEMS" "$selected" "$BASE_FUSIONS" <<'PY'
+python - "$ROOT_OUTPUT_DIR/accepted_fusions.json" "$SCOPE" "$FOCUS_SYSTEMS" "$selected" "$BASE_FUSIONS" "$NEIGHBOR_AUTO_GUARD_SLOTS" "$CANDIDATE_STAGE_LABEL" <<'PY'
 import json
 import pathlib
 import sys
 
-path, scope, focus, selected, base = sys.argv[1:]
+path, scope, focus, selected, base, guard_slots, candidate_stage = sys.argv[1:]
 accepted = [item for item in base.split(",") if item]
 if int(selected) == 0:
     accepted.append("so2-block-gemm")
@@ -74,8 +85,9 @@ pathlib.Path(path).write_text(json.dumps({
     "scope": scope,
     "accepted_fusions": accepted,
     "focus_systems": focus.split(),
-    "candidate_stage": "KF12",
-    "neighbor_capacity_policy": "auto" if scope == "whole-step" else "uniform",
+    "candidate_stage": candidate_stage,
+    "neighbor_capacity_policy": "auto-safe" if scope == "whole-step" else "uniform",
+    "neighbor_auto_guard_slots": int(guard_slots) if scope == "whole-step" else 0,
     "policy": "energy/force errors are telemetry only",
 }, indent=2) + "\n", encoding="utf-8")
 PY

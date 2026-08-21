@@ -34,6 +34,58 @@ Every result records:
 The threshold is configurable with `--neighbor-auto-min-reduction` or the
 runner environment variable `NEIGHBOR_AUTO_MIN_REDUCTION`.
 
+## CAP1-auto-safe
+
+The full 300/800 K matrix found deterministic local-slot overflows in
+H2O60/H2O192 at 800 K even though roughly 15% of the global edge buffer was
+unused.  `auto-safe` preserves the original `auto` implementation for result
+reproducibility and adds one protected slot bucket after margin/rounding.  It
+then reapplies the minimum-reduction gate, so systems whose protected layout
+no longer saves at least 5% fall back to uniform before capture.
+
+Configuration and telemetry:
+
+- `--neighbor-capacity-policy auto-safe`;
+- `--neighbor-auto-guard-slots 1` (or `NEIGHBOR_AUTO_GUARD_SLOTS=1`);
+- `neighbor_capacity_policy_effective=atom-safe|uniform`;
+- unprotected and protected capacity reductions are both recorded;
+- any capacity miss makes `graph_invariants_pass=false` and the performance
+  sample ineligible.
+
+Use `PROBE_STEPS=100`/`WHOLE_PROBE_STEPS=100` for the current 100-step
+acceptance matrix.  The guard is a conservative fixed-shape policy, not a
+mathematical guarantee for an arbitrarily long diffusive trajectory.
+
+KF12 and CAP1-auto-safe can be compiled/captured in one smoke:
+
+```bash
+GPU=0 \
+CHECKPOINT=/path/to/esen_30m_oam.pt \
+STRUCTURE_DIR=/path/to/cif_file \
+OUTPUT_DIR=/path/to/kf12_cap1_safe_smoke \
+bash example/smoke_opt4_kf12_cap1_safe.sh
+```
+
+The isolated CAP1-auto-safe polling ablation holds KF12 fixed on both sides:
+
+```bash
+GPU_LIST="0 1 2 3 4 5 6 7" \
+CHECKPOINT=/path/to/esen_30m_oam.pt \
+STRUCTURE_DIR=/path/to/cif_file \
+ROOT_OUTPUT_DIR=/path/to/cap1_auto_safe_ablation \
+bash example/run_opt4_capacity_auto_safe_8gpu.sh
+```
+
+The combined end-to-end matrix compares Opt4 v2 with KF12+CAP1-auto-safe:
+
+```bash
+GPU_LIST="0 1 2 3 4 5 6 7" \
+CHECKPOINT=/path/to/esen_30m_oam.pt \
+STRUCTURE_DIR=/path/to/cif_file \
+ROOT_OUTPUT_DIR=/path/to/kf12_cap1_safe_formal \
+bash example/run_opt4_kf12_cap1_safe_8gpu.sh
+```
+
 ### Unit tests
 
 ```bash

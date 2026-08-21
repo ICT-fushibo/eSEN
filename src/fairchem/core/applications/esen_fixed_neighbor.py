@@ -143,14 +143,22 @@ def auto_neighbor_capacities_from_probe(
     margin: float = 0.10,
     slot_step: int = 8,
     minimum_reduction: float = 0.05,
+    guard_slots: int = 0,
 ) -> tuple[tuple[int, ...] | None, float]:
-    """Select per-atom slots only when they remove enough padding.
+    """Select guarded per-atom slots only when they remove enough padding.
 
     The decision is made once after the eager probe and before CUDA Graph
     capture.  Returning ``None`` selects the original uniform-capacity path,
     so replay contains no policy branch.  The returned reduction is the
     fractional edge-capacity reduction of the per-atom candidate relative to
     the uniform allocation, regardless of which path is selected.
+
+    ``guard_slots`` promotes every heterogeneous capacity by that many slot
+    buckets, capped at the uniform capacity.  A one-slot guard is the safe
+    CAP1-auto policy: it covers one additional rounded neighbor bucket while
+    automatically falling back to uniform when the protected allocation no
+    longer clears ``minimum_reduction``.  The default remains zero so existing
+    CAP1-auto experiments retain their exact allocation semantics.
     """
 
     if (
@@ -158,6 +166,8 @@ def auto_neighbor_capacities_from_probe(
         or not 0.0 <= minimum_reduction <= 1.0
     ):
         raise ValueError("minimum_reduction must be finite and between 0 and 1")
+    if guard_slots < 0:
+        raise ValueError("guard_slots must be non-negative")
     maxima = torch.as_tensor(
         maximum_neighbors_by_atom, device="cpu", dtype=torch.long
     ).reshape(-1)
@@ -176,6 +186,12 @@ def auto_neighbor_capacities_from_probe(
         margin=margin,
         slot_step=slot_step,
     )
+    if guard_slots:
+        guard = guard_slots * slot_step
+        atom_capacities = tuple(
+            min(uniform_capacity, capacity + guard)
+            for capacity in atom_capacities
+        )
     uniform_edge_capacity = uniform_capacity * int(maxima.numel())
     reduction = (
         uniform_edge_capacity - sum(atom_capacities)
