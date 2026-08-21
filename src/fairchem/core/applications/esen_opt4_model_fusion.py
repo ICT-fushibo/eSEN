@@ -36,6 +36,7 @@ FUSION_KERNEL_VERSION = "opt4-model-fusion-v2"
 SO2_FUSION_KERNEL_VERSION = "opt4-model-fusion-v3-so2"
 SO2_GATE_BRIDGE_KERNEL_VERSION = "opt4-model-fusion-v4-so2-gate"
 WIGNER_SO2_BRIDGE_KERNEL_VERSION = "opt4-model-fusion-v5-wigner-so2"
+SO2_BLOCK_GEMM_VERSION = "opt4-model-fusion-v6-so2-block-gemm"
 SO2_KERNEL_BLOCK = 512
 SUPPORTED_FUSIONS = (
     "gather-wigner",
@@ -48,6 +49,7 @@ SUPPORTED_FUSIONS = (
     "so2-epilogue",
     "so2-gate-bridge",
     "wigner-so2-bridge",
+    "so2-block-gemm",
 )
 
 
@@ -91,6 +93,13 @@ def parse_model_fusions(value: str | Iterable[str]) -> tuple[str, ...]:
     }.issubset(requested_set):
         raise UnsupportedFusionConfigError(
             "wigner-so2-bridge subsumes gather-wigner; request only the bridge"
+        )
+    if (
+        "so2-block-gemm" in requested_set
+        and "so2-epilogue" not in requested_set
+    ):
+        raise UnsupportedFusionConfigError(
+            "so2-block-gemm requires so2-epilogue to be requested explicitly"
         )
     return tuple(name for name in SUPPORTED_FUSIONS if name in requested_set)
 
@@ -1282,6 +1291,449 @@ if triton is not None:
                 ),
                 mask=gate_mask,
             )
+
+    @triton.jit
+    def _so2_block_epilogue_kernel(
+        m0_ptr,
+        m1_ptr,
+        m2_ptr,
+        l_to_m_ptr,
+        out_ptr,
+        gating_ptr,
+        rows: tl.constexpr,
+        output_coefficients: tl.constexpr,
+        output_channels: tl.constexpr,
+        m0_channels: tl.constexpr,
+        m1_coefficients: tl.constexpr,
+        m2_coefficients: tl.constexpr,
+        extra_channels: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Map already-recombined block-GEMM outputs back to l order."""
+        row = tl.program_id(0)
+        tile = tl.program_id(1)
+        offset = tile * block + tl.arange(0, block)
+        main_size = output_coefficients * output_channels
+        main_active = offset < main_size
+        gate_active = offset >= main_size
+        l_coefficient = offset // output_channels
+        channel = offset % output_channels
+        m_coefficient = tl.load(
+            l_to_m_ptr + l_coefficient, mask=main_active, other=0
+        )
+
+        m0_offset = (
+            row * m0_channels
+            + extra_channels
+            + m_coefficient * output_channels
+            + channel
+        )
+        m0_value = tl.load(
+            m0_ptr + m0_offset,
+            mask=main_active & (m_coefficient < 4),
+            other=0.0,
+        )
+
+        m1_local = m_coefficient - 4
+        m1_part = m1_local // m1_coefficients
+        m1_coefficient = m1_local % m1_coefficients
+        m1_half_width = m1_coefficients * output_channels
+        m1_offset = (
+            row * 2 * m1_half_width
+            + m1_part * m1_half_width
+            + m1_coefficient * output_channels
+            + channel
+        )
+        m1_value = tl.load(
+            m1_ptr + m1_offset,
+            mask=main_active
+            & (m_coefficient >= 4)
+            & (m_coefficient < 10),
+            other=0.0,
+        )
+
+        m2_local = m_coefficient - 10
+        m2_part = m2_local // m2_coefficients
+        m2_coefficient = m2_local % m2_coefficients
+        m2_half_width = m2_coefficients * output_channels
+        m2_offset = (
+            row * 2 * m2_half_width
+            + m2_part * m2_half_width
+            + m2_coefficient * output_channels
+            + channel
+        )
+        m2_value = tl.load(
+            m2_ptr + m2_offset,
+            mask=main_active & (m_coefficient >= 10),
+            other=0.0,
+        )
+        value = tl.where(
+            m_coefficient < 4,
+            m0_value,
+            tl.where(m_coefficient < 10, m1_value, m2_value),
+        )
+        tl.store(out_ptr + row * main_size + offset, value, mask=main_active)
+
+        if extra_channels > 0:
+            gate_offset = offset - main_size
+            gate_mask = gate_active & (gate_offset < extra_channels)
+            tl.store(
+                gating_ptr + row * extra_channels + gate_offset,
+                tl.load(
+                    m0_ptr + row * m0_channels + gate_offset,
+                    mask=gate_mask,
+                    other=0.0,
+                ),
+                mask=gate_mask,
+            )
+
+    @triton.jit
+    def _so2_block_epilogue_backward_kernel(
+        grad_out_ptr,
+        grad_gating_ptr,
+        l_to_m_ptr,
+        grad_m0_ptr,
+        grad_m1_ptr,
+        grad_m2_ptr,
+        rows: tl.constexpr,
+        output_coefficients: tl.constexpr,
+        output_channels: tl.constexpr,
+        m0_channels: tl.constexpr,
+        m1_coefficients: tl.constexpr,
+        m2_coefficients: tl.constexpr,
+        extra_channels: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        tile = tl.program_id(1)
+        offset = tile * block + tl.arange(0, block)
+        main_size = output_coefficients * output_channels
+        main_active = offset < main_size
+        gate_active = offset >= main_size
+        l_coefficient = offset // output_channels
+        channel = offset % output_channels
+        m_coefficient = tl.load(
+            l_to_m_ptr + l_coefficient, mask=main_active, other=0
+        )
+        grad = tl.load(
+            grad_out_ptr + row * main_size + offset,
+            mask=main_active,
+            other=0.0,
+        )
+
+        m0_offset = (
+            row * m0_channels
+            + extra_channels
+            + m_coefficient * output_channels
+            + channel
+        )
+        tl.store(
+            grad_m0_ptr + m0_offset,
+            grad,
+            mask=main_active & (m_coefficient < 4),
+        )
+
+        m1_local = m_coefficient - 4
+        m1_part = m1_local // m1_coefficients
+        m1_coefficient = m1_local % m1_coefficients
+        m1_half_width = m1_coefficients * output_channels
+        m1_offset = (
+            row * 2 * m1_half_width
+            + m1_part * m1_half_width
+            + m1_coefficient * output_channels
+            + channel
+        )
+        tl.store(
+            grad_m1_ptr + m1_offset,
+            grad,
+            mask=main_active
+            & (m_coefficient >= 4)
+            & (m_coefficient < 10),
+        )
+
+        m2_local = m_coefficient - 10
+        m2_part = m2_local // m2_coefficients
+        m2_coefficient = m2_local % m2_coefficients
+        m2_half_width = m2_coefficients * output_channels
+        m2_offset = (
+            row * 2 * m2_half_width
+            + m2_part * m2_half_width
+            + m2_coefficient * output_channels
+            + channel
+        )
+        tl.store(
+            grad_m2_ptr + m2_offset,
+            grad,
+            mask=main_active & (m_coefficient >= 10),
+        )
+
+        if extra_channels > 0:
+            gate_offset = offset - main_size
+            gate_mask = gate_active & (gate_offset < extra_channels)
+            tl.store(
+                grad_m0_ptr + row * m0_channels + gate_offset,
+                tl.load(
+                    grad_gating_ptr + row * extra_channels + gate_offset,
+                    mask=gate_mask,
+                    other=0.0,
+                ),
+                mask=gate_mask,
+            )
+
+    @triton.jit
+    def _so2_block_gate_bridge_kernel(
+        m0_ptr,
+        m1_ptr,
+        m2_ptr,
+        m_degree_ptr,
+        out0_ptr,
+        out1_ptr,
+        out2_ptr,
+        rows: tl.constexpr,
+        coefficients: tl.constexpr,
+        channels: tl.constexpr,
+        extra_channels: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Gate canonical block-GEMM results directly into conv2 inputs."""
+        row = tl.program_id(0)
+        tile = tl.program_id(1)
+        offset = tile * block + tl.arange(0, block)
+        active = offset < coefficients * channels
+        coefficient = offset // channels
+        channel = offset % channels
+        degree = tl.load(m_degree_ptr + coefficient, mask=active, other=0)
+
+        m0_value = tl.load(
+            m0_ptr
+            + row * (extra_channels + 4 * channels)
+            + extra_channels
+            + coefficient * channels
+            + channel,
+            mask=active & (coefficient < 4),
+            other=0.0,
+        )
+        m1_value = tl.load(
+            m1_ptr
+            + row * 6 * channels
+            + (coefficient - 4) * channels
+            + channel,
+            mask=active & (coefficient >= 4) & (coefficient < 10),
+            other=0.0,
+        )
+        m2_value = tl.load(
+            m2_ptr
+            + row * 4 * channels
+            + (coefficient - 10) * channels
+            + channel,
+            mask=active & (coefficient >= 10),
+            other=0.0,
+        )
+        value = tl.where(
+            coefficient < 4,
+            m0_value,
+            tl.where(coefficient < 10, m1_value, m2_value),
+        )
+        gate = tl.load(
+            m0_ptr
+            + row * (extra_channels + 4 * channels)
+            + (degree - 1) * channels
+            + channel,
+            mask=active & (degree > 0),
+            other=0.0,
+        )
+        gate_sigmoid = 1.0 / (1.0 + tl.exp(-gate))
+        scalar_sigmoid = 1.0 / (1.0 + tl.exp(-value))
+        activated = tl.where(
+            degree == 0,
+            value * scalar_sigmoid,
+            value * gate_sigmoid,
+        )
+
+        tl.store(
+            out0_ptr + row * 4 * channels + coefficient * channels + channel,
+            activated,
+            mask=active & (coefficient < 4),
+        )
+        tl.store(
+            out1_ptr
+            + row * 6 * channels
+            + (coefficient - 4) * channels
+            + channel,
+            activated,
+            mask=active & (coefficient >= 4) & (coefficient < 10),
+        )
+        tl.store(
+            out2_ptr
+            + row * 4 * channels
+            + (coefficient - 10) * channels
+            + channel,
+            activated,
+            mask=active & (coefficient >= 10),
+        )
+
+    @triton.jit
+    def _so2_block_gate_bridge_backward_kernel(
+        grad_out0_ptr,
+        grad_out1_ptr,
+        grad_out2_ptr,
+        m0_ptr,
+        m1_ptr,
+        m2_ptr,
+        m_degree_ptr,
+        grad_m0_ptr,
+        grad_m1_ptr,
+        grad_m2_ptr,
+        rows: tl.constexpr,
+        channels: tl.constexpr,
+        extra_channels: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        channel = tl.arange(0, block)
+        active = channel < channels
+        gate_grad_1 = tl.zeros((block,), tl.float32)
+        gate_grad_2 = tl.zeros((block,), tl.float32)
+        gate_grad_3 = tl.zeros((block,), tl.float32)
+
+        for coefficient in range(14):
+            degree = tl.load(m_degree_ptr + coefficient)
+            m0_value = tl.load(
+                m0_ptr
+                + row * (extra_channels + 4 * channels)
+                + extra_channels
+                + coefficient * channels
+                + channel,
+                mask=active & (coefficient < 4),
+                other=0.0,
+            )
+            m1_value = tl.load(
+                m1_ptr
+                + row * 6 * channels
+                + (coefficient - 4) * channels
+                + channel,
+                mask=active & (coefficient >= 4) & (coefficient < 10),
+                other=0.0,
+            )
+            m2_value = tl.load(
+                m2_ptr
+                + row * 4 * channels
+                + (coefficient - 10) * channels
+                + channel,
+                mask=active & (coefficient >= 10),
+                other=0.0,
+            )
+            value = tl.where(
+                coefficient < 4,
+                m0_value,
+                tl.where(coefficient < 10, m1_value, m2_value),
+            )
+            grad_out = tl.load(
+                grad_out0_ptr
+                + row * 4 * channels
+                + coefficient * channels
+                + channel,
+                mask=active & (coefficient < 4),
+                other=0.0,
+            )
+            grad_out = tl.where(
+                coefficient < 4,
+                grad_out,
+                tl.where(
+                    coefficient < 10,
+                    tl.load(
+                        grad_out1_ptr
+                        + row * 6 * channels
+                        + (coefficient - 4) * channels
+                        + channel,
+                        mask=active
+                        & (coefficient >= 4)
+                        & (coefficient < 10),
+                        other=0.0,
+                    ),
+                    tl.load(
+                        grad_out2_ptr
+                        + row * 4 * channels
+                        + (coefficient - 10) * channels
+                        + channel,
+                        mask=active & (coefficient >= 10),
+                        other=0.0,
+                    ),
+                ),
+            )
+            gate = tl.load(
+                m0_ptr
+                + row * (extra_channels + 4 * channels)
+                + (degree - 1) * channels
+                + channel,
+                mask=active & (degree > 0),
+                other=0.0,
+            )
+            sigmoid = 1.0 / (1.0 + tl.exp(-gate))
+            scalar_sigmoid = 1.0 / (1.0 + tl.exp(-value))
+            grad_value = tl.where(
+                degree == 0,
+                grad_out
+                * (
+                    scalar_sigmoid
+                    + value * scalar_sigmoid * (1.0 - scalar_sigmoid)
+                ),
+                grad_out * sigmoid,
+            )
+            gate_contribution = (
+                grad_out * value * sigmoid * (1.0 - sigmoid)
+            )
+            gate_grad_1 += tl.where(degree == 1, gate_contribution, 0.0)
+            gate_grad_2 += tl.where(degree == 2, gate_contribution, 0.0)
+            gate_grad_3 += tl.where(degree == 3, gate_contribution, 0.0)
+
+            tl.store(
+                grad_m0_ptr
+                + row * (extra_channels + 4 * channels)
+                + extra_channels
+                + coefficient * channels
+                + channel,
+                grad_value,
+                mask=active & (coefficient < 4),
+            )
+            tl.store(
+                grad_m1_ptr
+                + row * 6 * channels
+                + (coefficient - 4) * channels
+                + channel,
+                grad_value,
+                mask=active & (coefficient >= 4) & (coefficient < 10),
+            )
+            tl.store(
+                grad_m2_ptr
+                + row * 4 * channels
+                + (coefficient - 10) * channels
+                + channel,
+                grad_value,
+                mask=active & (coefficient >= 10),
+            )
+
+        tl.store(
+            grad_m0_ptr + row * (extra_channels + 4 * channels) + channel,
+            gate_grad_1,
+            mask=active,
+        )
+        tl.store(
+            grad_m0_ptr
+            + row * (extra_channels + 4 * channels)
+            + channels
+            + channel,
+            gate_grad_2,
+            mask=active,
+        )
+        tl.store(
+            grad_m0_ptr
+            + row * (extra_channels + 4 * channels)
+            + 2 * channels
+            + channel,
+            gate_grad_3,
+            mask=active,
+        )
 
     @triton.jit
     def _so2_gate_bridge_kernel(
@@ -2768,6 +3220,223 @@ class _SO2Epilogue(torch.autograd.Function):
         return grad_m0, grad_m1, grad_m2, None, None
 
 
+class _SO2BlockEpilogue(torch.autograd.Function):
+    """Epilogue for canonical real/imag outputs from block-diagonal GEMMs."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        m0: Tensor,
+        m1: Tensor,
+        m2: Tensor,
+        l_to_m_index: Tensor,
+        extra_channels: int,
+    ) -> tuple[Tensor, Tensor]:
+        if m0.ndim != 2 or m1.ndim != 2 or m2.ndim != 2:
+            raise UnsupportedFusionConfigError(
+                "SO2 block epilogue received invalid Linear shapes"
+            )
+        if m0.shape[0] != m1.shape[0] or m0.shape[0] != m2.shape[0]:
+            raise UnsupportedFusionConfigError(
+                "SO2 block epilogue outputs must have the same edge count"
+            )
+        if int(extra_channels) < 0:
+            raise UnsupportedFusionConfigError(
+                "SO2 block epilogue extra channel count cannot be negative"
+            )
+        m0 = m0.contiguous()
+        m1 = m1.contiguous()
+        m2 = m2.contiguous()
+        l_to_m_index = l_to_m_index.contiguous()
+        _require_triton_cuda_fp32(m0, m1, m2, l_to_m_index)
+        if not (
+            m0.device == m1.device == m2.device == l_to_m_index.device
+        ):
+            raise UnsupportedFusionConfigError(
+                "SO2 block epilogue tensors must be on the same CUDA device"
+            )
+        if l_to_m_index.dtype != torch.long or l_to_m_index.shape != (14,):
+            raise UnsupportedFusionConfigError(
+                "SO2 block epilogue requires a [14] int64 permutation"
+            )
+        output_channels = m1.shape[1] // 2 // 3
+        if output_channels <= 0 or m1.shape[1] != 2 * 3 * output_channels:
+            raise UnsupportedFusionConfigError(
+                "SO2 block m=1 Linear output width is unsupported"
+            )
+        if m2.shape[1] != 2 * 2 * output_channels:
+            raise UnsupportedFusionConfigError(
+                "SO2 block m=2 Linear output width is unsupported"
+            )
+        if m0.shape[1] != 4 * output_channels + int(extra_channels):
+            raise UnsupportedFusionConfigError(
+                "SO2 block m=0 Linear output width is unsupported"
+            )
+        out = m0.new_empty((m0.shape[0], 14, output_channels))
+        gating = m0.new_empty((m0.shape[0], int(extra_channels)))
+        total = 14 * output_channels + int(extra_channels)
+        if m0.shape[0] > 0:
+            _so2_block_epilogue_kernel[
+                (m0.shape[0], triton.cdiv(total, SO2_KERNEL_BLOCK))
+            ](
+                m0,
+                m1,
+                m2,
+                l_to_m_index,
+                out,
+                gating,
+                rows=m0.shape[0],
+                output_coefficients=14,
+                output_channels=output_channels,
+                m0_channels=m0.shape[1],
+                m1_coefficients=3,
+                m2_coefficients=2,
+                extra_channels=int(extra_channels),
+                block=SO2_KERNEL_BLOCK,
+                num_warps=4,
+            )
+        ctx.save_for_backward(l_to_m_index)
+        ctx.output_channels = int(output_channels)
+        ctx.m0_channels = int(m0.shape[1])
+        ctx.extra_channels = int(extra_channels)
+        return out, gating
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor, grad_gating: Tensor):
+        (l_to_m_index,) = ctx.saved_tensors
+        grad_out = grad_out.contiguous()
+        if grad_gating is None:
+            grad_gating = grad_out.new_zeros(
+                (grad_out.shape[0], ctx.extra_channels)
+            )
+        else:
+            grad_gating = grad_gating.contiguous()
+        output_channels = ctx.output_channels
+        grad_m0 = grad_out.new_empty((grad_out.shape[0], ctx.m0_channels))
+        grad_m1 = grad_out.new_empty(
+            (grad_out.shape[0], 2 * 3 * output_channels)
+        )
+        grad_m2 = grad_out.new_empty(
+            (grad_out.shape[0], 2 * 2 * output_channels)
+        )
+        total = 14 * output_channels + ctx.extra_channels
+        if grad_out.shape[0] > 0:
+            _so2_block_epilogue_backward_kernel[
+                (grad_out.shape[0], triton.cdiv(total, SO2_KERNEL_BLOCK))
+            ](
+                grad_out,
+                grad_gating,
+                l_to_m_index,
+                grad_m0,
+                grad_m1,
+                grad_m2,
+                rows=grad_out.shape[0],
+                output_coefficients=14,
+                output_channels=output_channels,
+                m0_channels=ctx.m0_channels,
+                m1_coefficients=3,
+                m2_coefficients=2,
+                extra_channels=ctx.extra_channels,
+                block=SO2_KERNEL_BLOCK,
+                num_warps=4,
+            )
+        return grad_m0, grad_m1, grad_m2, None, None
+
+
+class _SO2BlockGateBridge(torch.autograd.Function):
+    """KF10 bridge specialized for already-recombined block-GEMM outputs."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        m0: Tensor,
+        m1: Tensor,
+        m2: Tensor,
+        m_degree_index: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        expected = (
+            (m0.shape[0], 896),
+            (m0.shape[0], 768),
+            (m0.shape[0], 512),
+        )
+        if (
+            tuple(m0.shape) != expected[0]
+            or tuple(m1.shape) != expected[1]
+            or tuple(m2.shape) != expected[2]
+        ):
+            raise UnsupportedFusionConfigError(
+                "SO2 block gate bridge requires m0=[E,896], m1=[E,768], "
+                f"m2=[E,512], got {tuple(m0.shape)}, {tuple(m1.shape)}, "
+                f"{tuple(m2.shape)}"
+            )
+        m0 = m0.contiguous()
+        m1 = m1.contiguous()
+        m2 = m2.contiguous()
+        m_degree_index = m_degree_index.contiguous()
+        _require_triton_cuda_fp32(m0, m1, m2, m_degree_index)
+        if not (m0.device == m1.device == m2.device == m_degree_index.device):
+            raise UnsupportedFusionConfigError(
+                "SO2 block gate bridge tensors must be on the same CUDA device"
+            )
+        if m_degree_index.dtype != torch.long or m_degree_index.shape != (14,):
+            raise UnsupportedFusionConfigError(
+                "SO2 block gate bridge requires a [14] int64 degree mapping"
+            )
+        out0 = m0.new_empty((m0.shape[0], 512))
+        out1 = m0.new_empty((m0.shape[0], 2, 384))
+        out2 = m0.new_empty((m0.shape[0], 2, 256))
+        if m0.shape[0] > 0:
+            total = 14 * 128
+            _so2_block_gate_bridge_kernel[
+                (m0.shape[0], triton.cdiv(total, SO2_KERNEL_BLOCK))
+            ](
+                m0,
+                m1,
+                m2,
+                m_degree_index,
+                out0,
+                out1,
+                out2,
+                rows=m0.shape[0],
+                coefficients=14,
+                channels=128,
+                extra_channels=384,
+                block=SO2_KERNEL_BLOCK,
+                num_warps=4,
+            )
+        ctx.save_for_backward(m0, m1, m2, m_degree_index)
+        return out0, out1, out2
+
+    @staticmethod
+    def backward(ctx, grad_out0: Tensor, grad_out1: Tensor, grad_out2: Tensor):
+        m0, m1, m2, m_degree_index = ctx.saved_tensors
+        grad_out0 = grad_out0.contiguous()
+        grad_out1 = grad_out1.contiguous()
+        grad_out2 = grad_out2.contiguous()
+        grad_m0 = torch.empty_like(m0)
+        grad_m1 = torch.empty_like(m1)
+        grad_m2 = torch.empty_like(m2)
+        if m0.shape[0] > 0:
+            _so2_block_gate_bridge_backward_kernel[(m0.shape[0],)](
+                grad_out0,
+                grad_out1,
+                grad_out2,
+                m0,
+                m1,
+                m2,
+                m_degree_index,
+                grad_m0,
+                grad_m1,
+                grad_m2,
+                rows=m0.shape[0],
+                channels=128,
+                extra_channels=384,
+                block=128,
+                num_warps=4,
+            )
+        return grad_m0, grad_m1, grad_m2, None
+
+
 class _SO2GateBridge(torch.autograd.Function):
     """Bridge conv1 Linear outputs directly to conv2 Linear inputs.
 
@@ -3091,6 +3760,43 @@ def _require_triton_cuda_fp32(*tensors: Tensor) -> None:
             )
 
 
+class SO2BlockLinear(nn.Module):
+    """Frozen SO2 m>0 Linear expressed as one block-diagonal cuBLAS GEMM."""
+
+    def __init__(self, original: nn.Linear) -> None:
+        super().__init__()
+        if not isinstance(original, nn.Linear) or original.bias is not None:
+            raise UnsupportedFusionConfigError(
+                "SO2 block GEMM requires a bias-free nn.Linear"
+            )
+        if original.out_features % 2:
+            raise UnsupportedFusionConfigError(
+                "SO2 block GEMM requires an even output width"
+            )
+        output_half = original.out_features // 2
+        w1, w2 = original.weight.detach().split(output_half, dim=0)
+        block_weight = torch.cat(
+            (
+                torch.cat((w1, -w2), dim=1),
+                torch.cat((w2, w1), dim=1),
+            ),
+            dim=0,
+        ).contiguous()
+        self.in_features = int(original.in_features)
+        self.out_features_half = int(output_half)
+        self.register_buffer("block_weight", block_weight, persistent=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.ndim != 3 or x.shape[1:] != (2, self.in_features):
+            raise UnsupportedFusionConfigError(
+                "SO2 block GEMM expected x=[E,2,"
+                f"{self.in_features}], got {tuple(x.shape)}"
+            )
+        return torch.nn.functional.linear(
+            x.reshape(x.shape[0], 2 * self.in_features), self.block_weight
+        )
+
+
 class FusedSO2Convolution(nn.Module):
     """SO2 convolution with fused m-layout and epilogue operations.
 
@@ -3099,7 +3805,9 @@ class FusedSO2Convolution(nn.Module):
     recombination, and inverse permutation are handled by Triton.
     """
 
-    def __init__(self, original: SO2_Convolution) -> None:
+    def __init__(
+        self, original: SO2_Convolution, *, block_gemm: bool = False
+    ) -> None:
         super().__init__()
         if not isinstance(original, SO2_Convolution):
             raise UnsupportedFusionConfigError("Expected an SO2_Convolution")
@@ -3157,6 +3865,12 @@ class FusedSO2Convolution(nn.Module):
         self.extra_m0_output_channels = int(original.extra_m0_output_channels or 0)
         self.fc_m0 = original.fc_m0
         self.so2_m_conv = original.so2_m_conv
+        self.block_gemm = bool(block_gemm)
+        self.so2_block_linear = nn.ModuleList()
+        if self.block_gemm:
+            self.so2_block_linear.extend(
+                SO2BlockLinear(module.fc) for module in self.so2_m_conv
+            )
         self.rad_func = original.rad_func
         self.register_buffer("to_m_index", to_m_index, persistent=False)
         self.register_buffer("l_to_m_index", l_to_m_index, persistent=False)
@@ -3208,6 +3922,12 @@ class FusedSO2Convolution(nn.Module):
     def linear_from_prepared(
         self, x0: Tensor, x1: Tensor, x2: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
+        if self.block_gemm:
+            return (
+                self.fc_m0(x0),
+                self.so2_block_linear[0](x1),
+                self.so2_block_linear[1](x2),
+            )
         return (
             self.fc_m0(x0),
             self.so2_m_conv[0].fc(x1),
@@ -3220,8 +3940,13 @@ class FusedSO2Convolution(nn.Module):
         return self.linear_from_prepared(*self.prepare(x, x_edge))
 
     def epilogue(self, m0: Tensor, m1: Tensor, m2: Tensor):
-        out, gating = _SO2Epilogue.apply(
-            m0, m1, m2, self.l_to_m_index, self.extra_m0_output_channels
+        epilogue = _SO2BlockEpilogue if self.block_gemm else _SO2Epilogue
+        out, gating = epilogue.apply(
+            m0,
+            m1,
+            m2,
+            self.l_to_m_index,
+            self.extra_m0_output_channels,
         )
         if self.extra_m0_output_channels:
             return out, gating
@@ -3259,6 +3984,11 @@ class FusedSO2GateBridge(nn.Module):
             raise UnsupportedFusionConfigError(
                 "SO2 gate bridge requires matching conv1/conv2 permutations"
             )
+        if conv1.block_gemm != conv2.block_gemm:
+            raise UnsupportedFusionConfigError(
+                "SO2 gate bridge requires matching conv1/conv2 GEMM layouts"
+            )
+        self.block_gemm = conv1.block_gemm
         l_degree = torch.tensor(
             [0, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3],
             dtype=torch.long,
@@ -3279,7 +4009,8 @@ class FusedSO2GateBridge(nn.Module):
     def forward(
         self, m0: Tensor, m1: Tensor, m2: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
-        return _SO2GateBridge.apply(
+        bridge = _SO2BlockGateBridge if self.block_gemm else _SO2GateBridge
+        return bridge.apply(
             m0.contiguous(),
             m1.contiguous(),
             m2.contiguous(),
@@ -3648,6 +4379,9 @@ class FusionMetadata:
     wigner_so2_bridge_forward_kernel_count: int
     wigner_so2_bridge_backward_kernel_count: int
     wigner_so2_bridge_kernel_version: str
+    so2_block_gemm_convolution_replacements: int
+    so2_block_gemm_linear_replacements: int
+    so2_block_gemm_version: str
     configure_wall_time_s: float
     torch_version: str
     triton_version: str
@@ -3691,6 +4425,13 @@ class FusionMetadata:
             "model_fusion_wigner_so2_bridge_kernel_version": (
                 self.wigner_so2_bridge_kernel_version
             ),
+            "model_fusion_so2_block_gemm_convolution_replacements": (
+                self.so2_block_gemm_convolution_replacements
+            ),
+            "model_fusion_so2_block_gemm_linear_replacements": (
+                self.so2_block_gemm_linear_replacements
+            ),
+            "model_fusion_so2_block_gemm_version": self.so2_block_gemm_version,
             "model_fusion_configure_wall_time_s": self.configure_wall_time_s,
             "model_fusion_torch_version": self.torch_version,
             "model_fusion_triton_version": self.triton_version,
@@ -3759,6 +4500,7 @@ def configure_esen_30m_model_fusions(
     so2 = "so2-epilogue" in selected
     so2_gate_bridge = "so2-gate-bridge" in selected
     wigner_so2_bridge = "wigner-so2-bridge" in selected
+    so2_block_gemm = "so2-block-gemm" in selected
     edgewise_count = 0
     edge_embedding_count = 0
     rmsnorm_count = 0
@@ -3769,6 +4511,7 @@ def configure_esen_30m_model_fusions(
     so2_count = 0
     so2_gate_bridge_count = 0
     wigner_so2_bridge_count = 0
+    so2_block_gemm_count = 0
 
     # radial-mlp first: the FusedEdgewise / FusedEdgeDegreeEmbedding wrappers
     # installed below hold references to these rad_func objects.
@@ -3806,9 +4549,15 @@ def configure_esen_30m_model_fusions(
                 raise UnsupportedFusionConfigError("Unexpected SO2 convolution 1 implementation")
             if not isinstance(block.edge_wise.so2_conv_2, SO2_Convolution):
                 raise UnsupportedFusionConfigError("Unexpected SO2 convolution 2 implementation")
-            block.edge_wise.so2_conv_1 = FusedSO2Convolution(block.edge_wise.so2_conv_1)
-            block.edge_wise.so2_conv_2 = FusedSO2Convolution(block.edge_wise.so2_conv_2)
+            block.edge_wise.so2_conv_1 = FusedSO2Convolution(
+                block.edge_wise.so2_conv_1, block_gemm=so2_block_gemm
+            )
+            block.edge_wise.so2_conv_2 = FusedSO2Convolution(
+                block.edge_wise.so2_conv_2, block_gemm=so2_block_gemm
+            )
             so2_count += 2
+            if so2_block_gemm:
+                so2_block_gemm_count += 2
 
     if gather or reverse or so2:
         for block in backbone.blocks:
@@ -3836,6 +4585,11 @@ def configure_esen_30m_model_fusions(
         raise UnsupportedFusionConfigError(
             "Wigner/SO2 bridge must replace all 10 Edgewise blocks, replaced "
             f"{wigner_so2_bridge_count}"
+        )
+    if so2_block_gemm and so2_block_gemm_count != 20:
+        raise UnsupportedFusionConfigError(
+            "SO2 block GEMM must replace all 20 Edgewise convolutions, replaced "
+            f"{so2_block_gemm_count}"
         )
 
     if "rmsnorm" in selected:
@@ -3911,6 +4665,12 @@ def configure_esen_30m_model_fusions(
         wigner_so2_bridge_backward_kernel_count=3 * wigner_so2_bridge_count,
         wigner_so2_bridge_kernel_version=(
             WIGNER_SO2_BRIDGE_KERNEL_VERSION if wigner_so2_bridge else ""
+        ),
+        so2_block_gemm_convolution_replacements=so2_block_gemm_count,
+        # Each convolution has one m=1 and one m=2 complex GEMM.
+        so2_block_gemm_linear_replacements=2 * so2_block_gemm_count,
+        so2_block_gemm_version=(
+            SO2_BLOCK_GEMM_VERSION if so2_block_gemm else ""
         ),
         configure_wall_time_s=time.perf_counter() - start,
         torch_version=torch.__version__,

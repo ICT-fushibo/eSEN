@@ -13,7 +13,10 @@ from fairchem.core.applications.esen_opt4_model_fusion import (
     FusedSO2Convolution,
     FusedSO2GateBridge,
     FusedSpectralAtomwise,
+    SO2BlockLinear,
     UnsupportedFusionConfigError,
+    _SO2BlockEpilogue,
+    _SO2BlockGateBridge,
     _SO2Epilogue,
     _SO2GateBridge,
     _SO2Prepare,
@@ -112,6 +115,45 @@ def _reference_so2_gate_bridge(m0, m1, m2, mapping):
     )
 
 
+def _reference_so2_block_epilogue(m0, m1, m2, mapping, extra_channels):
+    channels = m1.shape[1] // 6
+    gating = m0[:, :extra_channels]
+    m_order = torch.cat(
+        (
+            m0[:, extra_channels:].reshape(-1, 4, channels),
+            m1.reshape(-1, 6, channels),
+            m2.reshape(-1, 4, channels),
+        ),
+        dim=1,
+    )
+    return torch.einsum("nac,ab->nbc", m_order, mapping.to_m), gating
+
+
+def _reference_so2_block_gate_bridge(m0, m1, m2, mapping):
+    l_order, gating = _reference_so2_block_epilogue(
+        m0, m1, m2, mapping, 384
+    )
+    gate = torch.sigmoid(gating).reshape(-1, 3, 128)
+    expand = torch.tensor(
+        [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2],
+        device=m0.device,
+        dtype=torch.long,
+    )
+    activated = torch.cat(
+        (
+            torch.nn.functional.silu(l_order[:, :1]),
+            l_order[:, 1:] * gate.index_select(1, expand),
+        ),
+        dim=1,
+    )
+    m_order = torch.einsum("nac,ba->nbc", activated, mapping.to_m)
+    return (
+        m_order[:, :4].reshape(-1, 512),
+        m_order[:, 4:10].reshape(-1, 2, 384),
+        m_order[:, 10:14].reshape(-1, 2, 256),
+    )
+
+
 def _m_degree_index(mapping):
     degree_l = torch.tensor(
         [0, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3],
@@ -163,6 +205,37 @@ def test_parse_model_fusions_is_ordered_and_strict():
         parse_model_fusions(
             "gather-wigner,so2-epilogue,so2-gate-bridge,wigner-so2-bridge"
         )
+    assert parse_model_fusions(
+        "so2-block-gemm,so2-gate-bridge,so2-epilogue"
+    ) == (
+        "so2-epilogue",
+        "so2-gate-bridge",
+        "so2-block-gemm",
+    )
+    with pytest.raises(UnsupportedFusionConfigError, match="requires so2-epilogue"):
+        parse_model_fusions("so2-block-gemm")
+
+
+def test_so2_block_linear_forward_and_input_gradient_match_reference():
+    torch.manual_seed(42)
+    linear = torch.nn.Linear(7, 10, bias=False)
+    block = SO2BlockLinear(linear)
+    x_ref = torch.randn(5, 2, 7, requires_grad=True)
+    x_actual = x_ref.detach().clone().requires_grad_(True)
+    raw = linear(x_ref)
+    w1_real = raw[:, 0, :5]
+    w2_real = raw[:, 0, 5:]
+    w1_imag = raw[:, 1, :5]
+    w2_imag = raw[:, 1, 5:]
+    expected = torch.cat(
+        (w1_real - w2_imag, w2_real + w1_imag), dim=1
+    )
+    actual = block(x_actual)
+    gradient = torch.randn_like(expected)
+    expected.backward(gradient)
+    actual.backward(gradient)
+    torch.testing.assert_close(actual, expected, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(x_actual.grad, x_ref.grad, rtol=RTOL, atol=ATOL)
 
 
 def test_so2_epilogue_rejects_non_permutation_mapping():
@@ -250,6 +323,81 @@ def test_so2_epilogue_forward_and_gradients_match_torch():
     for actual_input, expected_input in zip(actual_inputs, reference_inputs):
         torch.testing.assert_close(
             actual_input.grad, expected_input.grad, rtol=RTOL, atol=ATOL
+        )
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_block_epilogue_forward_and_gradients_match_torch():
+    torch.manual_seed(42)
+    mapping = CoefficientMapping(3, 2).cuda()
+    _, l_to_m = _so2_indices(mapping)
+    values = (
+        torch.randn(4, 896, device="cuda"),
+        torch.randn(4, 768, device="cuda"),
+        torch.randn(4, 512, device="cuda"),
+    )
+    reference_inputs = [
+        value.detach().clone().requires_grad_(True) for value in values
+    ]
+    actual_inputs = [
+        value.detach().clone().requires_grad_(True) for value in values
+    ]
+    gradients = (
+        torch.randn(4, 14, 128, device="cuda"),
+        torch.randn(4, 384, device="cuda"),
+    )
+    expected = _reference_so2_block_epilogue(
+        *reference_inputs, mapping, 384
+    )
+    torch.autograd.backward(expected, gradients)
+    actual = _SO2BlockEpilogue.apply(*actual_inputs, l_to_m, 384)
+    torch.autograd.backward(actual, gradients)
+    for actual_part, expected_part in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_part, expected_part, rtol=RTOL, atol=ATOL
+        )
+    for actual_input, reference_input in zip(actual_inputs, reference_inputs):
+        torch.testing.assert_close(
+            actual_input.grad, reference_input.grad, rtol=RTOL, atol=ATOL
+        )
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_block_gate_bridge_forward_and_gradients_match_torch():
+    torch.manual_seed(42)
+    mapping = CoefficientMapping(3, 2).cuda()
+    values = (
+        torch.randn(5, 896, device="cuda"),
+        torch.randn(5, 768, device="cuda"),
+        torch.randn(5, 512, device="cuda"),
+    )
+    values[0][-1].zero_()
+    values[1][-1].zero_()
+    values[2][-1].zero_()
+    reference_inputs = [
+        value.detach().clone().requires_grad_(True) for value in values
+    ]
+    actual_inputs = [
+        value.detach().clone().requires_grad_(True) for value in values
+    ]
+    gradients = (
+        torch.randn(5, 512, device="cuda"),
+        torch.randn(5, 2, 384, device="cuda"),
+        torch.randn(5, 2, 256, device="cuda"),
+    )
+    expected = _reference_so2_block_gate_bridge(*reference_inputs, mapping)
+    torch.autograd.backward(expected, gradients)
+    actual = _SO2BlockGateBridge.apply(
+        *actual_inputs, _m_degree_index(mapping)
+    )
+    torch.autograd.backward(actual, gradients)
+    for actual_part, expected_part in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_part, expected_part, rtol=RTOL, atol=ATOL
+        )
+    for actual_input, reference_input in zip(actual_inputs, reference_inputs):
+        torch.testing.assert_close(
+            actual_input.grad, reference_input.grad, rtol=RTOL, atol=ATOL
         )
 
 
@@ -571,6 +719,103 @@ def test_so2_epilogue_external_radial_forward_and_gradients_match_torch():
     torch.testing.assert_close(actual_gate, expected_gate, rtol=RTOL, atol=ATOL)
     torch.testing.assert_close(x_fused.grad, x_ref.grad, rtol=RTOL, atol=ATOL)
     torch.testing.assert_close(edge_fused.grad, edge_ref.grad, rtol=RTOL, atol=ATOL)
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_block_gemm_external_radial_forward_and_gradients_match_torch():
+    torch.manual_seed(42)
+    mapping = CoefficientMapping(3, 2).cuda()
+    reference = SO2_Convolution(
+        256,
+        128,
+        3,
+        2,
+        mapping,
+        internal_weights=False,
+        edge_channels_list=[32, 64],
+        extra_m0_output_channels=384,
+    ).cuda().eval()
+    fused = FusedSO2Convolution(
+        copy.deepcopy(reference), block_gemm=True
+    ).cuda().eval()
+    reference.requires_grad_(False)
+    fused.requires_grad_(False)
+    x_ref = torch.randn(11, 14, 256, device="cuda", requires_grad=True)
+    edge_ref = torch.randn(11, 32, device="cuda", requires_grad=True)
+    x_fused = x_ref.detach().clone().requires_grad_(True)
+    edge_fused = edge_ref.detach().clone().requires_grad_(True)
+    grad_out = torch.randn(11, 14, 128, device="cuda")
+    grad_gate = torch.randn(11, 384, device="cuda")
+
+    expected = reference(x_ref, edge_ref)
+    torch.autograd.backward(expected, (grad_out, grad_gate))
+    actual = fused(x_fused, edge_fused)
+    torch.autograd.backward(actual, (grad_out, grad_gate))
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual[1], expected[1], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(x_fused.grad, x_ref.grad, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(
+        edge_fused.grad, edge_ref.grad, rtol=RTOL, atol=ATOL
+    )
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_block_gemm_kf10_pair_is_cuda_graph_capture_safe():
+    torch.manual_seed(42)
+    mapping = CoefficientMapping(3, 2).cuda()
+    conv1 = FusedSO2Convolution(
+        SO2_Convolution(
+            256,
+            128,
+            3,
+            2,
+            mapping,
+            internal_weights=False,
+            edge_channels_list=[32, 64],
+            extra_m0_output_channels=384,
+        ).cuda(),
+        block_gemm=True,
+    ).eval()
+    conv2 = FusedSO2Convolution(
+        SO2_Convolution(
+            128, 128, 3, 2, mapping, internal_weights=True
+        ).cuda(),
+        block_gemm=True,
+    ).eval()
+    conv1.requires_grad_(False)
+    conv2.requires_grad_(False)
+    bridge = FusedSO2GateBridge(conv1, conv2)
+    x = torch.randn(18, 14, 256, device="cuda", requires_grad=True)
+    x_edge = torch.randn(18, 32, device="cuda", requires_grad=True)
+    inputs = (x, x_edge)
+
+    def forward():
+        m0, m1, m2 = conv1.prepare_and_linear(x, x_edge)
+        prepared = bridge(m0, m1, m2)
+        return conv2.epilogue(*conv2.linear_from_prepared(*prepared))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            output = forward()
+            torch.autograd.grad(output.sum(), inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = forward()
+        gradients = torch.autograd.grad(output.sum(), inputs)
+    addresses = (output.data_ptr(),) + tuple(
+        gradient.data_ptr() for gradient in gradients
+    )
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert addresses == (output.data_ptr(),) + tuple(
+        gradient.data_ptr() for gradient in gradients
+    )
 
 
 @pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
