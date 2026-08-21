@@ -139,6 +139,7 @@ def test_selector_supports_model_only_scope(tmp_path, monkeypatch):
             (result_dir / f"{repeat}_{index}.json").write_text(
                 json.dumps(record), encoding="utf-8"
             )
+    _write_status_tsv(tmp_path, "model-only", "KF2", "success")
     output = tmp_path / "selection.json"
     monkeypatch.setattr(
         module.sys,
