@@ -19,6 +19,15 @@ OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/example/md_out/$RUN_ID"}
 NSYS=${NSYS:-/usr/local/cuda/bin/nsys}
 PYTHON=${PYTHON:-python}
 RESUME=${RESUME:-1}
+PROFILE_LABEL=${PROFILE_LABEL:-opt4_v1}
+MODEL_BASE_STAGE=${MODEL_BASE_STAGE:-OPT2}
+MODEL_BASE_FUSIONS=${MODEL_BASE_FUSIONS:-}
+MODEL_CANDIDATE_STAGE=${MODEL_CANDIDATE_STAGE:-OPT4V1}
+MODEL_CANDIDATE_FUSIONS=${MODEL_CANDIDATE_FUSIONS:-so2-epilogue}
+WHOLE_BASE_STAGE=${WHOLE_BASE_STAGE:-OPT3}
+WHOLE_BASE_FUSIONS=${WHOLE_BASE_FUSIONS:-}
+WHOLE_CANDIDATE_STAGE=${WHOLE_CANDIDATE_STAGE:-OPT4V1}
+WHOLE_CANDIDATE_FUSIONS=${WHOLE_CANDIDATE_FUSIONS:-rmsnorm,so2-epilogue}
 
 if [[ ! -x "$NSYS" ]]; then
     echo "Nsight Systems is not executable: $NSYS" >&2
@@ -64,7 +73,7 @@ record_status() {
 
 run_one() {
     local scope=$1 variant=$2 system=$3 mode=$4
-    local stage backend script scope_label run_name prefix log_path
+    local stage backend script scope_label run_name prefix log_path fusion_value
     local -a target_args fusion_args
 
     if [[ ! -f "$STRUCTURE_DIR/$system.cif" ]]; then
@@ -77,15 +86,20 @@ run_one() {
         script="$REPO_ROOT/example/benchmark_md_opt4.py"
         scope_label=whole_step
         if [[ "$variant" == "base" ]]; then
-            stage=OPT3
-            backend=whole-step-cg
+            stage=$WHOLE_BASE_STAGE
+            fusion_value=$WHOLE_BASE_FUSIONS
         else
-            stage=OPT4V1
+            stage=$WHOLE_CANDIDATE_STAGE
+            fusion_value=$WHOLE_CANDIDATE_FUSIONS
+        fi
+        if [[ -n "$fusion_value" ]]; then
             backend=whole-step-cg-opt4
             fusion_args=(
-                --model-fusions rmsnorm,so2-epilogue
-                --fusion-stage OPT4V1
+                --model-fusions "$fusion_value"
+                --fusion-stage "$stage"
             )
+        else
+            backend=whole-step-cg
         fi
         target_args=(
             --backend "$backend"
@@ -117,15 +131,20 @@ run_one() {
         script="$REPO_ROOT/example/benchmark_md_gpu.py"
         scope_label=model_only
         if [[ "$variant" == "base" ]]; then
-            stage=OPT2
-            backend=model-cg
+            stage=$MODEL_BASE_STAGE
+            fusion_value=$MODEL_BASE_FUSIONS
         else
-            stage=OPT4V1
+            stage=$MODEL_CANDIDATE_STAGE
+            fusion_value=$MODEL_CANDIDATE_FUSIONS
+        fi
+        if [[ -n "$fusion_value" ]]; then
             backend=model-cg-opt4
             fusion_args=(
-                --model-fusions so2-epilogue
-                --fusion-stage OPT4V1
+                --model-fusions "$fusion_value"
+                --fusion-stage "$stage"
             )
+        else
+            backend=model-cg
         fi
         target_args=(
             --backend "$backend"
@@ -230,6 +249,15 @@ run_one() {
     echo "systems=$SYSTEMS"
     echo "temperature=$TEMPERATURE"
     echo "trace_steps=$TRACE_STEPS"
+    echo "profile_label=$PROFILE_LABEL"
+    echo "model_base_stage=$MODEL_BASE_STAGE"
+    echo "model_base_fusions=$MODEL_BASE_FUSIONS"
+    echo "model_candidate_stage=$MODEL_CANDIDATE_STAGE"
+    echo "model_candidate_fusions=$MODEL_CANDIDATE_FUSIONS"
+    echo "whole_base_stage=$WHOLE_BASE_STAGE"
+    echo "whole_base_fusions=$WHOLE_BASE_FUSIONS"
+    echo "whole_candidate_stage=$WHOLE_CANDIDATE_STAGE"
+    echo "whole_candidate_fusions=$WHOLE_CANDIDATE_FUSIONS"
     echo "checkpoint=$CHECKPOINT"
     echo "structure_dir=$STRUCTURE_DIR"
     "$NSYS" --version | tr '\n' ' '
@@ -249,5 +277,5 @@ for scope in $SCOPES; do
     done
 done
 
-echo "Opt4 v1 NSYS profiling complete: $OUTPUT_DIR"
+echo "$PROFILE_LABEL NSYS profiling complete: $OUTPUT_DIR"
 echo "Status: $STATUS_FILE"

@@ -17,10 +17,12 @@ from fairchem.core.applications.esen_opt4_model_fusion import (
     _SO2Epilogue,
     _SO2GateBridge,
     _SO2Prepare,
+    _WignerSO2Prepare,
     gather_cat_wigner,
     model_fusion_available,
     parse_model_fusions,
     reverse_envelope_scatter,
+    wigner_so2_prepare,
     _energy_head_candidates,
 )
 from fairchem.core.models.esen.esen_block import SpectralAtomwise
@@ -148,6 +150,19 @@ def test_parse_model_fusions_is_ordered_and_strict():
     )
     with pytest.raises(UnsupportedFusionConfigError, match="requires so2-epilogue"):
         parse_model_fusions("so2-gate-bridge")
+    assert parse_model_fusions(
+        "wigner-so2-bridge,so2-gate-bridge,so2-epilogue"
+    ) == (
+        "so2-epilogue",
+        "so2-gate-bridge",
+        "wigner-so2-bridge",
+    )
+    with pytest.raises(UnsupportedFusionConfigError, match="requires so2-epilogue"):
+        parse_model_fusions("wigner-so2-bridge")
+    with pytest.raises(UnsupportedFusionConfigError, match="subsumes gather-wigner"):
+        parse_model_fusions(
+            "gather-wigner,so2-epilogue,so2-gate-bridge,wigner-so2-bridge"
+        )
 
 
 def test_so2_epilogue_rejects_non_permutation_mapping():
@@ -236,6 +251,150 @@ def test_so2_epilogue_forward_and_gradients_match_torch():
         torch.testing.assert_close(
             actual_input.grad, expected_input.grad, rtol=RTOL, atol=ATOL
         )
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_wigner_so2_prepare_forward_and_gradients_match_torch():
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    mapping = CoefficientMapping(3, 2).to(device)
+    to_m, _ = _so2_indices(mapping)
+    nodes, edges = 6, 7
+    edge_index = torch.tensor(
+        [[0, 0, 1, 2, 2, 5, 5], [1, 1, 3, 3, 4, 0, 0]],
+        device=device,
+        dtype=torch.long,
+    )
+    out_mask = torch.tensor(
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14],
+        device=device,
+        dtype=torch.long,
+    )
+    x = torch.randn(nodes, 16, 128, device=device)
+    wigner = torch.randn(edges, 16, 16, device=device)
+    radial = torch.randn(edges, 2304, device=device)
+    reference_inputs = [
+        value.detach().clone().requires_grad_(True)
+        for value in (x, wigner, radial)
+    ]
+    x_storage = torch.empty(nodes, 128, 17, device=device)
+    x_storage[:, :, :16].copy_(x.transpose(1, 2))
+    x_actual = x_storage[:, :, :16].transpose(1, 2).detach().requires_grad_(True)
+    w_actual = (
+        wigner.transpose(1, 2).contiguous().transpose(1, 2)
+        .detach()
+        .requires_grad_(True)
+    )
+    radial_storage = torch.empty(edges, 2305, device=device)
+    radial_storage[:, :2304].copy_(radial)
+    radial_actual = radial_storage[:, :2304].detach().requires_grad_(True)
+    actual_inputs = [x_actual, w_actual, radial_actual]
+    assert not all(value.is_contiguous() for value in actual_inputs)
+
+    gathered = torch.cat(
+        (
+            reference_inputs[0][edge_index[0]],
+            reference_inputs[0][edge_index[1]],
+        ),
+        dim=2,
+    )
+    rotated = torch.bmm(reference_inputs[1][:, out_mask, :], gathered)
+    expected = _reference_so2_prepare(
+        rotated, reference_inputs[2], mapping
+    )
+    gradients = (
+        torch.randn(edges, 1024, device=device),
+        torch.randn(edges, 2, 768, device=device),
+        torch.randn(edges, 2, 512, device=device),
+    )
+    torch.autograd.backward(expected, gradients)
+    actual = wigner_so2_prepare(
+        x_actual,
+        edge_index,
+        w_actual,
+        out_mask,
+        radial_actual,
+        to_m,
+    )
+    torch.autograd.backward(actual, gradients)
+
+    for actual_part, expected_part in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_part, expected_part, rtol=RTOL, atol=ATOL
+        )
+    for actual_input, expected_input in zip(actual_inputs, reference_inputs):
+        torch.testing.assert_close(
+            actual_input.grad, expected_input.grad, rtol=RTOL, atol=ATOL
+        )
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_wigner_so2_prepare_accepts_empty_edges():
+    mapping = CoefficientMapping(3, 2).cuda()
+    to_m, _ = _so2_indices(mapping)
+    x = torch.randn(3, 16, 128, device="cuda", requires_grad=True)
+    edge_index = torch.empty(2, 0, device="cuda", dtype=torch.long)
+    wigner = torch.empty(0, 16, 16, device="cuda", requires_grad=True)
+    radial = torch.empty(0, 2304, device="cuda", requires_grad=True)
+    out_mask = torch.tensor(
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14],
+        device="cuda",
+    )
+    outputs = _WignerSO2Prepare.apply(
+        x, edge_index, wigner, out_mask, radial, to_m
+    )
+    sum(output.sum() for output in outputs).backward()
+    assert [tuple(output.shape) for output in outputs] == [
+        (0, 1024),
+        (0, 2, 768),
+        (0, 2, 512),
+    ]
+    assert x.grad is not None and torch.count_nonzero(x.grad) == 0
+    assert wigner.grad is not None and wigner.grad.shape == wigner.shape
+    assert radial.grad is not None and radial.grad.shape == radial.shape
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_wigner_so2_prepare_is_cuda_graph_capture_safe():
+    torch.manual_seed(42)
+    mapping = CoefficientMapping(3, 2).cuda()
+    to_m, _ = _so2_indices(mapping)
+    x = torch.randn(8, 16, 128, device="cuda", requires_grad=True)
+    edge_index = torch.randint(0, 8, (2, 16), device="cuda")
+    wigner = torch.randn(16, 16, 16, device="cuda", requires_grad=True)
+    radial = torch.randn(16, 2304, device="cuda", requires_grad=True)
+    out_mask = torch.tensor(
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14],
+        device="cuda",
+    )
+    inputs = (x, wigner, radial)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            outputs = wigner_so2_prepare(
+                x, edge_index, wigner, out_mask, radial, to_m
+            )
+            torch.autograd.grad(sum(output.sum() for output in outputs), inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outputs = wigner_so2_prepare(
+            x, edge_index, wigner, out_mask, radial, to_m
+        )
+        gradients = torch.autograd.grad(
+            sum(output.sum() for output in outputs), inputs
+        )
+    addresses = tuple(output.data_ptr() for output in outputs) + tuple(
+        gradient.data_ptr() for gradient in gradients
+    )
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert addresses == tuple(output.data_ptr() for output in outputs) + tuple(
+        gradient.data_ptr() for gradient in gradients
+    )
 
 
 @pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
