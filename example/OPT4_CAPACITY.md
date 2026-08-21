@@ -15,6 +15,91 @@ Because a long diffusive trajectory may leave the probed local environment,
 Matbench trajectories until that protocol has an appropriately long probe or
 an independent capacity-safety study.
 
+## CAP1-auto
+
+The unconditional CAP1 experiment showed a stable Cu32 regression even though
+H2O32/H2O192 improved by about 1.15x.  `auto` therefore evaluates the rounded
+per-atom allocation after the existing probe and selects it only when its
+fixed edge capacity is at least 5% smaller than uniform capacity.  Otherwise
+it captures the original uniform graph.  The decision is chemistry-agnostic,
+occurs before capture, and adds no replay-time branch.
+
+Every result records:
+
+- `neighbor_capacity_policy_requested=auto`;
+- `neighbor_capacity_policy_effective=uniform|atom`;
+- `neighbor_capacity_auto_candidate_reduction_vs_uniform`;
+- `neighbor_capacity_auto_selected`.
+
+The threshold is configurable with `--neighbor-auto-min-reduction` or the
+runner environment variable `NEIGHBOR_AUTO_MIN_REDUCTION`.
+
+### Unit tests
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+PYTHONPATH="$PWD/src" \
+python -m pytest -q --noconftest \
+  tests/core/applications/test_esen_fixed_neighbor.py
+```
+
+### CAP1-auto one-step smoke
+
+```bash
+GPU=0 \
+CHECKPOINT=/path/to/esen_30m_oam.pt \
+STRUCTURE_DIR=/path/to/cif_file \
+OUTPUT_DIR=/path/to/cap1_auto_smoke \
+bash example/smoke_opt4_capacity_auto.sh
+```
+
+The smoke writes `auto_decisions.tsv` in addition to the normal result and
+status files.
+
+### CAP1-auto 100-step polling ablation
+
+```bash
+GPU_LIST="0 1 2 3 4 5 6 7" \
+GPU_IDLE_SECONDS=120 \
+GPU_POLL_SECONDS=10 \
+CHECKPOINT=/path/to/esen_30m_oam.pt \
+STRUCTURE_DIR=/path/to/cif_file \
+ROOT_OUTPUT_DIR=/path/to/cap1_auto_8gpu \
+nohup bash example/run_opt4_capacity_auto_8gpu.sh \
+  > /path/to/cap1_auto_8gpu.log 2>&1 &
+```
+
+After the queue completes, select it with:
+
+```bash
+python example/select_opt4_model_fusions.py \
+  --input-dir /path/to/cap1_auto_8gpu/whole_step \
+  --scope whole-step \
+  --base-stage OPT4V2 \
+  --candidate-stage CAP1AUTO \
+  --candidate-fusion auto-capacity \
+  --accepted-before "" \
+  --focus-systems H2O32 H2O192 \
+  --min-paired-repeats 3 \
+  --min-faster-directions 3 \
+  --maximum-peak-reserved-increase-gib 1.0 \
+  --output /path/to/cap1_auto_8gpu/CAP1AUTO_selection.json
+```
+
+The single-GPU equivalent is `run_opt4_capacity_auto_ablation.sh`.
+
+### Profiling after acceptance
+
+```bash
+GPU=0 \
+SYSTEMS="H2O32 H2O192" \
+TRACE_STEPS=20 \
+CHECKPOINT=/path/to/esen_30m_oam.pt \
+STRUCTURE_DIR=/path/to/cif_file \
+OUTPUT_DIR=/path/to/cap1_auto_nsys \
+bash example/run_opt4_capacity_auto_profiling.sh
+```
+
 ## One-step smoke
 
 ```bash

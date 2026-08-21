@@ -16,6 +16,7 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BASE_FUSIONS=${BASE_FUSIONS:-}
 BASE_NEIGHBOR_CAPACITY_POLICY=${BASE_NEIGHBOR_CAPACITY_POLICY:-uniform}
 CANDIDATE_NEIGHBOR_CAPACITY_POLICY=${CANDIDATE_NEIGHBOR_CAPACITY_POLICY:-uniform}
+NEIGHBOR_AUTO_MIN_REDUCTION=${NEIGHBOR_AUTO_MIN_REDUCTION:-0.05}
 CHECKPOINT=${CHECKPOINT:-"$REPO_ROOT/esen_30m_oam.pt"}
 STRUCTURE_DIR=${STRUCTURE_DIR:-"$REPO_ROOT/../MatRIS-09bk/example/cif_file"}
 BASELINE_DIR=${BASELINE_DIR:-}
@@ -45,6 +46,7 @@ printf 'scope\tvariant\tfusion_stage\tmodel_fusions\tneighbor_capacity_policy\ts
     echo "candidate_fusions=$CANDIDATE_FUSIONS"
     echo "base_neighbor_capacity_policy=$BASE_NEIGHBOR_CAPACITY_POLICY"
     echo "candidate_neighbor_capacity_policy=$CANDIDATE_NEIGHBOR_CAPACITY_POLICY"
+    echo "neighbor_auto_min_reduction=$NEIGHBOR_AUTO_MIN_REDUCTION"
     echo "repo_commit=$(git -C "$REPO_ROOT" rev-parse HEAD)"
     echo "source_bundle_sha256=$SOURCE_BUNDLE_SHA256"
     echo "physical_gpu=$GPU"
@@ -153,7 +155,9 @@ run_one() {
                 --temperature "$temperature" --timestep 1.0 --taut 100.0 \
                 --seed 42 --repeat "$repeat" --probe-steps 50 \
                 --neighbor-margin 0.10 --neighbor-slot-step 8 \
-                --neighbor-capacity-policy "$capacity_policy" --dummy-atoms 32 \
+                --neighbor-capacity-policy "$capacity_policy" \
+                --neighbor-auto-min-reduction "$NEIGHBOR_AUTO_MIN_REDUCTION" \
+                --dummy-atoms 32 \
                 --capture-warmup 3 --max-neighbors 300 \
                 --degeneracy-tolerance 0.01 --energy-per-atom-atol 1e-5 \
                 --force-max-atol 2e-4 "${whole_args[@]}" \

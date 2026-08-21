@@ -30,6 +30,7 @@ WHOLE_CANDIDATE_STAGE=${WHOLE_CANDIDATE_STAGE:-OPT4V1}
 WHOLE_CANDIDATE_FUSIONS=${WHOLE_CANDIDATE_FUSIONS:-rmsnorm,so2-epilogue}
 WHOLE_BASE_NEIGHBOR_CAPACITY_POLICY=${WHOLE_BASE_NEIGHBOR_CAPACITY_POLICY:-uniform}
 WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY=${WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY:-uniform}
+NEIGHBOR_AUTO_MIN_REDUCTION=${NEIGHBOR_AUTO_MIN_REDUCTION:-0.05}
 
 if [[ ! -x "$NSYS" ]]; then
     echo "Nsight Systems is not executable: $NSYS" >&2
@@ -122,6 +123,7 @@ run_one() {
             --neighbor-margin 0.10
             --neighbor-slot-step 8
             --neighbor-capacity-policy "$capacity_policy"
+            --neighbor-auto-min-reduction "$NEIGHBOR_AUTO_MIN_REDUCTION"
             --dummy-atoms 32
             --capture-warmup 3
             --max-neighbors 300
@@ -266,6 +268,7 @@ run_one() {
     echo "whole_candidate_fusions=$WHOLE_CANDIDATE_FUSIONS"
     echo "whole_base_neighbor_capacity_policy=$WHOLE_BASE_NEIGHBOR_CAPACITY_POLICY"
     echo "whole_candidate_neighbor_capacity_policy=$WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY"
+    echo "neighbor_auto_min_reduction=$NEIGHBOR_AUTO_MIN_REDUCTION"
     echo "checkpoint=$CHECKPOINT"
     echo "structure_dir=$STRUCTURE_DIR"
     "$NSYS" --version | tr '\n' ' '

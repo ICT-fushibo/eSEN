@@ -137,6 +137,53 @@ def atom_neighbor_capacities_from_probe(
     )
 
 
+def auto_neighbor_capacities_from_probe(
+    maximum_neighbors_by_atom: Tensor | Sequence[int],
+    *,
+    margin: float = 0.10,
+    slot_step: int = 8,
+    minimum_reduction: float = 0.05,
+) -> tuple[tuple[int, ...] | None, float]:
+    """Select per-atom slots only when they remove enough padding.
+
+    The decision is made once after the eager probe and before CUDA Graph
+    capture.  Returning ``None`` selects the original uniform-capacity path,
+    so replay contains no policy branch.  The returned reduction is the
+    fractional edge-capacity reduction of the per-atom candidate relative to
+    the uniform allocation, regardless of which path is selected.
+    """
+
+    if (
+        not math.isfinite(minimum_reduction)
+        or not 0.0 <= minimum_reduction <= 1.0
+    ):
+        raise ValueError("minimum_reduction must be finite and between 0 and 1")
+    maxima = torch.as_tensor(
+        maximum_neighbors_by_atom, device="cpu", dtype=torch.long
+    ).reshape(-1)
+    if maxima.numel() < 1:
+        raise ValueError("maximum_neighbors_by_atom must be non-empty")
+    if bool((maxima < 0).any()):
+        raise ValueError("maximum neighbor counts must be non-negative")
+
+    atom_capacities = atom_neighbor_capacities_from_probe(
+        maxima,
+        margin=margin,
+        slot_step=slot_step,
+    )
+    uniform_capacity = neighbor_capacity_from_probe(
+        max(1, int(maxima.max().item())),
+        margin=margin,
+        slot_step=slot_step,
+    )
+    uniform_edge_capacity = uniform_capacity * int(maxima.numel())
+    reduction = (
+        uniform_edge_capacity - sum(atom_capacities)
+    ) / uniform_edge_capacity
+    selected = atom_capacities if reduction >= minimum_reduction else None
+    return selected, float(reduction)
+
+
 def _pbc_repetitions(cell: Tensor, cutoff: float, pbc: Tensor) -> tuple[int, int, int]:
     """Match the plane-distance repetition calculation in radius_graph_pbc."""
 

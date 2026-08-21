@@ -76,12 +76,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neighbor-slot-step", type=int, default=8)
     parser.add_argument(
         "--neighbor-capacity-policy",
-        choices=("uniform", "species", "atom"),
+        choices=("uniform", "species", "atom", "auto"),
         default="uniform",
         help=(
             "Static neighbor-slot allocation. 'uniform' preserves Opt3/Opt4 "
             "behavior; 'species' assigns each element its probed maximum; "
-            "'atom' assigns rounded probe bounds per atom."
+            "'atom' assigns rounded probe bounds per atom; 'auto' uses atom "
+            "slots only when their capacity reduction reaches the configured "
+            "threshold."
+        ),
+    )
+    parser.add_argument(
+        "--neighbor-auto-min-reduction",
+        type=float,
+        default=0.05,
+        help=(
+            "Minimum fractional edge-capacity reduction required for the "
+            "'auto' policy to select per-atom slots (default: 0.05)."
         ),
     )
     parser.add_argument("--dummy-atoms", type=int, default=32)
@@ -115,6 +126,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("NVT parameters must be positive")
     if args.neighbor_margin < 0 or args.neighbor_slot_step < 1:
         parser.error("invalid neighbor capacity parameters")
+    if (
+        not np.isfinite(args.neighbor_auto_min_reduction)
+        or not 0.0 <= args.neighbor_auto_min_reduction <= 1.0
+    ):
+        parser.error("neighbor auto minimum reduction must be between 0 and 1")
     if args.dummy_atoms < 1 or args.capture_warmup < 0:
         parser.error("invalid CUDA Graph setup parameters")
     if args.max_neighbors < 1 or args.degeneracy_tolerance < 0:
@@ -199,6 +215,7 @@ def main() -> int:
     from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
     from fairchem.core.applications.esen_fixed_neighbor import (
         atom_neighbor_capacities_from_probe,
+        auto_neighbor_capacities_from_probe,
         neighbor_counts_in_graph,
         neighbor_capacity_from_probe,
         species_neighbor_capacities_from_probe,
@@ -325,6 +342,14 @@ def main() -> int:
         margin=args.neighbor_margin,
         slot_step=args.neighbor_slot_step,
     )
+    auto_candidate_capacities, auto_candidate_reduction = (
+        auto_neighbor_capacities_from_probe(
+            probe_max_degrees,
+            margin=args.neighbor_margin,
+            slot_step=args.neighbor_slot_step,
+            minimum_reduction=args.neighbor_auto_min_reduction,
+        )
+    )
     if args.neighbor_capacity_policy == "species":
         neighbor_capacities = species_neighbor_capacities_from_probe(
             probe_max_degrees,
@@ -338,8 +363,17 @@ def main() -> int:
             margin=args.neighbor_margin,
             slot_step=args.neighbor_slot_step,
         )
+    elif args.neighbor_capacity_policy == "auto":
+        neighbor_capacities = auto_candidate_capacities
     else:
         neighbor_capacities = None
+    effective_neighbor_capacity_policy = (
+        "atom" if neighbor_capacities is not None
+        and args.neighbor_capacity_policy in {"atom", "auto"}
+        else args.neighbor_capacity_policy
+    )
+    if args.neighbor_capacity_policy == "auto" and neighbor_capacities is None:
+        effective_neighbor_capacity_policy = "uniform"
     effective_neighbor_capacities = (
         neighbor_capacities
         if neighbor_capacities is not None
@@ -413,7 +447,7 @@ def main() -> int:
             evaluator,
             neighbors_per_atom=neighbor_capacity,
             neighbor_capacities=neighbor_capacities,
-            neighbor_capacity_policy=args.neighbor_capacity_policy,
+            neighbor_capacity_policy=effective_neighbor_capacity_policy,
             dummy_atoms=args.dummy_atoms,
             capture_warmup=args.capture_warmup,
             max_neighbors=args.max_neighbors,
@@ -446,7 +480,7 @@ def main() -> int:
             integrator,
             neighbors_per_atom=neighbor_capacity,
             neighbor_capacities=neighbor_capacities,
-            neighbor_capacity_policy=args.neighbor_capacity_policy,
+            neighbor_capacity_policy=effective_neighbor_capacity_policy,
             dummy_atoms=args.dummy_atoms,
             capture_warmup=args.capture_warmup,
             max_neighbors=args.max_neighbors,
@@ -678,6 +712,25 @@ def main() -> int:
         "probe_max_neighbors_per_atom": probe_max_neighbors,
         "neighbor_capacity_per_atom": neighbor_capacity,
         "neighbor_capacity_policy": args.neighbor_capacity_policy,
+        "neighbor_capacity_policy_requested": args.neighbor_capacity_policy,
+        "neighbor_capacity_policy_effective": effective_neighbor_capacity_policy,
+        "neighbor_capacity_auto_min_reduction": (
+            args.neighbor_auto_min_reduction
+        ),
+        "neighbor_capacity_auto_candidate_edge_capacity": sum(
+            atom_neighbor_capacities_from_probe(
+                probe_max_degrees,
+                margin=args.neighbor_margin,
+                slot_step=args.neighbor_slot_step,
+            )
+        ),
+        "neighbor_capacity_auto_candidate_reduction_vs_uniform": (
+            auto_candidate_reduction
+        ),
+        "neighbor_capacity_auto_selected": (
+            args.neighbor_capacity_policy == "auto"
+            and effective_neighbor_capacity_policy == "atom"
+        ),
         "neighbor_capacity_by_species": neighbor_capacity_by_species,
         "neighbor_edge_capacity": neighbor_edge_capacity,
         "neighbor_uniform_capacity_per_atom": uniform_neighbor_capacity,

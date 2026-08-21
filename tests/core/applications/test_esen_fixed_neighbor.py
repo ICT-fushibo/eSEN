@@ -8,6 +8,7 @@ import torch
 from fairchem.core.applications.esen_fixed_neighbor import (
     FixedShapePBCNeighborBuilder,
     atom_neighbor_capacities_from_probe,
+    auto_neighbor_capacities_from_probe,
     maximum_neighbors_in_graph,
     neighbor_counts_in_graph,
     neighbor_capacity_from_probe,
@@ -59,6 +60,36 @@ def test_atom_neighbor_capacities_preserve_local_probe_distribution():
         [8, 17, 20, 10], margin=0.0, slot_step=8
     )
     assert capacities == (16, 24, 24, 16)
+
+
+def test_auto_neighbor_capacities_selects_atom_for_material_reduction():
+    capacities, reduction = auto_neighbor_capacities_from_probe(
+        [8, 8, 20, 20],
+        margin=0.0,
+        slot_step=8,
+        minimum_reduction=0.05,
+    )
+    assert capacities == (16, 16, 24, 24)
+    assert reduction == pytest.approx(1.0 / 6.0)
+
+
+def test_auto_neighbor_capacities_keeps_uniform_below_threshold():
+    capacities, reduction = auto_neighbor_capacities_from_probe(
+        [20, 19, 20, 19],
+        margin=0.0,
+        slot_step=8,
+        minimum_reduction=0.05,
+    )
+    assert capacities is None
+    assert reduction == 0.0
+
+
+@pytest.mark.parametrize("minimum_reduction", [-0.01, 1.01, float("nan")])
+def test_auto_neighbor_capacities_rejects_invalid_threshold(minimum_reduction):
+    with pytest.raises(ValueError):
+        auto_neighbor_capacities_from_probe(
+            [8, 20], minimum_reduction=minimum_reduction
+        )
 
 
 def test_neighbor_counts_in_graph_includes_isolated_atoms():

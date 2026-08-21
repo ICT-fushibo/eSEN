@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import csv
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -76,6 +77,13 @@ def _env_float(name: str, default: float) -> float:
     return float(_env(name, str(default)))
 
 
+def _env_fraction(name: str, default: float) -> float:
+    value = _env_float(name, default)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be finite and between 0 and 1")
+    return value
+
+
 def _split(value: str) -> list[str]:
     return [item for item in value.replace(",", " ").split() if item]
 
@@ -101,9 +109,9 @@ def _temperature_label(value: str) -> str:
 
 
 def _capacity_policy(value: str) -> str:
-    if value not in {"uniform", "species", "atom"}:
+    if value not in {"uniform", "species", "atom", "auto"}:
         raise ValueError(
-            "neighbor capacity policy must be uniform, species, or atom"
+            "neighbor capacity policy must be uniform, species, atom, or auto"
         )
     return value
 
@@ -240,6 +248,7 @@ class Config:
     model_candidate_capacity_policy: str
     whole_base_capacity_policy: str
     whole_candidate_capacity_policy: str
+    neighbor_auto_min_reduction: float
     run_kind: str
     status_filename: str
     resume: bool
@@ -301,6 +310,9 @@ class Config:
             ),
             whole_candidate_capacity_policy=_capacity_policy(
                 _env("WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY", "uniform")
+            ),
+            neighbor_auto_min_reduction=_env_fraction(
+                "NEIGHBOR_AUTO_MIN_REDUCTION", 0.05
             ),
             run_kind=_env("RUN_KIND", "opt4_v1_kf9_formal_performance"),
             status_filename=_env("STATUS_FILENAME", "v1_status.tsv"),
@@ -413,6 +425,9 @@ class Scheduler:
                 "--neighbor-margin", "0.10",
                 "--neighbor-slot-step", "8",
                 "--neighbor-capacity-policy", neighbor_capacity_policy,
+                "--neighbor-auto-min-reduction", str(
+                    self.config.neighbor_auto_min_reduction
+                ),
                 "--dummy-atoms", "32",
                 "--capture-warmup", "3",
                 "--max-neighbors", "300",
@@ -641,6 +656,9 @@ class Scheduler:
                 ),
                 "whole_candidate_neighbor_capacity_policy": (
                     self.config.whole_candidate_capacity_policy
+                ),
+                "neighbor_auto_min_reduction": (
+                    self.config.neighbor_auto_min_reduction
                 ),
                 "gpus": self.config.gpus,
                 "gpu_idle_seconds": self.config.idle_seconds,
