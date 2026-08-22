@@ -25,6 +25,7 @@ def _record(
     peak_reserved_gib: float = 1.0,
     system: str = "Cu32",
     temperature: int = 300,
+    tf32: bool | None = None,
 ) -> dict[str, object]:
     if scope == "model-only":
         base_backend = "esen_gpu_resident_model_cg"
@@ -32,7 +33,7 @@ def _record(
     else:
         base_backend = "esen_gpu_resident_whole_step_cg"
         fused_backend = "esen_gpu_resident_whole_step_cg_opt4"
-    return {
+    record = {
         "backend": base_backend if stage.endswith("_base") else fused_backend,
         "kernel_fusion_stage": stage,
         "system": system,
@@ -45,6 +46,18 @@ def _record(
         "cuda_graph_capture_count": 1,
         "peak_reserved_gib": peak_reserved_gib,
     }
+    if tf32 is not None:
+        record.update(
+            {
+                "tf32": tf32,
+                "tf32_mode_requested": "on" if tf32 else "off",
+                "tf32_matmul_allowed": tf32,
+                "tf32_cudnn_allowed": tf32,
+                "float32_matmul_precision": "high" if tf32 else "highest",
+                "tf32_config_verified": True,
+            }
+        )
+    return record
 
 
 def _write_status_tsv(root: Path, scope: str, stage: str, status: str) -> None:
@@ -279,3 +292,61 @@ def test_selector_focus_system_supports_multiple_temperatures(
     result = json.loads(output.read_text(encoding="utf-8"))
     assert result["focus_stable"] is True
     assert len(result["comparisons"]) == 2
+
+
+def test_selector_requires_verified_tf32_pair(tmp_path, monkeypatch):
+    module = _load_module()
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    for repeat in range(1, 4):
+        for index, record in enumerate(
+            (
+                _record("OPT4V3_FP32", repeat, 1.0, tf32=False),
+                _record("PREC1_TF32", repeat, 0.8, tf32=True),
+            )
+        ):
+            (result_dir / f"{repeat}_{index}.json").write_text(
+                json.dumps(record), encoding="utf-8"
+            )
+    _write_status_tsv(tmp_path, "whole-step", "PREC1_TF32", "success")
+    status = (tmp_path / "run_status.tsv").read_text(encoding="utf-8")
+    (tmp_path / "run_status.tsv").write_text(
+        "\n".join(status.splitlines()[:4]) + "\n", encoding="utf-8"
+    )
+    output = tmp_path / "selection.json"
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        [
+            str(SCRIPT),
+            "--input-dir",
+            str(tmp_path),
+            "--scope",
+            "whole-step",
+            "--base-stage",
+            "OPT4V3_FP32",
+            "--candidate-stage",
+            "PREC1_TF32",
+            "--candidate-fusion",
+            "tf32",
+            "--require-tf32-pair",
+            "--min-paired-repeats",
+            "3",
+            "--min-faster-directions",
+            "3",
+            "--output",
+            str(output),
+        ],
+    )
+    assert module.main() == 0
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["accepted"] is True
+    assert result["precision_configuration_ok"] is True
+
+    candidate = json.loads((result_dir / "1_1.json").read_text(encoding="utf-8"))
+    candidate["tf32_matmul_allowed"] = False
+    (result_dir / "1_1.json").write_text(json.dumps(candidate), encoding="utf-8")
+    assert module.main() == 1
+    assert json.loads(output.read_text(encoding="utf-8"))[
+        "precision_configuration_ok"
+    ] is False

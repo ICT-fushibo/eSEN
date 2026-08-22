@@ -16,6 +16,8 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BASE_FUSIONS=${BASE_FUSIONS:-}
 BASE_NEIGHBOR_CAPACITY_POLICY=${BASE_NEIGHBOR_CAPACITY_POLICY:-uniform}
 CANDIDATE_NEIGHBOR_CAPACITY_POLICY=${CANDIDATE_NEIGHBOR_CAPACITY_POLICY:-uniform}
+BASE_TF32_MODE=${BASE_TF32_MODE:-off}
+CANDIDATE_TF32_MODE=${CANDIDATE_TF32_MODE:-off}
 NEIGHBOR_AUTO_MIN_REDUCTION=${NEIGHBOR_AUTO_MIN_REDUCTION:-0.05}
 NEIGHBOR_AUTO_GUARD_SLOTS=${NEIGHBOR_AUTO_GUARD_SLOTS:-1}
 PROBE_STEPS=${PROBE_STEPS:-50}
@@ -48,6 +50,8 @@ printf 'scope\tvariant\tfusion_stage\tmodel_fusions\tneighbor_capacity_policy\ts
     echo "candidate_fusions=$CANDIDATE_FUSIONS"
     echo "base_neighbor_capacity_policy=$BASE_NEIGHBOR_CAPACITY_POLICY"
     echo "candidate_neighbor_capacity_policy=$CANDIDATE_NEIGHBOR_CAPACITY_POLICY"
+    echo "base_tf32_mode=$BASE_TF32_MODE"
+    echo "candidate_tf32_mode=$CANDIDATE_TF32_MODE"
     echo "neighbor_auto_min_reduction=$NEIGHBOR_AUTO_MIN_REDUCTION"
     echo "neighbor_auto_guard_slots=$NEIGHBOR_AUTO_GUARD_SLOTS"
     echo "probe_steps=$PROBE_STEPS"
@@ -86,13 +90,15 @@ classify() {
 
 run_one() {
     local variant=$1 system=$2 temperature=$3 repeat=$4
-    local stage fusions capacity_policy backend
+    local stage fusions capacity_policy tf32_mode backend
     if [[ "$variant" == base ]]; then
         stage=$BASE_STAGE; fusions=$BASE_FUSIONS
         capacity_policy=$BASE_NEIGHBOR_CAPACITY_POLICY
+        tf32_mode=$BASE_TF32_MODE
     else
         stage=$CANDIDATE_STAGE; fusions=$CANDIDATE_FUSIONS
         capacity_policy=$CANDIDATE_NEIGHBOR_CAPACITY_POLICY
+        tf32_mode=$CANDIDATE_TF32_MODE
     fi
     if [[ "$SCOPE" == "model-only" ]]; then
         if [[ -n "$fusions" ]]; then backend=model-cg-opt4; else backend=model-cg; fi
@@ -138,6 +144,7 @@ run_one() {
                 --cg-capture-warmup 3 --cg-replay-energy-atol 0.0 \
                 --cg-replay-force-atol 2e-4 \
                 --energy-per-atom-atol 1e-5 --force-max-atol 2e-4 \
+                --tf32-mode "$tf32_mode" \
                 "${model_args[@]}" "${refs[@]}" > "$log" 2>&1
     else
         local benchmark_script="$REPO_ROOT/example/benchmark_md_opt4.py"
@@ -166,6 +173,7 @@ run_one() {
                 --capture-warmup 3 --max-neighbors 300 \
                 --degeneracy-tolerance 0.01 --energy-per-atom-atol 1e-5 \
                 --force-max-atol 2e-4 "${whole_args[@]}" \
+                --tf32-mode "$tf32_mode" \
                 "${refs[@]}" > "$log" 2>&1
     fi
     code=$?

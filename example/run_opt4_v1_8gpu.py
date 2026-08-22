@@ -124,6 +124,12 @@ def _capacity_policy(value: str) -> str:
     return value
 
 
+def _tf32_mode(value: str) -> str:
+    if value not in {"off", "on"}:
+        raise ValueError("TF32 mode must be off or on")
+    return value
+
+
 def _shuffle_variants(scope: str, system: str, temperature: str, repeat: int) -> list[str]:
     salt = f"42|opt4-v1|{scope}|{system}|{temperature}|{repeat}"
     seed = int.from_bytes(hashlib.sha256(salt.encode()).digest()[:8], "big")
@@ -252,6 +258,10 @@ class Config:
     model_candidate_stage: str
     whole_base_stage: str
     whole_candidate_stage: str
+    model_base_tf32_mode: str
+    model_candidate_tf32_mode: str
+    whole_base_tf32_mode: str
+    whole_candidate_tf32_mode: str
     model_base_capacity_policy: str
     model_candidate_capacity_policy: str
     whole_base_capacity_policy: str
@@ -309,6 +319,18 @@ class Config:
                 "WHOLE_BASE_STAGE", "WHOLE_BASE" if whole_base_fusions else "OPT3"
             ),
             whole_candidate_stage=_env("WHOLE_CANDIDATE_STAGE", "OPT4V1"),
+            model_base_tf32_mode=_tf32_mode(
+                _env("MODEL_BASE_TF32_MODE", "off")
+            ),
+            model_candidate_tf32_mode=_tf32_mode(
+                _env("MODEL_CANDIDATE_TF32_MODE", "off")
+            ),
+            whole_base_tf32_mode=_tf32_mode(
+                _env("WHOLE_BASE_TF32_MODE", "off")
+            ),
+            whole_candidate_tf32_mode=_tf32_mode(
+                _env("WHOLE_CANDIDATE_TF32_MODE", "off")
+            ),
             model_base_capacity_policy=_capacity_policy(
                 _env("MODEL_BASE_NEIGHBOR_CAPACITY_POLICY", "uniform")
             ),
@@ -343,6 +365,7 @@ class Task:
     fusion_stage: str
     model_fusions: str
     neighbor_capacity_policy: str
+    tf32_mode: str
     system: str
     temperature: str
     repeat: int
@@ -389,6 +412,7 @@ class Scheduler:
         fusion_stage: str,
         model_fusions: str,
         neighbor_capacity_policy: str,
+        tf32_mode: str,
     ) -> list[str]:
         if scope == "model-only":
             script = self.config.repo_root / "example" / "benchmark_md_gpu.py"
@@ -417,6 +441,7 @@ class Scheduler:
                 "--cg-replay-force-atol", "2e-4",
                 "--energy-per-atom-atol", "1e-5",
                 "--force-max-atol", "2e-4",
+                "--tf32-mode", tf32_mode,
             ]
         else:
             script = self.config.repo_root / "example" / "benchmark_md_opt4.py"
@@ -453,6 +478,7 @@ class Scheduler:
                 "--replay-force-atol", "2e-4",
                 "--energy-per-atom-atol", "1e-5",
                 "--force-max-atol", "2e-4",
+                "--tf32-mode", tf32_mode,
             ]
         if model_fusions:
             args.extend(["--model-fusions", model_fusions, "--fusion-stage", fusion_stage])
@@ -478,6 +504,8 @@ class Scheduler:
                 candidate_capacity_policy = (
                     self.config.model_candidate_capacity_policy
                 )
+                base_tf32_mode = self.config.model_base_tf32_mode
+                candidate_tf32_mode = self.config.model_candidate_tf32_mode
             else:
                 base_stage = self.config.whole_base_stage
                 candidate_stage = self.config.whole_candidate_stage
@@ -487,6 +515,8 @@ class Scheduler:
                 candidate_capacity_policy = (
                     self.config.whole_candidate_capacity_policy
                 )
+                base_tf32_mode = self.config.whole_base_tf32_mode
+                candidate_tf32_mode = self.config.whole_candidate_tf32_mode
 
             for repeat in range(1, self.config.repeats + 1):
                 for system in self.config.systems:
@@ -500,6 +530,11 @@ class Scheduler:
                                 else base_capacity_policy
                             )
                             stage = candidate_stage if is_candidate else base_stage
+                            tf32_mode = (
+                                candidate_tf32_mode
+                                if is_candidate
+                                else base_tf32_mode
+                            )
                             label = stage
                             scope_label = scope.replace("-", "_")
                             run_name = (
@@ -518,6 +553,7 @@ class Scheduler:
                                     fusion_stage=stage,
                                     model_fusions=fusions,
                                     neighbor_capacity_policy=capacity_policy,
+                                    tf32_mode=tf32_mode,
                                     system=system,
                                     temperature=temperature,
                                     repeat=repeat,
@@ -537,6 +573,7 @@ class Scheduler:
                                         stage,
                                         fusions,
                                         capacity_policy,
+                                        tf32_mode,
                                     ),
                                 )
                             )
@@ -662,6 +699,10 @@ class Scheduler:
                 "model_candidate_stage": self.config.model_candidate_stage,
                 "whole_base_stage": self.config.whole_base_stage,
                 "whole_candidate_stage": self.config.whole_candidate_stage,
+                "model_base_tf32_mode": self.config.model_base_tf32_mode,
+                "model_candidate_tf32_mode": self.config.model_candidate_tf32_mode,
+                "whole_base_tf32_mode": self.config.whole_base_tf32_mode,
+                "whole_candidate_tf32_mode": self.config.whole_candidate_tf32_mode,
                 "model_base_neighbor_capacity_policy": (
                     self.config.model_base_capacity_policy
                 ),
@@ -692,6 +733,9 @@ class Scheduler:
                 "structure_dir": str(self.config.structure_dir),
                 "numerical_validation_policy": "telemetry_only; Matbench is the correctness path",
                 "mps_policy": "unchanged; scheduler only sets CUDA_VISIBLE_DEVICES",
+                "precision_selection_dir": os.environ.get(
+                    "PREC1_SELECTION_DIR", ""
+                ),
             },
         )
 

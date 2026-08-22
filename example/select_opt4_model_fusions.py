@@ -95,6 +95,14 @@ def main() -> int:
     parser.add_argument("--min-paired-repeats", type=int, default=5)
     parser.add_argument("--min-faster-directions", type=int, default=4)
     parser.add_argument(
+        "--require-tf32-pair",
+        action="store_true",
+        help=(
+            "Require every base result to verify TF32=off/highest and every "
+            "candidate result to verify TF32=on/high. Used by PREC1."
+        ),
+    )
+    parser.add_argument(
         "--maximum-peak-reserved-increase-gib",
         type=float,
         default=None,
@@ -184,6 +192,29 @@ def main() -> int:
         and row.get("fusion_stage") == args.candidate_stage
     ]
     base_records = records_by_stage[args.base_stage]
+
+    def _tf32_configuration_ok(
+        stage_records: list[dict[str, object]], *, enabled: bool
+    ) -> bool:
+        expected_mode = "on" if enabled else "off"
+        expected_precision = "high" if enabled else "highest"
+        return bool(stage_records) and all(
+            record.get("tf32") is enabled
+            and record.get("tf32_mode_requested") == expected_mode
+            and record.get("tf32_matmul_allowed") is enabled
+            and record.get("tf32_cudnn_allowed") is enabled
+            and record.get("float32_matmul_precision") == expected_precision
+            and record.get("tf32_config_verified") is True
+            for record in stage_records
+        )
+
+    precision_configuration_ok = (
+        not args.require_tf32_pair
+        or (
+            _tf32_configuration_ok(base_records, enabled=False)
+            and _tf32_configuration_ok(candidate_records, enabled=True)
+        )
+    )
 
     def record_key(record: dict[str, object]) -> tuple[str, int, int]:
         return (
@@ -310,6 +341,7 @@ def main() -> int:
             and focus_geomean >= args.minimum_geomean_speedup
             and guardrail_ok
             and reserved_memory_ok
+            and precision_configuration_ok
         )
     else:
         accepted = (
@@ -319,6 +351,7 @@ def main() -> int:
             and no_regression
             and geomean >= args.minimum_geomean_speedup
             and reserved_memory_ok
+            and precision_configuration_ok
         )
     before = [item for item in args.accepted_before.split(",") if item]
     after = before + ([args.candidate_fusion] if accepted else [])
@@ -337,6 +370,8 @@ def main() -> int:
         "focus_no_system_regression": focus_no_regression,
         "guardrail_ok": guardrail_ok,
         "reserved_memory_ok": reserved_memory_ok,
+        "precision_configuration_ok": precision_configuration_ok,
+        "require_tf32_pair": args.require_tf32_pair,
         "maximum_peak_reserved_increase_gib": args.maximum_peak_reserved_increase_gib,
         "structural_ok": structural_ok,
         "coverage_ok": coverage_ok,

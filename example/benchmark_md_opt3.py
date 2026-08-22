@@ -117,6 +117,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-fusions", default="")
     parser.add_argument("--fusion-stage", default="")
     parser.add_argument(
+        "--tf32-mode",
+        choices=("off", "on"),
+        default="off",
+        help=(
+            "Explicit process-wide TF32 policy. The default 'off' preserves "
+            "Opt3/Opt4 behavior; 'on' is only for the independent PREC1 "
+            "performance experiment."
+        ),
+    )
+    parser.add_argument(
         "--external-profiler",
         action="store_true",
         help=(
@@ -251,14 +261,17 @@ def main() -> int:
     from fairchem.core.applications.esen_opt4_model_fusion import (
         parse_model_fusions,
     )
+    from fairchem.core.applications.esen_precision import (
+        configure_tf32,
+        verify_tf32,
+    )
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required")
     if not args.structure.is_file() or not args.checkpoint.is_file():
         raise FileNotFoundError("structure or checkpoint file is missing")
     seed_everything(torch, args.seed)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+    precision_metadata = configure_tf32(torch, args.tf32_mode)
     fixed_builder_backend = args.backend.startswith("fixed-builder-model-cg")
     kf1_backend = args.backend.endswith("-kf1")
     opt4_backend = args.backend.endswith("-opt4")
@@ -705,6 +718,7 @@ def main() -> int:
         f"{args.system}_{args.temperature:g}K_{args.steps}step_{suffix}"
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    precision_metadata = verify_tf32(torch, args.tf32_mode)
     record: dict[str, object] = {
         "backend": backend_name,
         "run_name": run_name,
@@ -720,7 +734,7 @@ def main() -> int:
         "seed": args.seed,
         "repeat": args.repeat,
         "amp": False,
-        "tf32": False,
+        **precision_metadata,
         "torch_compile": False,
         "external_profiler_range": args.external_profiler,
         "kernel_fusion": kf1_backend or opt4_backend,

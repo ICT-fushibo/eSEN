@@ -115,6 +115,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-fusions", default="")
     parser.add_argument("--fusion-stage", default="")
     parser.add_argument(
+        "--tf32-mode",
+        choices=("off", "on"),
+        default="off",
+        help=(
+            "Explicit process-wide TF32 policy. The default 'off' preserves "
+            "all existing benchmark behavior; 'on' is reserved for the "
+            "independent PREC1 experiment."
+        ),
+    )
+    parser.add_argument(
         "--external-profiler",
         action="store_true",
         help=(
@@ -250,6 +260,10 @@ def main() -> int:
         GPUMDState,
         GPUResidentMD,
     )
+    from fairchem.core.applications.esen_precision import (
+        configure_tf32,
+        verify_tf32,
+    )
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required")
     if not args.structure.is_file():
@@ -258,9 +272,7 @@ def main() -> int:
         raise FileNotFoundError(args.checkpoint)
 
     seed_everything(torch, args.seed)
-
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+    precision_metadata = configure_tf32(torch, args.tf32_mode)
     model_cg_backend = args.backend in {"model-cg", "model-cg-opt4"}
     opt4_backend = args.backend == "model-cg-opt4"
     selected_model_fusions: tuple[str, ...] = ()
@@ -615,6 +627,7 @@ def main() -> int:
         f"{args.system}_{args.temperature:g}K_{args.steps}step_{backend_suffix}"
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    precision_metadata = verify_tf32(torch, args.tf32_mode)
 
     record: dict[str, object] = {
         "backend": backend_name,
@@ -633,7 +646,7 @@ def main() -> int:
         "outputs": "energy,forces",
         "parameters_frozen": True,
         "amp": False,
-        "tf32": False,
+        **precision_metadata,
         "torch_compile": False,
         "external_profiler_range": args.external_profiler,
         "cuda_graph": model_cg_backend,
