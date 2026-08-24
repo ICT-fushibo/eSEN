@@ -23,6 +23,7 @@ from fairchem.core.models.esen.nn.layer_norm import (
 )
 from fairchem.core.models.esen.nn.radial import RadialMLP
 from fairchem.core.models.esen.nn.so2_layers import SO2_Convolution
+from fairchem.core.models.esen.nn.so3_layers import SO3_Linear
 
 try:
     import triton
@@ -37,6 +38,7 @@ SO2_FUSION_KERNEL_VERSION = "opt4-model-fusion-v3-so2"
 SO2_GATE_BRIDGE_KERNEL_VERSION = "opt4-model-fusion-v4-so2-gate"
 WIGNER_SO2_BRIDGE_KERNEL_VERSION = "opt4-model-fusion-v5-wigner-so2"
 SO2_BLOCK_GEMM_VERSION = "opt4-model-fusion-v6-so2-block-gemm"
+SO3_WEIGHT_CACHE_VERSION = "opt4-model-fusion-v7-so3-weight-cache"
 SO2_KERNEL_BLOCK = 512
 SUPPORTED_FUSIONS = (
     "gather-wigner",
@@ -50,6 +52,7 @@ SUPPORTED_FUSIONS = (
     "so2-gate-bridge",
     "wigner-so2-bridge",
     "so2-block-gemm",
+    "so3-weight-cache",
 )
 
 
@@ -100,6 +103,11 @@ def parse_model_fusions(value: str | Iterable[str]) -> tuple[str, ...]:
     ):
         raise UnsupportedFusionConfigError(
             "so2-block-gemm requires so2-epilogue to be requested explicitly"
+        )
+    if {"so3-mlp", "so3-weight-cache"}.issubset(requested_set):
+        raise UnsupportedFusionConfigError(
+            "so3-mlp already materializes expanded SO3 weights; "
+            "do not combine it with so3-weight-cache"
         )
     return tuple(name for name in SUPPORTED_FUSIONS if name in requested_set)
 
@@ -4288,6 +4296,90 @@ class FusedRadialMLP(nn.Module):
         )
 
 
+class FrozenSO3Linear(nn.Module):
+    """Inference-only ``SO3_Linear`` with a configure-time weight cache.
+
+    The official layer expands its four degree weights to all 16 spherical
+    coefficients with ``index_select`` on every forward.  eSEN force inference
+    freezes model parameters, so the expanded tensor is immutable and can be
+    materialized once without changing the einsum/cuBLAS computation.  The
+    ordinary PyTorch einsum is intentionally retained; only the repeated
+    weight-gather kernel and its temporary allocation are removed.
+    """
+
+    def __init__(self, original: SO3_Linear) -> None:
+        super().__init__()
+        if not isinstance(original, SO3_Linear):
+            raise UnsupportedFusionConfigError(
+                "SO3 weight cache requires an official SO3_Linear module"
+            )
+        if (
+            original.lmax != 3
+            or original.in_features != 128
+            or original.out_features != 128
+        ):
+            raise UnsupportedFusionConfigError(
+                "SO3 weight cache only supports the 30M [16,128] layout; "
+                f"got lmax={original.lmax}, in={original.in_features}, "
+                f"out={original.out_features}"
+            )
+        if original.weight.requires_grad or original.bias.requires_grad:
+            raise UnsupportedFusionConfigError(
+                "SO3 weight cache requires frozen weight and bias parameters"
+            )
+        expected_index = torch.tensor(
+            [0, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3],
+            dtype=torch.long,
+            device=original.expand_index.device,
+        )
+        if not torch.equal(original.expand_index, expected_index):
+            raise UnsupportedFusionConfigError(
+                "SO3 weight cache received an unsupported degree expansion"
+            )
+
+        self.in_features = original.in_features
+        self.out_features = original.out_features
+        self.lmax = original.lmax
+        # Keep the checkpoint parameters reachable under the same public names.
+        # They stay frozen; forward reads only the immutable expanded buffer.
+        self.weight = original.weight
+        self.bias = original.bias
+        expanded = original.weight.detach().index_select(
+            0, original.expand_index
+        ).contiguous()
+        self.register_buffer("expanded_weight", expanded, persistent=False)
+        self.cached_weight_bytes = expanded.numel() * expanded.element_size()
+
+    def forward(self, input_embedding: Tensor) -> Tensor:
+        if input_embedding.ndim != 3 or tuple(input_embedding.shape[1:]) != (
+            16,
+            self.in_features,
+        ):
+            raise UnsupportedFusionConfigError(
+                "SO3 weight cache expected input [N,16,128], got "
+                f"{tuple(input_embedding.shape)}"
+            )
+        if (
+            input_embedding.device != self.expanded_weight.device
+            or input_embedding.dtype != self.expanded_weight.dtype
+        ):
+            raise UnsupportedFusionConfigError(
+                "SO3 weight cache input must match the cached FP32 CUDA weight"
+            )
+        out = torch.einsum(
+            "bmi, moi -> bmo", input_embedding, self.expanded_weight
+        )
+        bias = self.bias.view(1, 1, self.out_features)
+        out[:, 0:1, :] = out.narrow(1, 0, 1) + bias
+        return out
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"lmax={self.lmax}, cached_weight_bytes={self.cached_weight_bytes}"
+        )
+
+
 class FusedSpectralAtomwise(nn.Module):
     """Fused ``SO3_Linear + GateActivation + SO3_Linear`` atomwise chain.
 
@@ -4382,6 +4474,10 @@ class FusionMetadata:
     so2_block_gemm_convolution_replacements: int
     so2_block_gemm_linear_replacements: int
     so2_block_gemm_version: str
+    so3_weight_cache_replacements: int
+    so3_weight_cache_expanded_weight_count: int
+    so3_weight_cache_bytes: int
+    so3_weight_cache_version: str
     configure_wall_time_s: float
     torch_version: str
     triton_version: str
@@ -4432,6 +4528,14 @@ class FusionMetadata:
                 self.so2_block_gemm_linear_replacements
             ),
             "model_fusion_so2_block_gemm_version": self.so2_block_gemm_version,
+            "model_fusion_so3_weight_cache_replacements": (
+                self.so3_weight_cache_replacements
+            ),
+            "model_fusion_so3_weight_cache_expanded_weight_count": (
+                self.so3_weight_cache_expanded_weight_count
+            ),
+            "model_fusion_so3_weight_cache_bytes": self.so3_weight_cache_bytes,
+            "model_fusion_so3_weight_cache_version": self.so3_weight_cache_version,
             "model_fusion_configure_wall_time_s": self.configure_wall_time_s,
             "model_fusion_torch_version": self.torch_version,
             "model_fusion_triton_version": self.triton_version,
@@ -4501,6 +4605,7 @@ def configure_esen_30m_model_fusions(
     so2_gate_bridge = "so2-gate-bridge" in selected
     wigner_so2_bridge = "wigner-so2-bridge" in selected
     so2_block_gemm = "so2-block-gemm" in selected
+    so3_weight_cache = "so3-weight-cache" in selected
     edgewise_count = 0
     edge_embedding_count = 0
     rmsnorm_count = 0
@@ -4512,6 +4617,8 @@ def configure_esen_30m_model_fusions(
     so2_gate_bridge_count = 0
     wigner_so2_bridge_count = 0
     so2_block_gemm_count = 0
+    so3_weight_cache_count = 0
+    so3_weight_cache_bytes = 0
 
     # radial-mlp first: the FusedEdgewise / FusedEdgeDegreeEmbedding wrappers
     # installed below hold references to these rad_func objects.
@@ -4604,6 +4711,28 @@ def configure_esen_30m_model_fusions(
             block.norm_2 = FusedRMSNormSH(block.norm_2)
         rmsnorm_count = len(norms)
 
+    if so3_weight_cache:
+        for block in backbone.blocks:
+            if not isinstance(block.atom_wise, SpectralAtomwise):
+                raise UnsupportedFusionConfigError(
+                    "SO3 weight cache requires the official SpectralAtomwise"
+                )
+            for name in ("so3_linear_1", "so3_linear_2"):
+                original = getattr(block.atom_wise, name, None)
+                if not isinstance(original, SO3_Linear):
+                    raise UnsupportedFusionConfigError(
+                        f"Unexpected {name} implementation for SO3 weight cache"
+                    )
+                cached = FrozenSO3Linear(original)
+                setattr(block.atom_wise, name, cached)
+                so3_weight_cache_count += 1
+                so3_weight_cache_bytes += cached.cached_weight_bytes
+        if so3_weight_cache_count != 20:
+            raise UnsupportedFusionConfigError(
+                "SO3 weight cache must replace all 20 SO3_Linear modules, "
+                f"replaced {so3_weight_cache_count}"
+            )
+
     if "so3-mlp" in selected:
         for block in backbone.blocks:
             if not isinstance(block.atom_wise, SpectralAtomwise):
@@ -4671,6 +4800,12 @@ def configure_esen_30m_model_fusions(
         so2_block_gemm_linear_replacements=2 * so2_block_gemm_count,
         so2_block_gemm_version=(
             SO2_BLOCK_GEMM_VERSION if so2_block_gemm else ""
+        ),
+        so3_weight_cache_replacements=so3_weight_cache_count,
+        so3_weight_cache_expanded_weight_count=so3_weight_cache_count,
+        so3_weight_cache_bytes=so3_weight_cache_bytes,
+        so3_weight_cache_version=(
+            SO3_WEIGHT_CACHE_VERSION if so3_weight_cache else ""
         ),
         configure_wall_time_s=time.perf_counter() - start,
         torch_version=torch.__version__,

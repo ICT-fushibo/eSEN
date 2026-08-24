@@ -103,6 +103,16 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--expected-tf32-mode",
+        choices=("off", "on", "off-to-on"),
+        default=None,
+        help=(
+            "Optional precision guard for both stages. 'off' requires FP32 "
+            "on both sides, 'on' requires TF32 on both sides, and "
+            "'off-to-on' is equivalent to --require-tf32-pair."
+        ),
+    )
+    parser.add_argument(
         "--maximum-peak-reserved-increase-gib",
         type=float,
         default=None,
@@ -208,13 +218,34 @@ def main() -> int:
             for record in stage_records
         )
 
-    precision_configuration_ok = (
-        not args.require_tf32_pair
-        or (
+    if args.require_tf32_pair and args.expected_tf32_mode not in (
+        None,
+        "off-to-on",
+    ):
+        parser.error(
+            "--require-tf32-pair conflicts with --expected-tf32-mode "
+            f"{args.expected_tf32_mode}"
+        )
+    expected_tf32_mode = (
+        "off-to-on" if args.require_tf32_pair else args.expected_tf32_mode
+    )
+    if expected_tf32_mode is None:
+        precision_configuration_ok = True
+    elif expected_tf32_mode == "off":
+        precision_configuration_ok = (
+            _tf32_configuration_ok(base_records, enabled=False)
+            and _tf32_configuration_ok(candidate_records, enabled=False)
+        )
+    elif expected_tf32_mode == "on":
+        precision_configuration_ok = (
+            _tf32_configuration_ok(base_records, enabled=True)
+            and _tf32_configuration_ok(candidate_records, enabled=True)
+        )
+    else:
+        precision_configuration_ok = (
             _tf32_configuration_ok(base_records, enabled=False)
             and _tf32_configuration_ok(candidate_records, enabled=True)
         )
-    )
 
     def record_key(record: dict[str, object]) -> tuple[str, int, int]:
         return (
@@ -372,6 +403,7 @@ def main() -> int:
         "reserved_memory_ok": reserved_memory_ok,
         "precision_configuration_ok": precision_configuration_ok,
         "require_tf32_pair": args.require_tf32_pair,
+        "expected_tf32_mode": expected_tf32_mode,
         "maximum_peak_reserved_increase_gib": args.maximum_peak_reserved_increase_gib,
         "structural_ok": structural_ok,
         "coverage_ok": coverage_ok,

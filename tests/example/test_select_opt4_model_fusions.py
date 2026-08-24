@@ -350,3 +350,55 @@ def test_selector_requires_verified_tf32_pair(tmp_path, monkeypatch):
     assert json.loads(output.read_text(encoding="utf-8"))[
         "precision_configuration_ok"
     ] is False
+
+
+def test_selector_can_require_tf32_on_for_both_stages(tmp_path, monkeypatch):
+    module = _load_module()
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    for repeat in range(1, 4):
+        for index, record in enumerate(
+            (
+                _record("PREC1_TF32", repeat, 1.0, tf32=True),
+                _record("KF13_PREC1_TF32", repeat, 0.95, tf32=True),
+            )
+        ):
+            (result_dir / f"{repeat}_{index}.json").write_text(
+                json.dumps(record), encoding="utf-8"
+            )
+    _write_status_tsv(tmp_path, "whole-step", "KF13_PREC1_TF32", "success")
+    status = (tmp_path / "run_status.tsv").read_text(encoding="utf-8")
+    (tmp_path / "run_status.tsv").write_text(
+        "\n".join(status.splitlines()[:4]) + "\n", encoding="utf-8"
+    )
+    output = tmp_path / "selection.json"
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        [
+            str(SCRIPT),
+            "--input-dir",
+            str(tmp_path),
+            "--scope",
+            "whole-step",
+            "--base-stage",
+            "PREC1_TF32",
+            "--candidate-stage",
+            "KF13_PREC1_TF32",
+            "--candidate-fusion",
+            "so3-weight-cache",
+            "--expected-tf32-mode",
+            "on",
+            "--min-paired-repeats",
+            "3",
+            "--min-faster-directions",
+            "3",
+            "--output",
+            str(output),
+        ],
+    )
+    assert module.main() == 0
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["accepted"] is True
+    assert result["expected_tf32_mode"] == "on"
+    assert result["precision_configuration_ok"] is True

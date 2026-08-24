@@ -29,11 +29,16 @@ WHOLE_BASE_STAGE=${WHOLE_BASE_STAGE:-OPT3}
 WHOLE_BASE_FUSIONS=${WHOLE_BASE_FUSIONS:-}
 WHOLE_CANDIDATE_STAGE=${WHOLE_CANDIDATE_STAGE:-OPT4V1}
 WHOLE_CANDIDATE_FUSIONS=${WHOLE_CANDIDATE_FUSIONS:-rmsnorm,so2-epilogue}
+MODEL_BASE_TF32_MODE=${MODEL_BASE_TF32_MODE:-off}
+MODEL_CANDIDATE_TF32_MODE=${MODEL_CANDIDATE_TF32_MODE:-off}
+WHOLE_BASE_TF32_MODE=${WHOLE_BASE_TF32_MODE:-off}
+WHOLE_CANDIDATE_TF32_MODE=${WHOLE_CANDIDATE_TF32_MODE:-off}
 WHOLE_BASE_NEIGHBOR_CAPACITY_POLICY=${WHOLE_BASE_NEIGHBOR_CAPACITY_POLICY:-uniform}
 WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY=${WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY:-uniform}
 NEIGHBOR_AUTO_MIN_REDUCTION=${NEIGHBOR_AUTO_MIN_REDUCTION:-0.05}
 NEIGHBOR_AUTO_GUARD_SLOTS=${NEIGHBOR_AUTO_GUARD_SLOTS:-1}
 WHOLE_PROBE_STEPS=${WHOLE_PROBE_STEPS:-50}
+MODEL_PROBE_STEPS=${MODEL_PROBE_STEPS:-50}
 
 if [[ ! -x "$NSYS" ]]; then
     echo "Nsight Systems is not executable: $NSYS" >&2
@@ -80,6 +85,7 @@ record_status() {
 run_one() {
     local scope=$1 variant=$2 system=$3 mode=$4
     local stage backend script scope_label run_name prefix log_path fusion_value
+    local tf32_mode=off
     local capacity_policy=uniform
     local -a target_args fusion_args
 
@@ -96,10 +102,12 @@ run_one() {
             stage=$WHOLE_BASE_STAGE
             fusion_value=$WHOLE_BASE_FUSIONS
             capacity_policy=$WHOLE_BASE_NEIGHBOR_CAPACITY_POLICY
+            tf32_mode=$WHOLE_BASE_TF32_MODE
         else
             stage=$WHOLE_CANDIDATE_STAGE
             fusion_value=$WHOLE_CANDIDATE_FUSIONS
             capacity_policy=$WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY
+            tf32_mode=$WHOLE_CANDIDATE_TF32_MODE
         fi
         if [[ -n "$fusion_value" ]]; then
             backend=whole-step-cg-opt4
@@ -136,6 +144,7 @@ run_one() {
             --replay-force-atol 2e-4
             --energy-per-atom-atol 1e-5
             --force-max-atol 2e-4
+            --tf32-mode "$tf32_mode"
             --missing-baseline-reference
             --external-profiler
         )
@@ -145,9 +154,11 @@ run_one() {
         if [[ "$variant" == "base" ]]; then
             stage=$MODEL_BASE_STAGE
             fusion_value=$MODEL_BASE_FUSIONS
+            tf32_mode=$MODEL_BASE_TF32_MODE
         else
             stage=$MODEL_CANDIDATE_STAGE
             fusion_value=$MODEL_CANDIDATE_FUSIONS
+            tf32_mode=$MODEL_CANDIDATE_TF32_MODE
         fi
         if [[ -n "$fusion_value" ]]; then
             backend=model-cg-opt4
@@ -171,7 +182,7 @@ run_one() {
             --seed 42
             --repeat 1
             --md-dtype float64
-            --cg-probe-steps 50
+            --cg-probe-steps "$MODEL_PROBE_STEPS"
             --cg-capacity-margin 0.10
             --cg-edge-step 256
             --cg-dummy-atoms 32
@@ -180,6 +191,7 @@ run_one() {
             --cg-replay-force-atol 2e-4
             --energy-per-atom-atol 1e-5
             --force-max-atol 2e-4
+            --tf32-mode "$tf32_mode"
             --missing-baseline-reference
             --external-profiler
         )
@@ -267,15 +279,20 @@ run_one() {
     echo "model_base_fusions=$MODEL_BASE_FUSIONS"
     echo "model_candidate_stage=$MODEL_CANDIDATE_STAGE"
     echo "model_candidate_fusions=$MODEL_CANDIDATE_FUSIONS"
+    echo "model_base_tf32_mode=$MODEL_BASE_TF32_MODE"
+    echo "model_candidate_tf32_mode=$MODEL_CANDIDATE_TF32_MODE"
     echo "whole_base_stage=$WHOLE_BASE_STAGE"
     echo "whole_base_fusions=$WHOLE_BASE_FUSIONS"
     echo "whole_candidate_stage=$WHOLE_CANDIDATE_STAGE"
     echo "whole_candidate_fusions=$WHOLE_CANDIDATE_FUSIONS"
+    echo "whole_base_tf32_mode=$WHOLE_BASE_TF32_MODE"
+    echo "whole_candidate_tf32_mode=$WHOLE_CANDIDATE_TF32_MODE"
     echo "whole_base_neighbor_capacity_policy=$WHOLE_BASE_NEIGHBOR_CAPACITY_POLICY"
     echo "whole_candidate_neighbor_capacity_policy=$WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY"
     echo "neighbor_auto_min_reduction=$NEIGHBOR_AUTO_MIN_REDUCTION"
     echo "neighbor_auto_guard_slots=$NEIGHBOR_AUTO_GUARD_SLOTS"
     echo "whole_probe_steps=$WHOLE_PROBE_STEPS"
+    echo "model_probe_steps=$MODEL_PROBE_STEPS"
     echo "checkpoint=$CHECKPOINT"
     echo "structure_dir=$STRUCTURE_DIR"
     "$NSYS" --version | tr '\n' ' '

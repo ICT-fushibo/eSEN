@@ -13,6 +13,7 @@ from fairchem.core.applications.esen_opt4_model_fusion import (
     FusedSO2Convolution,
     FusedSO2GateBridge,
     FusedSpectralAtomwise,
+    FrozenSO3Linear,
     SO2BlockLinear,
     UnsupportedFusionConfigError,
     _SO2BlockEpilogue,
@@ -27,6 +28,7 @@ from fairchem.core.applications.esen_opt4_model_fusion import (
     reverse_envelope_scatter,
     wigner_so2_prepare,
     _energy_head_candidates,
+    configure_esen_30m_model_fusions,
 )
 from fairchem.core.models.esen.esen_block import SpectralAtomwise
 from fairchem.core.models.esen.nn.activation import GateActivation
@@ -36,6 +38,7 @@ from fairchem.core.models.esen.nn.layer_norm import (
 from fairchem.core.models.esen.nn.radial import RadialMLP
 from fairchem.core.models.esen.common.so3 import CoefficientMapping
 from fairchem.core.models.esen.nn.so2_layers import SO2_Convolution
+from fairchem.core.models.esen.nn.so3_layers import SO3_Linear
 
 
 RTOL = 2e-4
@@ -214,6 +217,45 @@ def test_parse_model_fusions_is_ordered_and_strict():
     )
     with pytest.raises(UnsupportedFusionConfigError, match="requires so2-epilogue"):
         parse_model_fusions("so2-block-gemm")
+    assert parse_model_fusions(
+        "so3-weight-cache,so2-block-gemm,so2-gate-bridge,so2-epilogue"
+    ) == (
+        "so2-epilogue",
+        "so2-gate-bridge",
+        "so2-block-gemm",
+        "so3-weight-cache",
+    )
+    with pytest.raises(UnsupportedFusionConfigError, match="do not combine"):
+        parse_model_fusions("so3-mlp,so3-weight-cache")
+
+
+def test_frozen_so3_linear_forward_and_input_gradient_match_reference():
+    torch.manual_seed(42)
+    original = SO3_Linear(128, 128, lmax=3).eval()
+    original.requires_grad_(False)
+    cached = FrozenSO3Linear(original)
+    # Exercise the wrapper boundary with a non-contiguous logical [N,16,128].
+    x_ref = torch.randn(3, 128, 16).transpose(1, 2).requires_grad_(True)
+    x_cached = x_ref.detach().clone().requires_grad_(True)
+    grad = torch.randn(3, 16, 128)
+
+    expected = original(x_ref)
+    expected.backward(grad)
+    address = cached.expanded_weight.data_ptr()
+    actual = cached(x_cached)
+    actual.backward(grad)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(x_cached.grad, x_ref.grad, rtol=0, atol=0)
+    assert cached.expanded_weight.data_ptr() == address
+    assert cached.expanded_weight.shape == (16, 128, 128)
+    assert cached.cached_weight_bytes == 16 * 128 * 128 * 4
+
+
+def test_frozen_so3_linear_rejects_trainable_parameters():
+    original = SO3_Linear(128, 128, lmax=3)
+    with pytest.raises(UnsupportedFusionConfigError, match="requires frozen"):
+        FrozenSO3Linear(original)
 
 
 def test_so2_block_linear_forward_and_input_gradient_match_reference():
@@ -1136,6 +1178,76 @@ def test_so3_mlp_forward_backward_is_cuda_graph_capture_safe():
     graph.replay()
     torch.cuda.synchronize()
     assert addresses == (output.data_ptr(), gradients[0].data_ptr())
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_frozen_so3_linear_forward_backward_is_cuda_graph_capture_safe():
+    torch.manual_seed(42)
+    original = SO3_Linear(128, 128, lmax=3).cuda().eval()
+    original.requires_grad_(False)
+    cached = FrozenSO3Linear(original)
+    x = torch.randn(8, 16, 128, device="cuda", requires_grad=True)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            torch.autograd.grad(cached(x).sum(), (x,))
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = cached(x)
+        gradients = torch.autograd.grad(output.sum(), (x,))
+    addresses = (
+        cached.expanded_weight.data_ptr(),
+        output.data_ptr(),
+        gradients[0].data_ptr(),
+    )
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert addresses == (
+        cached.expanded_weight.data_ptr(),
+        output.data_ptr(),
+        gradients[0].data_ptr(),
+    )
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_configure_so3_weight_cache_replaces_all_20_linears():
+    class Backbone(torch.nn.Module):
+        lmax = 3
+        mmax = 2
+        sphere_channels = 128
+        hidden_channels = 128
+        num_layers = 10
+        act_type = "gate"
+        norm_type = "rms_norm_sh"
+        mlp_type = "spectral"
+        use_envelope = True
+
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList()
+            for _ in range(10):
+                block = torch.nn.Module()
+                block.atom_wise = SpectralAtomwise(128, 128, 3, 3, None)
+                self.blocks.append(block)
+
+    model = torch.nn.Module()
+    model.backbone = Backbone().cuda().eval()
+    model.requires_grad_(False)
+    metadata = configure_esen_30m_model_fusions(
+        model, "so3-weight-cache"
+    )
+    assert metadata.so3_weight_cache_replacements == 20
+    assert metadata.so3_weight_cache_expanded_weight_count == 20
+    assert metadata.so3_weight_cache_bytes == 20 * 16 * 128 * 128 * 4
+    assert all(
+        isinstance(block.atom_wise.so3_linear_1, FrozenSO3Linear)
+        and isinstance(block.atom_wise.so3_linear_2, FrozenSO3Linear)
+        for block in model.backbone.blocks
+    )
 
 
 @pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
