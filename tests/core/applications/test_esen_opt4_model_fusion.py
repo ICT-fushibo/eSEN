@@ -21,6 +21,7 @@ from fairchem.core.applications.esen_opt4_model_fusion import (
     _SO2Epilogue,
     _SO2GateBridge,
     _SO2Prepare,
+    _SO2PrepareBackwardReduce,
     _WignerSO2Prepare,
     gather_cat_wigner,
     model_fusion_available,
@@ -218,6 +219,18 @@ def test_parse_model_fusions_is_ordered_and_strict():
     with pytest.raises(UnsupportedFusionConfigError, match="requires so2-epilogue"):
         parse_model_fusions("so2-block-gemm")
     assert parse_model_fusions(
+        "so2-prepare-backward-reduce,so2-gate-bridge,so2-epilogue"
+    ) == (
+        "so2-epilogue",
+        "so2-gate-bridge",
+        "so2-prepare-backward-reduce",
+    )
+    with pytest.raises(
+        UnsupportedFusionConfigError,
+        match="requires so2-epilogue and so2-gate-bridge",
+    ):
+        parse_model_fusions("so2-epilogue,so2-prepare-backward-reduce")
+    assert parse_model_fusions(
         "so3-weight-cache,so2-block-gemm,so2-gate-bridge,so2-epilogue"
     ) == (
         "so2-epilogue",
@@ -290,7 +303,11 @@ def test_so2_epilogue_rejects_non_permutation_mapping():
 
 
 @pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
-def test_so2_prepare_forward_and_gradients_match_torch():
+@pytest.mark.parametrize(
+    "prepare", (_SO2Prepare, _SO2PrepareBackwardReduce),
+    ids=("atomic", "edge-local-reduce"),
+)
+def test_so2_prepare_forward_and_gradients_match_torch(prepare):
     torch.manual_seed(42)
     device = torch.device("cuda")
     mapping = CoefficientMapping(3, 2).to(device)
@@ -321,7 +338,7 @@ def test_so2_prepare_forward_and_gradients_match_torch():
 
     expected = _reference_so2_prepare(x_ref, radial_ref, mapping)
     torch.autograd.backward(expected, grad)
-    actual = _SO2Prepare.apply(
+    actual = prepare.apply(
         x_actual, radial_actual, to_m, True, 9 * channels
     )
     torch.autograd.backward(actual, grad)
@@ -333,6 +350,64 @@ def test_so2_prepare_forward_and_gradients_match_torch():
     torch.testing.assert_close(x_actual.grad, x_ref.grad, rtol=RTOL, atol=ATOL)
     torch.testing.assert_close(
         radial_actual.grad, radial_ref.grad, rtol=RTOL, atol=ATOL
+    )
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_prepare_backward_reduce_accepts_empty_edges():
+    mapping = CoefficientMapping(3, 2).cuda()
+    to_m, _ = _so2_indices(mapping)
+    x = torch.empty(0, 14, 256, device="cuda", requires_grad=True)
+    radial = torch.empty(0, 2304, device="cuda", requires_grad=True)
+    outputs = _SO2PrepareBackwardReduce.apply(
+        x, radial, to_m, True, 2304
+    )
+    sum(output.sum() for output in outputs).backward()
+    assert [tuple(output.shape) for output in outputs] == [
+        (0, 1024),
+        (0, 2, 768),
+        (0, 2, 512),
+    ]
+    assert x.grad is not None and x.grad.shape == x.shape
+    assert radial.grad is not None and radial.grad.shape == radial.shape
+
+
+@pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
+def test_so2_prepare_backward_reduce_is_cuda_graph_capture_safe():
+    torch.manual_seed(42)
+    mapping = CoefficientMapping(3, 2).cuda()
+    to_m, _ = _so2_indices(mapping)
+    x = torch.randn(16, 14, 256, device="cuda", requires_grad=True)
+    radial = torch.randn(16, 2304, device="cuda", requires_grad=True)
+    inputs = (x, radial)
+
+    def forward():
+        return _SO2PrepareBackwardReduce.apply(
+            x, radial, to_m, True, 2304
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            outputs = forward()
+            torch.autograd.grad(sum(output.sum() for output in outputs), inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outputs = forward()
+        gradients = torch.autograd.grad(
+            sum(output.sum() for output in outputs), inputs
+        )
+    addresses = tuple(output.data_ptr() for output in outputs) + tuple(
+        gradient.data_ptr() for gradient in gradients
+    )
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert addresses == tuple(output.data_ptr() for output in outputs) + tuple(
+        gradient.data_ptr() for gradient in gradients
     )
 
 
@@ -764,7 +839,10 @@ def test_so2_epilogue_external_radial_forward_and_gradients_match_torch():
 
 
 @pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
-def test_so2_block_gemm_external_radial_forward_and_gradients_match_torch():
+@pytest.mark.parametrize("prepare_backward_reduce", (False, True))
+def test_so2_block_gemm_external_radial_forward_and_gradients_match_torch(
+    prepare_backward_reduce,
+):
     torch.manual_seed(42)
     mapping = CoefficientMapping(3, 2).cuda()
     reference = SO2_Convolution(
@@ -778,7 +856,9 @@ def test_so2_block_gemm_external_radial_forward_and_gradients_match_torch():
         extra_m0_output_channels=384,
     ).cuda().eval()
     fused = FusedSO2Convolution(
-        copy.deepcopy(reference), block_gemm=True
+        copy.deepcopy(reference),
+        block_gemm=True,
+        prepare_backward_reduce=prepare_backward_reduce,
     ).cuda().eval()
     reference.requires_grad_(False)
     fused.requires_grad_(False)

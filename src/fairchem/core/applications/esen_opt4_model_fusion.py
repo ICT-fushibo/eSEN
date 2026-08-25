@@ -39,6 +39,9 @@ SO2_GATE_BRIDGE_KERNEL_VERSION = "opt4-model-fusion-v4-so2-gate"
 WIGNER_SO2_BRIDGE_KERNEL_VERSION = "opt4-model-fusion-v5-wigner-so2"
 SO2_BLOCK_GEMM_VERSION = "opt4-model-fusion-v6-so2-block-gemm"
 SO3_WEIGHT_CACHE_VERSION = "opt4-model-fusion-v7-so3-weight-cache"
+SO2_PREPARE_BACKWARD_REDUCE_VERSION = (
+    "opt4-model-fusion-v8-so2-prepare-backward-reduce"
+)
 SO2_KERNEL_BLOCK = 512
 SUPPORTED_FUSIONS = (
     "gather-wigner",
@@ -53,6 +56,7 @@ SUPPORTED_FUSIONS = (
     "wigner-so2-bridge",
     "so2-block-gemm",
     "so3-weight-cache",
+    "so2-prepare-backward-reduce",
 )
 
 
@@ -103,6 +107,14 @@ def parse_model_fusions(value: str | Iterable[str]) -> tuple[str, ...]:
     ):
         raise UnsupportedFusionConfigError(
             "so2-block-gemm requires so2-epilogue to be requested explicitly"
+        )
+    if (
+        "so2-prepare-backward-reduce" in requested_set
+        and not {"so2-epilogue", "so2-gate-bridge"}.issubset(requested_set)
+    ):
+        raise UnsupportedFusionConfigError(
+            "so2-prepare-backward-reduce requires so2-epilogue and "
+            "so2-gate-bridge to be requested explicitly"
         )
     if {"so3-mlp", "so3-weight-cache"}.issubset(requested_set):
         raise UnsupportedFusionConfigError(
@@ -785,6 +797,159 @@ if triton is not None:
         # exactly one output coefficient.  A direct store avoids an unnecessary
         # zero-fill and atomic operation on the feature gradient.
         tl.store(grad_x_ptr + source_offset, grad, mask=active)
+
+    @triton.jit
+    def _so2_prepare_backward_reduce_kernel(
+        grad_m0_ptr,
+        grad_m1_ptr,
+        grad_m2_ptr,
+        x_ptr,
+        radial_ptr,
+        to_m_ptr,
+        grad_x_ptr,
+        grad_radial_ptr,
+        rows: tl.constexpr,
+        coefficients: tl.constexpr,
+        channels: tl.constexpr,
+        radial_channels: tl.constexpr,
+        use_radial: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Reduce the nine radial gradients per edge without atomics.
+
+        A program owns one edge and one lane owns one feature channel.  The
+        14 coefficient contributions are accumulated in registers before the
+        nine unique radial entries are written once.  Since no radial address
+        is shared by different edges or channels, direct stores are sufficient.
+        """
+        row = tl.program_id(0)
+        channel = tl.arange(0, block)
+        active = channel < channels
+        row_x = row * coefficients * channels
+        row_radial = row * radial_channels
+
+        radial_grad_0 = tl.zeros((block,), dtype=tl.float32)
+        radial_grad_1 = tl.zeros((block,), dtype=tl.float32)
+        radial_grad_2 = tl.zeros((block,), dtype=tl.float32)
+        radial_grad_3 = tl.zeros((block,), dtype=tl.float32)
+        radial_grad_4 = tl.zeros((block,), dtype=tl.float32)
+        radial_grad_5 = tl.zeros((block,), dtype=tl.float32)
+        radial_grad_6 = tl.zeros((block,), dtype=tl.float32)
+        radial_grad_7 = tl.zeros((block,), dtype=tl.float32)
+        radial_grad_8 = tl.zeros((block,), dtype=tl.float32)
+
+        for coefficient in range(coefficients):
+            source_coefficient = tl.load(to_m_ptr + coefficient)
+            source_offset = row_x + source_coefficient * channels + channel
+            if coefficient < 4:
+                grad = tl.load(
+                    grad_m0_ptr
+                    + row * 4 * channels
+                    + coefficient * channels
+                    + channel,
+                    mask=active,
+                    other=0.0,
+                )
+                radial_coefficient = coefficient
+            elif coefficient < 10:
+                grad = tl.load(
+                    grad_m1_ptr
+                    + row * 6 * channels
+                    + (coefficient - 4) * channels
+                    + channel,
+                    mask=active,
+                    other=0.0,
+                )
+                radial_coefficient = 4 + ((coefficient - 4) % 3)
+            else:
+                grad = tl.load(
+                    grad_m2_ptr
+                    + row * 4 * channels
+                    + (coefficient - 10) * channels
+                    + channel,
+                    mask=active,
+                    other=0.0,
+                )
+                radial_coefficient = 7 + ((coefficient - 10) % 2)
+
+            if use_radial:
+                radial_offset = (
+                    row_radial + radial_coefficient * channels + channel
+                )
+                x_value = tl.load(
+                    x_ptr + source_offset, mask=active, other=0.0
+                )
+                contribution = grad * x_value
+                if radial_coefficient == 0:
+                    radial_grad_0 += contribution
+                elif radial_coefficient == 1:
+                    radial_grad_1 += contribution
+                elif radial_coefficient == 2:
+                    radial_grad_2 += contribution
+                elif radial_coefficient == 3:
+                    radial_grad_3 += contribution
+                elif radial_coefficient == 4:
+                    radial_grad_4 += contribution
+                elif radial_coefficient == 5:
+                    radial_grad_5 += contribution
+                elif radial_coefficient == 6:
+                    radial_grad_6 += contribution
+                elif radial_coefficient == 7:
+                    radial_grad_7 += contribution
+                else:
+                    radial_grad_8 += contribution
+                radial_value = tl.load(
+                    radial_ptr + radial_offset, mask=active, other=0.0
+                )
+                grad *= radial_value
+            tl.store(grad_x_ptr + source_offset, grad, mask=active)
+
+        if use_radial:
+            tl.store(
+                grad_radial_ptr + row_radial + 0 * channels + channel,
+                radial_grad_0,
+                mask=active,
+            )
+            tl.store(
+                grad_radial_ptr + row_radial + 1 * channels + channel,
+                radial_grad_1,
+                mask=active,
+            )
+            tl.store(
+                grad_radial_ptr + row_radial + 2 * channels + channel,
+                radial_grad_2,
+                mask=active,
+            )
+            tl.store(
+                grad_radial_ptr + row_radial + 3 * channels + channel,
+                radial_grad_3,
+                mask=active,
+            )
+            tl.store(
+                grad_radial_ptr + row_radial + 4 * channels + channel,
+                radial_grad_4,
+                mask=active,
+            )
+            tl.store(
+                grad_radial_ptr + row_radial + 5 * channels + channel,
+                radial_grad_5,
+                mask=active,
+            )
+            tl.store(
+                grad_radial_ptr + row_radial + 6 * channels + channel,
+                radial_grad_6,
+                mask=active,
+            )
+            tl.store(
+                grad_radial_ptr + row_radial + 7 * channels + channel,
+                radial_grad_7,
+                mask=active,
+            )
+            tl.store(
+                grad_radial_ptr + row_radial + 8 * channels + channel,
+                radial_grad_8,
+                mask=active,
+            )
 
     @triton.jit
     def _wigner_so2_prepare_forward_kernel(
@@ -3129,6 +3294,43 @@ class _SO2Prepare(torch.autograd.Function):
         return grad_x, (grad_radial if ctx.use_radial else None), None, None, None
 
 
+class _SO2PrepareBackwardReduce(_SO2Prepare):
+    """KF14 SO2 prepare with an edge-local, non-atomic backward."""
+
+    @staticmethod
+    def backward(ctx, grad_m0: Tensor, grad_m1: Tensor, grad_m2: Tensor):
+        x, radial, to_m_index = ctx.saved_tensors
+        grad_m0 = grad_m0.contiguous()
+        grad_m1 = grad_m1.contiguous()
+        grad_m2 = grad_m2.contiguous()
+        grad_x = torch.empty_like(x)
+        grad_radial = torch.empty_like(radial)
+        if x.shape[0] > 0:
+            block = triton.next_power_of_2(x.shape[2])
+            if block not in (128, 256):
+                raise UnsupportedFusionConfigError(
+                    "SO2 prepare backward reduction supports 128 or 256 channels"
+                )
+            _so2_prepare_backward_reduce_kernel[(x.shape[0],)](
+                grad_m0,
+                grad_m1,
+                grad_m2,
+                x,
+                radial,
+                to_m_index,
+                grad_x,
+                grad_radial,
+                rows=x.shape[0],
+                coefficients=14,
+                channels=x.shape[2],
+                radial_channels=ctx.radial_channels,
+                use_radial=ctx.use_radial,
+                block=block,
+                num_warps=8 if block == 256 else 4,
+            )
+        return grad_x, (grad_radial if ctx.use_radial else None), None, None, None
+
+
 class _SO2Epilogue(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -3814,7 +4016,11 @@ class FusedSO2Convolution(nn.Module):
     """
 
     def __init__(
-        self, original: SO2_Convolution, *, block_gemm: bool = False
+        self,
+        original: SO2_Convolution,
+        *,
+        block_gemm: bool = False,
+        prepare_backward_reduce: bool = False,
     ) -> None:
         super().__init__()
         if not isinstance(original, SO2_Convolution):
@@ -3874,6 +4080,7 @@ class FusedSO2Convolution(nn.Module):
         self.fc_m0 = original.fc_m0
         self.so2_m_conv = original.so2_m_conv
         self.block_gemm = bool(block_gemm)
+        self.prepare_backward_reduce = bool(prepare_backward_reduce)
         self.so2_block_linear = nn.ModuleList()
         if self.block_gemm:
             self.so2_block_linear.extend(
@@ -3923,7 +4130,12 @@ class FusedSO2Convolution(nn.Module):
         else:
             radial = x.new_empty((x.shape[0], 0))
             use_radial = False
-        return _SO2Prepare.apply(
+        prepare = (
+            _SO2PrepareBackwardReduce
+            if self.prepare_backward_reduce
+            else _SO2Prepare
+        )
+        return prepare.apply(
             x.contiguous(), radial, self.to_m_index, use_radial, self.radial_channels
         )
 
@@ -4478,6 +4690,9 @@ class FusionMetadata:
     so3_weight_cache_expanded_weight_count: int
     so3_weight_cache_bytes: int
     so3_weight_cache_version: str
+    so2_prepare_backward_reduce_replacements: int
+    so2_prepare_backward_reduce_kernel_count: int
+    so2_prepare_backward_reduce_version: str
     configure_wall_time_s: float
     torch_version: str
     triton_version: str
@@ -4536,6 +4751,15 @@ class FusionMetadata:
             ),
             "model_fusion_so3_weight_cache_bytes": self.so3_weight_cache_bytes,
             "model_fusion_so3_weight_cache_version": self.so3_weight_cache_version,
+            "model_fusion_so2_prepare_backward_reduce_replacements": (
+                self.so2_prepare_backward_reduce_replacements
+            ),
+            "model_fusion_so2_prepare_backward_reduce_kernel_count": (
+                self.so2_prepare_backward_reduce_kernel_count
+            ),
+            "model_fusion_so2_prepare_backward_reduce_version": (
+                self.so2_prepare_backward_reduce_version
+            ),
             "model_fusion_configure_wall_time_s": self.configure_wall_time_s,
             "model_fusion_torch_version": self.torch_version,
             "model_fusion_triton_version": self.triton_version,
@@ -4606,6 +4830,7 @@ def configure_esen_30m_model_fusions(
     wigner_so2_bridge = "wigner-so2-bridge" in selected
     so2_block_gemm = "so2-block-gemm" in selected
     so3_weight_cache = "so3-weight-cache" in selected
+    so2_prepare_backward_reduce = "so2-prepare-backward-reduce" in selected
     edgewise_count = 0
     edge_embedding_count = 0
     rmsnorm_count = 0
@@ -4619,6 +4844,7 @@ def configure_esen_30m_model_fusions(
     so2_block_gemm_count = 0
     so3_weight_cache_count = 0
     so3_weight_cache_bytes = 0
+    so2_prepare_backward_reduce_count = 0
 
     # radial-mlp first: the FusedEdgewise / FusedEdgeDegreeEmbedding wrappers
     # installed below hold references to these rad_func objects.
@@ -4657,12 +4883,16 @@ def configure_esen_30m_model_fusions(
             if not isinstance(block.edge_wise.so2_conv_2, SO2_Convolution):
                 raise UnsupportedFusionConfigError("Unexpected SO2 convolution 2 implementation")
             block.edge_wise.so2_conv_1 = FusedSO2Convolution(
-                block.edge_wise.so2_conv_1, block_gemm=so2_block_gemm
+                block.edge_wise.so2_conv_1,
+                block_gemm=so2_block_gemm,
+                prepare_backward_reduce=so2_prepare_backward_reduce,
             )
             block.edge_wise.so2_conv_2 = FusedSO2Convolution(
                 block.edge_wise.so2_conv_2, block_gemm=so2_block_gemm
             )
             so2_count += 2
+            if so2_prepare_backward_reduce:
+                so2_prepare_backward_reduce_count += 1
             if so2_block_gemm:
                 so2_block_gemm_count += 2
 
@@ -4697,6 +4927,15 @@ def configure_esen_30m_model_fusions(
         raise UnsupportedFusionConfigError(
             "SO2 block GEMM must replace all 20 Edgewise convolutions, replaced "
             f"{so2_block_gemm_count}"
+        )
+    if (
+        so2_prepare_backward_reduce
+        and so2_prepare_backward_reduce_count != 10
+    ):
+        raise UnsupportedFusionConfigError(
+            "SO2 prepare backward reduction must replace conv1 in all 10 "
+            "Edgewise blocks, replaced "
+            f"{so2_prepare_backward_reduce_count}"
         )
 
     if "rmsnorm" in selected:
@@ -4806,6 +5045,17 @@ def configure_esen_30m_model_fusions(
         so3_weight_cache_bytes=so3_weight_cache_bytes,
         so3_weight_cache_version=(
             SO3_WEIGHT_CACHE_VERSION if so3_weight_cache else ""
+        ),
+        so2_prepare_backward_reduce_replacements=(
+            so2_prepare_backward_reduce_count
+        ),
+        so2_prepare_backward_reduce_kernel_count=(
+            so2_prepare_backward_reduce_count
+        ),
+        so2_prepare_backward_reduce_version=(
+            SO2_PREPARE_BACKWARD_REDUCE_VERSION
+            if so2_prepare_backward_reduce
+            else ""
         ),
         configure_wall_time_s=time.perf_counter() - start,
         torch_version=torch.__version__,
