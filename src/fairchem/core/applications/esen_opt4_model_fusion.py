@@ -43,6 +43,9 @@ SO2_PREPARE_BACKWARD_REDUCE_VERSION = (
     "opt4-model-fusion-v8-so2-prepare-backward-reduce"
 )
 WIGNER_SO2_HYBRID_KERNEL_VERSION = "opt4-model-fusion-v9-wigner-so2-hybrid"
+WIGNER_SO2_TILED_BACKWARD_KERNEL_VERSION = (
+    "opt4-model-fusion-v10-wigner-so2-tiled-backward"
+)
 SO2_KERNEL_BLOCK = 512
 SUPPORTED_FUSIONS = (
     "gather-wigner",
@@ -56,6 +59,7 @@ SUPPORTED_FUSIONS = (
     "so2-gate-bridge",
     "wigner-so2-bridge",
     "wigner-so2-hybrid",
+    "wigner-so2-tiled-backward",
     "so2-block-gemm",
     "so3-weight-cache",
     "so2-prepare-backward-reduce",
@@ -119,6 +123,25 @@ def parse_model_fusions(value: str | Iterable[str]) -> tuple[str, ...]:
         raise UnsupportedFusionConfigError(
             "wigner-so2-hybrid is mutually exclusive with gather-wigner "
             "and wigner-so2-bridge"
+        )
+    if "wigner-so2-tiled-backward" in requested_set and not {
+        "so2-epilogue",
+        "so2-gate-bridge",
+        "so2-prepare-backward-reduce",
+    }.issubset(requested_set):
+        raise UnsupportedFusionConfigError(
+            "wigner-so2-tiled-backward requires so2-epilogue, "
+            "so2-gate-bridge and so2-prepare-backward-reduce to be "
+            "requested explicitly"
+        )
+    if "wigner-so2-tiled-backward" in requested_set and {
+        "gather-wigner",
+        "wigner-so2-bridge",
+        "wigner-so2-hybrid",
+    }.intersection(requested_set):
+        raise UnsupportedFusionConfigError(
+            "wigner-so2-tiled-backward is mutually exclusive with "
+            "gather-wigner, wigner-so2-bridge and wigner-so2-hybrid"
         )
     if (
         "so2-block-gemm" in requested_set
@@ -1434,6 +1457,306 @@ if triton is not None:
             + radial_coefficient * input_channels
             + channel2,
             grad * rotated,
+            mask=active,
+        )
+
+    @triton.jit
+    def _wigner_so2_tiled_backward_x_kernel(
+        grad_m0_ptr,
+        grad_m1_ptr,
+        grad_m2_ptr,
+        source_ptr,
+        target_ptr,
+        wigner_ptr,
+        out_mask_ptr,
+        to_m_ptr,
+        radial_ptr,
+        grad_x_ptr,
+        node_channels: tl.constexpr,
+        full_coefficients: tl.constexpr,
+        input_channels: tl.constexpr,
+        radial_channels: tl.constexpr,
+        block_channels: tl.constexpr,
+        input_tile: tl.constexpr,
+    ):
+        """KF16 dX: group four Wigner input coefficients per program."""
+        edge = tl.program_id(0)
+        tile = tl.program_id(1)
+        full_in = tile * input_tile + tl.arange(0, input_tile)
+        channel2 = tl.arange(0, block_channels)
+        full_active = full_in < full_coefficients
+        channel_active = channel2 < input_channels
+        source_half = channel2 < node_channels
+        channel = channel2 % node_channels
+        source = tl.load(source_ptr + edge)
+        target = tl.load(target_ptr + edge)
+        node = tl.where(source_half, source, target)
+        total = tl.zeros((input_tile, block_channels), tl.float32)
+        for coefficient in range(14):
+            if coefficient < 4:
+                grad = tl.load(
+                    grad_m0_ptr
+                    + edge * 4 * input_channels
+                    + coefficient * input_channels
+                    + channel2,
+                    mask=channel_active,
+                    other=0.0,
+                )
+                radial_coefficient = coefficient
+            elif coefficient < 10:
+                grad = tl.load(
+                    grad_m1_ptr
+                    + edge * 6 * input_channels
+                    + (coefficient - 4) * input_channels
+                    + channel2,
+                    mask=channel_active,
+                    other=0.0,
+                )
+                radial_coefficient = 4 + ((coefficient - 4) % 3)
+            else:
+                grad = tl.load(
+                    grad_m2_ptr
+                    + edge * 4 * input_channels
+                    + (coefficient - 10) * input_channels
+                    + channel2,
+                    mask=channel_active,
+                    other=0.0,
+                )
+                radial_coefficient = 7 + ((coefficient - 10) % 2)
+            radial = tl.load(
+                radial_ptr
+                + edge * radial_channels
+                + radial_coefficient * input_channels
+                + channel2,
+                mask=channel_active,
+                other=0.0,
+            )
+            reduced = tl.load(to_m_ptr + coefficient)
+            full_out = tl.load(out_mask_ptr + reduced)
+            weight = tl.load(
+                wigner_ptr
+                + edge * full_coefficients * full_coefficients
+                + full_out * full_coefficients
+                + full_in[:, None],
+                mask=full_active[:, None],
+                other=0.0,
+            )
+            total += weight * (grad * radial)[None, :]
+        grad_offset = (
+            node[None, :] * full_coefficients * node_channels
+            + full_in[:, None] * node_channels
+            + channel[None, :]
+        )
+        tl.atomic_add(
+            grad_x_ptr + grad_offset,
+            total,
+            mask=full_active[:, None] & channel_active[None, :],
+        )
+
+    @triton.jit
+    def _wigner_so2_tiled_backward_w_kernel(
+        grad_m0_ptr,
+        grad_m1_ptr,
+        grad_m2_ptr,
+        x_ptr,
+        source_ptr,
+        target_ptr,
+        out_mask_ptr,
+        to_m_ptr,
+        radial_ptr,
+        grad_wigner_ptr,
+        node_channels: tl.constexpr,
+        full_coefficients: tl.constexpr,
+        input_channels: tl.constexpr,
+        radial_channels: tl.constexpr,
+        block_channels: tl.constexpr,
+        input_tile: tl.constexpr,
+    ):
+        """KF16 dW: reduce four Wigner columns in one tiled program."""
+        edge = tl.program_id(0)
+        coefficient = tl.program_id(1)
+        tile = tl.program_id(2)
+        full_in = tile * input_tile + tl.arange(0, input_tile)
+        channel2 = tl.arange(0, block_channels)
+        full_active = full_in < full_coefficients
+        channel_active = channel2 < input_channels
+        source_half = channel2 < node_channels
+        channel = channel2 % node_channels
+        source = tl.load(source_ptr + edge)
+        target = tl.load(target_ptr + edge)
+        node = tl.where(source_half, source, target)
+        grad0 = tl.load(
+            grad_m0_ptr
+            + edge * 4 * input_channels
+            + coefficient * input_channels
+            + channel2,
+            mask=channel_active & (coefficient < 4),
+            other=0.0,
+        )
+        grad1 = tl.load(
+            grad_m1_ptr
+            + edge * 6 * input_channels
+            + (coefficient - 4) * input_channels
+            + channel2,
+            mask=channel_active & (coefficient >= 4) & (coefficient < 10),
+            other=0.0,
+        )
+        grad2 = tl.load(
+            grad_m2_ptr
+            + edge * 4 * input_channels
+            + (coefficient - 10) * input_channels
+            + channel2,
+            mask=channel_active & (coefficient >= 10),
+            other=0.0,
+        )
+        grad = tl.where(
+            coefficient < 4,
+            grad0,
+            tl.where(coefficient < 10, grad1, grad2),
+        )
+        radial_coefficient = tl.where(
+            coefficient < 4,
+            coefficient,
+            tl.where(
+                coefficient < 10,
+                4 + ((coefficient - 4) % 3),
+                7 + ((coefficient - 10) % 2),
+            ),
+        )
+        radial = tl.load(
+            radial_ptr
+            + edge * radial_channels
+            + radial_coefficient * input_channels
+            + channel2,
+            mask=channel_active,
+            other=0.0,
+        )
+        feature = tl.load(
+            x_ptr
+            + node[None, :] * full_coefficients * node_channels
+            + full_in[:, None] * node_channels
+            + channel[None, :],
+            mask=full_active[:, None] & channel_active[None, :],
+            other=0.0,
+        )
+        reduced = tl.load(to_m_ptr + coefficient)
+        full_out = tl.load(out_mask_ptr + reduced)
+        value = tl.sum(feature * (grad * radial)[None, :], axis=1)
+        tl.store(
+            grad_wigner_ptr
+            + edge * full_coefficients * full_coefficients
+            + full_out * full_coefficients
+            + full_in,
+            value,
+            mask=full_active,
+        )
+
+    @triton.jit
+    def _wigner_so2_tiled_backward_radial_kernel(
+        grad_m0_ptr,
+        grad_m1_ptr,
+        grad_m2_ptr,
+        x_ptr,
+        source_ptr,
+        target_ptr,
+        wigner_ptr,
+        out_mask_ptr,
+        to_m_ptr,
+        grad_radial_ptr,
+        node_channels: tl.constexpr,
+        full_coefficients: tl.constexpr,
+        input_channels: tl.constexpr,
+        radial_channels: tl.constexpr,
+        block_channels: tl.constexpr,
+    ):
+        """KF16 dRadial: merge duplicate m rows without atomic updates."""
+        edge = tl.program_id(0)
+        radial_coefficient = tl.program_id(1)
+        channel2 = tl.arange(0, block_channels)
+        active = channel2 < input_channels
+        source_half = channel2 < node_channels
+        channel = channel2 % node_channels
+        source = tl.load(source_ptr + edge)
+        target = tl.load(target_ptr + edge)
+        node = tl.where(source_half, source, target)
+        coefficient0 = tl.where(
+            radial_coefficient < 7,
+            radial_coefficient,
+            radial_coefficient + 3,
+        )
+        coefficient1 = tl.where(
+            radial_coefficient < 4,
+            -1,
+            tl.where(
+                radial_coefficient < 7,
+                radial_coefficient + 3,
+                radial_coefficient + 5,
+            ),
+        )
+        total = tl.zeros((block_channels,), tl.float32)
+        for pair in range(2):
+            if pair == 0:
+                coefficient = coefficient0
+            else:
+                coefficient = coefficient1
+            pair_active = active & (coefficient >= 0)
+            reduced = tl.load(to_m_ptr + coefficient, mask=coefficient >= 0, other=0)
+            full_out = tl.load(out_mask_ptr + reduced, mask=coefficient >= 0, other=0)
+            rotated = tl.zeros((block_channels,), tl.float32)
+            for full_in in range(full_coefficients):
+                weight = tl.load(
+                    wigner_ptr
+                    + edge * full_coefficients * full_coefficients
+                    + full_out * full_coefficients
+                    + full_in,
+                    mask=coefficient >= 0,
+                    other=0.0,
+                )
+                feature = tl.load(
+                    x_ptr
+                    + node * full_coefficients * node_channels
+                    + full_in * node_channels
+                    + channel,
+                    mask=pair_active,
+                    other=0.0,
+                )
+                rotated += weight * feature
+            grad0 = tl.load(
+                grad_m0_ptr
+                + edge * 4 * input_channels
+                + coefficient * input_channels
+                + channel2,
+                mask=pair_active & (coefficient < 4),
+                other=0.0,
+            )
+            grad1 = tl.load(
+                grad_m1_ptr
+                + edge * 6 * input_channels
+                + (coefficient - 4) * input_channels
+                + channel2,
+                mask=pair_active & (coefficient >= 4) & (coefficient < 10),
+                other=0.0,
+            )
+            grad2 = tl.load(
+                grad_m2_ptr
+                + edge * 4 * input_channels
+                + (coefficient - 10) * input_channels
+                + channel2,
+                mask=pair_active & (coefficient >= 10),
+                other=0.0,
+            )
+            grad = tl.where(
+                coefficient < 4,
+                grad0,
+                tl.where(coefficient < 10, grad1, grad2),
+            )
+            total += grad * rotated
+        tl.store(
+            grad_radial_ptr
+            + edge * radial_channels
+            + radial_coefficient * input_channels
+            + channel2,
+            total,
             mask=active,
         )
 
@@ -3347,6 +3670,95 @@ class _WignerSO2Prepare(torch.autograd.Function):
         return grad_x, None, grad_wigner, None, grad_radial, None
 
 
+class _WignerSO2TiledBackward(_WignerSO2Prepare):
+    """KF16 no-intermediate forward with coarser tiled backward programs."""
+
+    @staticmethod
+    def backward(ctx, grad_m0: Tensor, grad_m1: Tensor, grad_m2: Tensor):
+        (
+            x,
+            source_index,
+            target_index,
+            wigner,
+            out_mask,
+            radial,
+            to_m_index,
+        ) = ctx.saved_tensors
+        edges = source_index.numel()
+        if grad_m0 is None:
+            grad_m0 = x.new_zeros((edges, 1024))
+        if grad_m1 is None:
+            grad_m1 = x.new_zeros((edges, 2, 768))
+        if grad_m2 is None:
+            grad_m2 = x.new_zeros((edges, 2, 512))
+        grad_m0 = grad_m0.contiguous()
+        grad_m1 = grad_m1.contiguous()
+        grad_m2 = grad_m2.contiguous()
+        grad_x = torch.zeros_like(x)
+        grad_wigner = torch.zeros_like(wigner)
+        grad_radial = torch.empty_like(radial)
+        if edges > 0:
+            input_tile = 4
+            input_tiles = triton.cdiv(16, input_tile)
+            _wigner_so2_tiled_backward_x_kernel[(edges, input_tiles)](
+                grad_m0,
+                grad_m1,
+                grad_m2,
+                source_index,
+                target_index,
+                wigner,
+                out_mask,
+                to_m_index,
+                radial,
+                grad_x,
+                node_channels=128,
+                full_coefficients=16,
+                input_channels=256,
+                radial_channels=2304,
+                block_channels=256,
+                input_tile=input_tile,
+                num_warps=8,
+            )
+            _wigner_so2_tiled_backward_w_kernel[(edges, 14, input_tiles)](
+                grad_m0,
+                grad_m1,
+                grad_m2,
+                x,
+                source_index,
+                target_index,
+                out_mask,
+                to_m_index,
+                radial,
+                grad_wigner,
+                node_channels=128,
+                full_coefficients=16,
+                input_channels=256,
+                radial_channels=2304,
+                block_channels=256,
+                input_tile=input_tile,
+                num_warps=8,
+            )
+            _wigner_so2_tiled_backward_radial_kernel[(edges, 9)](
+                grad_m0,
+                grad_m1,
+                grad_m2,
+                x,
+                source_index,
+                target_index,
+                wigner,
+                out_mask,
+                to_m_index,
+                grad_radial,
+                node_channels=128,
+                full_coefficients=16,
+                input_channels=256,
+                radial_channels=2304,
+                block_channels=256,
+                num_warps=8,
+            )
+        return grad_x, None, grad_wigner, None, grad_radial, None
+
+
 class _SO2Prepare(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -4588,6 +5000,25 @@ def wigner_so2_hybrid(
     )
 
 
+def wigner_so2_tiled_backward(
+    x: Tensor,
+    edge_index: Tensor,
+    wigner: Tensor,
+    out_mask: Tensor,
+    radial: Tensor,
+    to_m_index: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Run KF16's no-intermediate forward and tiled first-order backward."""
+    return _WignerSO2TiledBackward.apply(
+        x,
+        edge_index,
+        wigner,
+        out_mask,
+        radial,
+        to_m_index,
+    )
+
+
 def reverse_envelope_scatter(
     message: Tensor,
     wigner_inv: Tensor,
@@ -4661,6 +5092,7 @@ class FusedEdgewise(nn.Module):
         so2_gate_bridge: bool = False,
         wigner_so2_bridge: bool = False,
         wigner_so2_hybrid: bool = False,
+        wigner_so2_tiled_backward: bool = False,
     ) -> None:
         super().__init__()
         self.sphere_channels = original.sphere_channels
@@ -4684,13 +5116,22 @@ class FusedEdgewise(nn.Module):
         self.fuse_so2_gate_bridge = so2_gate_bridge
         self.fuse_wigner_so2_bridge = wigner_so2_bridge
         self.fuse_wigner_so2_hybrid = wigner_so2_hybrid
-        if (wigner_so2_bridge or wigner_so2_hybrid) and not so2_gate_bridge:
+        self.fuse_wigner_so2_tiled_backward = wigner_so2_tiled_backward
+        producer_fusions = sum(
+            bool(value)
+            for value in (
+                wigner_so2_bridge,
+                wigner_so2_hybrid,
+                wigner_so2_tiled_backward,
+            )
+        )
+        if producer_fusions and not so2_gate_bridge:
             raise UnsupportedFusionConfigError(
                 "Wigner/SO2 producer fusion requires the SO2 gate bridge"
             )
-        if wigner_so2_bridge and wigner_so2_hybrid:
+        if producer_fusions > 1:
             raise UnsupportedFusionConfigError(
-                "Wigner/SO2 bridge and hybrid are mutually exclusive"
+                "Wigner/SO2 producer fusions are mutually exclusive"
             )
         if so2_gate_bridge:
             if not isinstance(self.act, GateActivation):
@@ -4706,12 +5147,17 @@ class FusedEdgewise(nn.Module):
     def forward(self, x, x_edge, edge_distance, edge_index, wigner, wigner_inv, node_offset: int = 0):
         out_mask = self.out_mask.to(device=x.device)
         if self.fuse_so2_gate_bridge:
-            if self.fuse_wigner_so2_bridge or self.fuse_wigner_so2_hybrid:
-                producer = (
-                    wigner_so2_hybrid
-                    if self.fuse_wigner_so2_hybrid
-                    else wigner_so2_prepare
-                )
+            if (
+                self.fuse_wigner_so2_bridge
+                or self.fuse_wigner_so2_hybrid
+                or self.fuse_wigner_so2_tiled_backward
+            ):
+                if self.fuse_wigner_so2_tiled_backward:
+                    producer = wigner_so2_tiled_backward
+                elif self.fuse_wigner_so2_hybrid:
+                    producer = wigner_so2_hybrid
+                else:
+                    producer = wigner_so2_prepare
                 prepared = producer(
                     x.contiguous(),
                     edge_index.contiguous(),
@@ -5020,6 +5466,11 @@ class FusionMetadata:
     wigner_so2_hybrid_backward_reduce_kernel_count: int
     wigner_so2_hybrid_backward_cublas_bmm_count: int
     wigner_so2_hybrid_kernel_version: str
+    wigner_so2_tiled_backward_replacements: int
+    wigner_so2_tiled_backward_forward_kernel_count: int
+    wigner_so2_tiled_backward_kernel_count: int
+    wigner_so2_tiled_backward_input_tile: int
+    wigner_so2_tiled_backward_kernel_version: str
     so2_block_gemm_convolution_replacements: int
     so2_block_gemm_linear_replacements: int
     so2_block_gemm_version: str
@@ -5087,6 +5538,21 @@ class FusionMetadata:
             ),
             "model_fusion_wigner_so2_hybrid_kernel_version": (
                 self.wigner_so2_hybrid_kernel_version
+            ),
+            "model_fusion_wigner_so2_tiled_backward_replacements": (
+                self.wigner_so2_tiled_backward_replacements
+            ),
+            "model_fusion_wigner_so2_tiled_backward_forward_kernel_count": (
+                self.wigner_so2_tiled_backward_forward_kernel_count
+            ),
+            "model_fusion_wigner_so2_tiled_backward_kernel_count": (
+                self.wigner_so2_tiled_backward_kernel_count
+            ),
+            "model_fusion_wigner_so2_tiled_backward_input_tile": (
+                self.wigner_so2_tiled_backward_input_tile
+            ),
+            "model_fusion_wigner_so2_tiled_backward_kernel_version": (
+                self.wigner_so2_tiled_backward_kernel_version
             ),
             "model_fusion_so2_block_gemm_convolution_replacements": (
                 self.so2_block_gemm_convolution_replacements
@@ -5181,6 +5647,7 @@ def configure_esen_30m_model_fusions(
     so2_gate_bridge = "so2-gate-bridge" in selected
     wigner_so2_bridge = "wigner-so2-bridge" in selected
     wigner_so2_hybrid = "wigner-so2-hybrid" in selected
+    wigner_so2_tiled_backward = "wigner-so2-tiled-backward" in selected
     so2_block_gemm = "so2-block-gemm" in selected
     so3_weight_cache = "so3-weight-cache" in selected
     so2_prepare_backward_reduce = "so2-prepare-backward-reduce" in selected
@@ -5195,6 +5662,7 @@ def configure_esen_30m_model_fusions(
     so2_gate_bridge_count = 0
     wigner_so2_bridge_count = 0
     wigner_so2_hybrid_count = 0
+    wigner_so2_tiled_backward_count = 0
     so2_block_gemm_count = 0
     so3_weight_cache_count = 0
     so3_weight_cache_bytes = 0
@@ -5262,6 +5730,7 @@ def configure_esen_30m_model_fusions(
                 so2_gate_bridge=so2_gate_bridge,
                 wigner_so2_bridge=wigner_so2_bridge,
                 wigner_so2_hybrid=wigner_so2_hybrid,
+                wigner_so2_tiled_backward=wigner_so2_tiled_backward,
             )
             edgewise_count += 1
             if so2_gate_bridge:
@@ -5270,6 +5739,8 @@ def configure_esen_30m_model_fusions(
                 wigner_so2_bridge_count += 1
             if wigner_so2_hybrid:
                 wigner_so2_hybrid_count += 1
+            if wigner_so2_tiled_backward:
+                wigner_so2_tiled_backward_count += 1
     if so2_gate_bridge and so2_gate_bridge_count != 10:
         raise UnsupportedFusionConfigError(
             "SO2 gate bridge must replace all 10 Edgewise blocks, replaced "
@@ -5284,6 +5755,14 @@ def configure_esen_30m_model_fusions(
         raise UnsupportedFusionConfigError(
             "Wigner/SO2 hybrid must replace all 10 Edgewise blocks, replaced "
             f"{wigner_so2_hybrid_count}"
+        )
+    if (
+        wigner_so2_tiled_backward
+        and wigner_so2_tiled_backward_count != 10
+    ):
+        raise UnsupportedFusionConfigError(
+            "Wigner/SO2 tiled backward must replace all 10 Edgewise blocks, "
+            f"replaced {wigner_so2_tiled_backward_count}"
         )
     if so2_block_gemm and so2_block_gemm_count != 20:
         raise UnsupportedFusionConfigError(
@@ -5383,6 +5862,7 @@ def configure_esen_30m_model_fusions(
             - so2_gate_bridge_count
             - wigner_so2_bridge_count
             - wigner_so2_hybrid_count
+            - wigner_so2_tiled_backward_count
         ),
         so2_epilogue_kernel_count=so2_count - so2_gate_bridge_count,
         so2_fusion_kernel_version=(SO2_FUSION_KERNEL_VERSION if so2 else ""),
@@ -5409,6 +5889,24 @@ def configure_esen_30m_model_fusions(
         ),
         wigner_so2_hybrid_kernel_version=(
             WIGNER_SO2_HYBRID_KERNEL_VERSION if wigner_so2_hybrid else ""
+        ),
+        wigner_so2_tiled_backward_replacements=(
+            wigner_so2_tiled_backward_count
+        ),
+        wigner_so2_tiled_backward_forward_kernel_count=(
+            wigner_so2_tiled_backward_count
+        ),
+        # dX, dWigner and dRadial are each one tiled kernel per Edgewise.
+        wigner_so2_tiled_backward_kernel_count=(
+            3 * wigner_so2_tiled_backward_count
+        ),
+        wigner_so2_tiled_backward_input_tile=(
+            4 if wigner_so2_tiled_backward else 0
+        ),
+        wigner_so2_tiled_backward_kernel_version=(
+            WIGNER_SO2_TILED_BACKWARD_KERNEL_VERSION
+            if wigner_so2_tiled_backward
+            else ""
         ),
         so2_block_gemm_convolution_replacements=so2_block_gemm_count,
         # Each convolution has one m=1 and one m=2 complex GEMM.

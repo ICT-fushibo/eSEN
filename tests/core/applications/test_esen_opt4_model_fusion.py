@@ -24,12 +24,14 @@ from fairchem.core.applications.esen_opt4_model_fusion import (
     _SO2PrepareBackwardReduce,
     _WignerSO2Hybrid,
     _WignerSO2Prepare,
+    _WignerSO2TiledBackward,
     gather_cat_wigner,
     model_fusion_available,
     parse_model_fusions,
     reverse_envelope_scatter,
     wigner_so2_prepare,
     wigner_so2_hybrid,
+    wigner_so2_tiled_backward,
     _energy_head_candidates,
     configure_esen_30m_model_fusions,
 )
@@ -252,6 +254,25 @@ def test_parse_model_fusions_is_ordered_and_strict():
         parse_model_fusions(
             "so2-epilogue,so2-gate-bridge,so2-prepare-backward-reduce,"
             "wigner-so2-bridge,wigner-so2-hybrid"
+        )
+    assert parse_model_fusions(
+        "wigner-so2-tiled-backward,so2-prepare-backward-reduce,"
+        "so2-gate-bridge,so2-epilogue"
+    ) == (
+        "so2-epilogue",
+        "so2-gate-bridge",
+        "wigner-so2-tiled-backward",
+        "so2-prepare-backward-reduce",
+    )
+    with pytest.raises(
+        UnsupportedFusionConfigError,
+        match="requires so2-epilogue",
+    ):
+        parse_model_fusions("wigner-so2-tiled-backward")
+    with pytest.raises(UnsupportedFusionConfigError, match="mutually exclusive"):
+        parse_model_fusions(
+            "so2-epilogue,so2-gate-bridge,so2-prepare-backward-reduce,"
+            "wigner-so2-hybrid,wigner-so2-tiled-backward"
         )
     assert parse_model_fusions(
         "so3-weight-cache,so2-block-gemm,so2-gate-bridge,so2-epilogue"
@@ -544,8 +565,8 @@ def test_so2_block_gate_bridge_forward_and_gradients_match_torch():
 @pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
 @pytest.mark.parametrize(
     "producer",
-    (wigner_so2_prepare, wigner_so2_hybrid),
-    ids=("kf11", "kf15-hybrid"),
+    (wigner_so2_prepare, wigner_so2_hybrid, wigner_so2_tiled_backward),
+    ids=("kf11", "kf15-hybrid", "kf16-tiled-backward"),
 )
 def test_wigner_so2_prepare_forward_and_gradients_match_torch(producer):
     torch.manual_seed(42)
@@ -624,8 +645,8 @@ def test_wigner_so2_prepare_forward_and_gradients_match_torch(producer):
 @pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
 @pytest.mark.parametrize(
     "producer",
-    (_WignerSO2Prepare, _WignerSO2Hybrid),
-    ids=("kf11", "kf15-hybrid"),
+    (_WignerSO2Prepare, _WignerSO2Hybrid, _WignerSO2TiledBackward),
+    ids=("kf11", "kf15-hybrid", "kf16-tiled-backward"),
 )
 def test_wigner_so2_prepare_accepts_empty_edges(producer):
     mapping = CoefficientMapping(3, 2).cuda()
@@ -655,8 +676,8 @@ def test_wigner_so2_prepare_accepts_empty_edges(producer):
 @pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
 @pytest.mark.parametrize(
     "producer",
-    (wigner_so2_prepare, wigner_so2_hybrid),
-    ids=("kf11", "kf15-hybrid"),
+    (wigner_so2_prepare, wigner_so2_hybrid, wigner_so2_tiled_backward),
+    ids=("kf11", "kf15-hybrid", "kf16-tiled-backward"),
 )
 def test_wigner_so2_prepare_is_cuda_graph_capture_safe(producer):
     torch.manual_seed(42)

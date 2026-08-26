@@ -202,6 +202,12 @@ def main() -> int:
         and row.get("fusion_stage") == args.candidate_stage
     ]
     base_records = records_by_stage[args.base_stage]
+    base_statuses = [
+        row
+        for row in statuses
+        if row.get("scope", args.scope) == args.scope
+        and row.get("fusion_stage") == args.base_stage
+    ]
 
     def _tf32_configuration_ok(
         stage_records: list[dict[str, object]], *, enabled: bool
@@ -261,10 +267,54 @@ def main() -> int:
             int(row.get("repeat", 1)),
         )
 
-    candidate_keys = {record_key(record) for record in candidate_records}
-    base_keys = {record_key(record) for record in base_records}
-    candidate_status_keys = {status_key(row) for row in candidate_statuses}
-    coverage_ok = bool(candidate_keys) and candidate_keys == base_keys == candidate_status_keys
+    candidate_status_by_key = {
+        status_key(row): row for row in candidate_statuses
+    }
+    base_status_by_key = {status_key(row): row for row in base_statuses}
+    # Large-system matrices can legitimately contain configurations that OOM
+    # for both sides of an A/B comparison.  Those pairs have no result JSON by
+    # construction and therefore cannot contribute timing, but they also do
+    # not indicate that the candidate introduced a regression.  Exclude only
+    # exact base/candidate OOM pairs.  Any asymmetric OOM or other hard status
+    # remains in the effective coverage and makes the selector fail.
+    symmetric_oom_keys = {
+        key
+        for key in set(candidate_status_by_key) & set(base_status_by_key)
+        if candidate_status_by_key[key].get("status") == "oom"
+        and base_status_by_key[key].get("status") == "oom"
+    }
+    candidate_keys = {
+        record_key(record) for record in candidate_records
+    } - symmetric_oom_keys
+    base_keys = {
+        record_key(record) for record in base_records
+    } - symmetric_oom_keys
+    effective_candidate_statuses = [
+        row
+        for row in candidate_statuses
+        if status_key(row) not in symmetric_oom_keys
+    ]
+    effective_base_statuses = [
+        row for row in base_statuses if status_key(row) not in symmetric_oom_keys
+    ]
+    candidate_status_keys = {
+        status_key(row) for row in effective_candidate_statuses
+    }
+    # Historical result directories sometimes contain only candidate rows in
+    # run_status.tsv.  Preserve support for those directories; whenever base
+    # rows are present, require their coverage and health as well.
+    base_status_keys = (
+        {status_key(row) for row in effective_base_statuses}
+        if base_statuses
+        else base_keys
+    )
+    coverage_ok = (
+        bool(candidate_keys)
+        and candidate_keys
+        == base_keys
+        == candidate_status_keys
+        == base_status_keys
+    )
     # Structural CUDA Graph health: graph wiring must be intact for the
     # timing comparison to be valid.  Energy/force-vs-baseline errors are
     # telemetry only and never gate acceptance.
@@ -276,6 +326,7 @@ def main() -> int:
         and int(record.get("cuda_graph_production_capture_count", 0)) == 0
         and float(record.get("cuda_graph_hit_rate", 1.0)) == 1.0
         for record in candidate_records
+        if record_key(record) not in symmetric_oom_keys
     )
     engineering_validation_ok = bool(candidate_records) and all(
         record.get("engineering_validation_pass") is not False
@@ -284,11 +335,20 @@ def main() -> int:
     # A legacy validation_failed row is non-fatal: the benchmark wrote a
     # complete result and the numerical mismatch is recorded in JSON. Hard
     # runtime failures still invalidate the timing comparison.
-    status_ok = bool(candidate_statuses) and coverage_ok and all(
+    candidate_status_ok = bool(effective_candidate_statuses) and all(
         row.get("status") in NON_FATAL_STATUSES
         and row.get("status") not in HARD_STATUSES
-        for row in candidate_statuses
+        for row in effective_candidate_statuses
     )
+    base_status_ok = not base_statuses or (
+        bool(effective_base_statuses)
+        and all(
+            row.get("status") in NON_FATAL_STATUSES
+            and row.get("status") not in HARD_STATUSES
+            for row in effective_base_statuses
+        )
+    )
+    status_ok = coverage_ok and candidate_status_ok and base_status_ok
     geomean = (
         math.exp(sum(math.log(row["speedup"]) for row in comparisons) / len(comparisons))
         if comparisons
@@ -407,6 +467,20 @@ def main() -> int:
         "maximum_peak_reserved_increase_gib": args.maximum_peak_reserved_increase_gib,
         "structural_ok": structural_ok,
         "coverage_ok": coverage_ok,
+        "partial_coverage": bool(symmetric_oom_keys),
+        "symmetric_oom_count": len(symmetric_oom_keys),
+        "symmetric_oom_tasks": [
+            {
+                "system": system,
+                "temperature_K": temperature,
+                "repeat": repeat,
+            }
+            for system, temperature, repeat in sorted(symmetric_oom_keys)
+        ],
+        "candidate_result_count": len(candidate_keys),
+        "base_result_count": len(base_keys),
+        "candidate_status_count": len(candidate_status_keys),
+        "base_status_count": len(base_status_keys),
         "engineering_validation_ok": engineering_validation_ok,
         "status_ok": status_ok,
         "stable": stable,

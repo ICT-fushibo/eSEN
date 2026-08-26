@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Counter-free CUDA Graph microbenchmark for the KF11 Wigner/SO2 bridge.
+"""Counter-free CUDA Graph microbenchmark for Wigner/SO2 producer variants.
 
 This diagnostic compares the Opt4-v4 Edgewise producer sequence
 
@@ -24,6 +24,7 @@ from fairchem.core.applications.esen_opt4_model_fusion import (
     model_fusion_available,
     wigner_so2_hybrid,
     wigner_so2_prepare,
+    wigner_so2_tiled_backward,
 )
 from fairchem.core.models.esen.common.so3 import CoefficientMapping
 
@@ -39,7 +40,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--system", choices=tuple(SYSTEM_SHAPES), required=True)
     parser.add_argument(
-        "--variant", choices=("base", "bridge", "hybrid"), required=True
+        "--variant",
+        choices=("base", "bridge", "hybrid", "tiled"),
+        required=True,
     )
     parser.add_argument(
         "--mode", choices=("forward", "forward-backward"), required=True
@@ -113,6 +116,22 @@ def make_hybrid(
     return forward
 
 
+def make_tiled(
+    x: torch.Tensor,
+    edge_index: torch.Tensor,
+    wigner: torch.Tensor,
+    out_mask: torch.Tensor,
+    radial: torch.Tensor,
+    to_m: torch.Tensor,
+):
+    def forward() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return wigner_so2_tiled_backward(
+            x, edge_index, wigner, out_mask, radial, to_m
+        )
+
+    return forward
+
+
 def capture(
     forward,
     inputs: tuple[torch.Tensor, ...],
@@ -146,7 +165,7 @@ def main() -> int:
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if args.variant in {"bridge", "hybrid"} and not model_fusion_available():
+    if args.variant in {"bridge", "hybrid", "tiled"} and not model_fusion_available():
         raise RuntimeError("The Triton model-fusion runtime is unavailable")
 
     torch.manual_seed(args.seed)
@@ -181,6 +200,7 @@ def main() -> int:
         "base": make_reference,
         "bridge": make_bridge,
         "hybrid": make_hybrid,
+        "tiled": make_tiled,
     }
     factory = factories[args.variant]
     forward = factory(x, edge_index, wigner, out_mask, radial, to_m)

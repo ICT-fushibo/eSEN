@@ -74,6 +74,23 @@ def _write_status_tsv(root: Path, scope: str, stage: str, status: str) -> None:
     (root / "run_status.tsv").write_text(header + "".join(rows), encoding="utf-8")
 
 
+def _status_row(
+    scope: str,
+    variant: str,
+    stage: str,
+    system: str,
+    temperature: int,
+    repeat: int,
+    status: str,
+) -> str:
+    exit_code = 0 if status in {"success", "validation_failed"} else 42
+    return (
+        f"{scope}\t{variant}\t{stage}\tgather-wigner\t{system}\t"
+        f"{temperature}\t{repeat}\trun_{stage}_{system}_{repeat}\t{status}\t"
+        f"{exit_code}\t1.0\n"
+    )
+
+
 def test_selector_accepts_stable_candidate_despite_validation_status(
     tmp_path, monkeypatch
 ):
@@ -402,3 +419,142 @@ def test_selector_can_require_tf32_on_for_both_stages(tmp_path, monkeypatch):
     assert result["accepted"] is True
     assert result["expected_tf32_mode"] == "on"
     assert result["precision_configuration_ok"] is True
+
+
+def test_selector_excludes_symmetric_oom_pairs_from_coverage(
+    tmp_path, monkeypatch
+):
+    module = _load_module()
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    status_rows = []
+    for repeat in range(1, 4):
+        for index, record in enumerate(
+            (
+                _record("OPT4V4_FP32", repeat, 1.0),
+                _record("KF16_FP32", repeat, 0.9),
+            )
+        ):
+            (result_dir / f"Cu32_{repeat}_{index}.json").write_text(
+                json.dumps(record), encoding="utf-8"
+            )
+        status_rows.extend(
+            (
+                _status_row(
+                    "whole-step", "base", "OPT4V4_FP32", "Cu32", 300,
+                    repeat, "success",
+                ),
+                _status_row(
+                    "whole-step", "candidate", "KF16_FP32", "Cu32", 300,
+                    repeat, "success",
+                ),
+                _status_row(
+                    "whole-step", "base", "OPT4V4_FP32", "H2O512", 300,
+                    repeat, "oom",
+                ),
+                _status_row(
+                    "whole-step", "candidate", "KF16_FP32", "H2O512", 300,
+                    repeat, "oom",
+                ),
+            )
+        )
+    header = (
+        "scope\tvariant\tfusion_stage\tmodel_fusions\tsystem\t"
+        "temperature_K\trepeat\trun_name\tstatus\texit_code\t"
+        "process_wall_time_s\n"
+    )
+    (tmp_path / "run_status.tsv").write_text(
+        header + "".join(status_rows), encoding="utf-8"
+    )
+    output = tmp_path / "selection.json"
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        [
+            str(SCRIPT), "--input-dir", str(tmp_path),
+            "--scope", "whole-step",
+            "--base-stage", "OPT4V4_FP32",
+            "--candidate-stage", "KF16_FP32",
+            "--candidate-fusion", "wigner-so2-tiled-backward",
+            "--min-paired-repeats", "3",
+            "--min-faster-directions", "3",
+            "--output", str(output),
+        ],
+    )
+    assert module.main() == 0
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["accepted"] is True
+    assert result["coverage_ok"] is True
+    assert result["status_ok"] is True
+    assert result["partial_coverage"] is True
+    assert result["symmetric_oom_count"] == 3
+    assert result["candidate_result_count"] == 3
+
+
+def test_selector_rejects_asymmetric_oom(tmp_path, monkeypatch):
+    module = _load_module()
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    status_rows = []
+    for repeat in range(1, 4):
+        for index, record in enumerate(
+            (
+                _record("OPT4V4_FP32", repeat, 1.0),
+                _record("KF16_FP32", repeat, 0.9),
+                _record(
+                    "OPT4V4_FP32", repeat, 2.0, system="H2O512"
+                ),
+            )
+        ):
+            (result_dir / f"{repeat}_{index}.json").write_text(
+                json.dumps(record), encoding="utf-8"
+            )
+        status_rows.extend(
+            (
+                _status_row(
+                    "whole-step", "base", "OPT4V4_FP32", "Cu32", 300,
+                    repeat, "success",
+                ),
+                _status_row(
+                    "whole-step", "candidate", "KF16_FP32", "Cu32", 300,
+                    repeat, "success",
+                ),
+                _status_row(
+                    "whole-step", "base", "OPT4V4_FP32", "H2O512", 300,
+                    repeat, "success",
+                ),
+                _status_row(
+                    "whole-step", "candidate", "KF16_FP32", "H2O512", 300,
+                    repeat, "oom",
+                ),
+            )
+        )
+    header = (
+        "scope\tvariant\tfusion_stage\tmodel_fusions\tsystem\t"
+        "temperature_K\trepeat\trun_name\tstatus\texit_code\t"
+        "process_wall_time_s\n"
+    )
+    (tmp_path / "run_status.tsv").write_text(
+        header + "".join(status_rows), encoding="utf-8"
+    )
+    output = tmp_path / "selection.json"
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        [
+            str(SCRIPT), "--input-dir", str(tmp_path),
+            "--scope", "whole-step",
+            "--base-stage", "OPT4V4_FP32",
+            "--candidate-stage", "KF16_FP32",
+            "--candidate-fusion", "wigner-so2-tiled-backward",
+            "--min-paired-repeats", "3",
+            "--min-faster-directions", "3",
+            "--output", str(output),
+        ],
+    )
+    assert module.main() == 1
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["accepted"] is False
+    assert result["coverage_ok"] is False
+    assert result["status_ok"] is False
+    assert result["symmetric_oom_count"] == 0
