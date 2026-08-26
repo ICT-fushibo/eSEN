@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run one Matbench system per job on GPUs idle for a sustained interval.
 
-Each job runs baseline, Opt1, Opt2, and Opt3 serially on one physical GPU so
+Each job runs the requested baseline/Opt1/Opt2/Opt3/Opt4 set on one GPU so
 per-system speedups remain same-GPU comparisons.  Different systems run in
 parallel.  The scheduler never starts, stops, or changes CUDA MPS.
 """
@@ -25,7 +25,7 @@ from statistics import median
 from typing import Any, Optional
 
 
-BACKEND_CHOICES = ("baseline", "opt1", "opt2", "opt3")
+BACKEND_CHOICES = ("baseline", "opt1", "opt2", "opt3", "opt4")
 IDLE_PID_RE = re.compile(r"^\s*(\d+)\s*$")
 METRIC_KEYS = ("rdf_error", "adf_error", "vdos_error")
 
@@ -135,7 +135,7 @@ class Config:
         reference = Path(
             _env(
                 "REFERENCE_H5",
-                str(repo.parent / "matbench-discovery-data" / "md" / "2026-06-29-dynamat-v1.0-reference-trajectories.h5"),
+                str(repo.parent / "matbench-discovery-data" / "2026-06-29-dynamat-v1.0-reference-trajectories.h5"),
             )
         ).resolve()
         requested_systems = _split(_env("SYSTEMS"))

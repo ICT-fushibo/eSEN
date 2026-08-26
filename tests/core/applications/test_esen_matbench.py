@@ -11,6 +11,7 @@ from fairchem.core.applications.esen_matbench import (
     MatbenchNHCIntegrator,
     MatbenchNHCWholeStepCUDAGraphMD,
     MatbenchTrajectoryRecorder,
+    matched_trajectory_window,
     read_matbench_systems,
 )
 
@@ -29,6 +30,24 @@ class HarmonicCalculator(Calculator):
             "energy": 0.5 * self.spring * np.square(positions).sum(),
             "forces": -self.spring * positions,
         }
+
+
+def test_matbench_metric_window_matches_short_prediction_duration():
+    window = matched_trajectory_window(
+        reference_frames=16_000,
+        prediction_frames=1_001,
+        reference_dt_fs=0.5,
+        prediction_dt_fs=2.5,
+    )
+    assert window == {
+        "reference_frames_available": 16_000,
+        "prediction_frames_available": 1_001,
+        "reference_frames_used": 5_001,
+        "prediction_frames_used": 1_001,
+        "reference_stride": 5,
+        "prediction_stride": 1,
+        "matched_duration_fs": 2_500.0,
+    }
 
 
 def test_matbench_reader_validates_schema_and_frame_zero(tmp_path):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run eSEN baseline/Opt1/Opt2/Opt3 on the public Matbench MD dataset.
+"""Run eSEN baseline/Opt1/Opt2/Opt3/Opt4 on public Matbench MD data.
 
 This runner is intentionally independent from the existing Cu/H2O and Opt4
 benchmarks.  It uses the official DynaMat NHC protocol and writes sampled
@@ -30,16 +30,23 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parent.parent
 ROOT = REPO.parent
-DEFAULT_REFERENCE = (
-    ROOT
-    / "matbench-discovery-data"
-    / "md"
-    / "2026-06-29-dynamat-v1.0-reference-trajectories.h5"
+REFERENCE_NAME = "2026-06-29-dynamat-v1.0-reference-trajectories.h5"
+_REFERENCE_CANDIDATES = (
+    ROOT / "matbench-discovery-data" / REFERENCE_NAME,
+    ROOT / "matbench-discovery-data" / "md" / REFERENCE_NAME,
+)
+DEFAULT_REFERENCE = next(
+    (path for path in _REFERENCE_CANDIDATES if path.is_file()),
+    _REFERENCE_CANDIDATES[0],
 )
 DEFAULT_MATBENCH_REPO = ROOT / "matbench-discovery"
 DEFAULT_CHECKPOINT = REPO / "esen_30m_oam.pt"
 
-BACKENDS = ("baseline", "opt1", "opt2", "opt3")
+BACKENDS = ("baseline", "opt1", "opt2", "opt3", "opt4")
+OPT4_V4_MODEL_FUSIONS = (
+    "rmsnorm,so2-epilogue,so2-gate-bridge,so2-block-gemm,"
+    "so2-prepare-backward-reduce"
+)
 STEPS = 80_000
 RECORD_INTERVAL = 10
 TIMESTEP_FS = 0.25
@@ -82,6 +89,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-neighbors", type=int, default=300)
     parser.add_argument("--degeneracy-tolerance", type=float, default=0.01)
     parser.add_argument(
+        "--opt4-model-fusions",
+        default=OPT4_V4_MODEL_FUSIONS,
+        help="Frozen Opt4 model fusion mask used only by the opt4 backend",
+    )
+    parser.add_argument("--opt4-fusion-stage", default="OPT4V4_FP32")
+    parser.add_argument(
+        "--opt4-neighbor-capacity-policy",
+        choices=("uniform", "auto-safe"),
+        default="auto-safe",
+        help="Frozen Opt4 whole-step capacity policy",
+    )
+    parser.add_argument("--neighbor-auto-min-reduction", type=float, default=0.05)
+    parser.add_argument("--neighbor-auto-guard-slots", type=int, default=1)
+    parser.add_argument(
         "--statistics",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -104,6 +125,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("neighbor and dummy parameters must be positive")
     if args.capture_warmup < 0 or args.max_neighbors < 1:
         parser.error("capture warmup and max neighbors must be valid")
+    if not 0.0 <= args.neighbor_auto_min_reduction <= 1.0:
+        parser.error("neighbor auto minimum reduction must be between 0 and 1")
+    if args.neighbor_auto_guard_slots < 1:
+        parser.error("neighbor auto guard slots must be positive")
+    if "opt4" in args.backend and (
+        not args.opt4_model_fusions.strip() or not args.opt4_fusion_stage.strip()
+    ):
+        parser.error("opt4 requires a frozen fusion mask and stage label")
     if args.published_yaml is None:
         args.published_yaml = (
             args.matbench_repo / "models" / "esen" / "esen-30m-oam.yml"
@@ -313,7 +342,8 @@ def _run_baseline(system, args, checkpoint, recorder):
 def _run_gpu(system, args, checkpoint, recorder, backend):
     import torch
     from fairchem.core.applications.esen_fixed_neighbor import (
-        maximum_neighbors_in_graph,
+        auto_neighbor_capacities_from_probe,
+        neighbor_counts_in_graph,
         neighbor_capacity_from_probe,
     )
     from fairchem.core.applications.esen_gpu_md import (
@@ -337,6 +367,23 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
     evaluator = ESENEnergyForceEvaluator(
         atoms, checkpoint, device=device, seed=args.seed, disable_amp=True
     )
+    fusion_metadata: dict[str, Any] = {}
+    if backend == "opt4":
+        from fairchem.core.applications.esen_opt4_model_fusion import (
+            configure_esen_30m_model_fusions,
+        )
+
+        configured = configure_esen_30m_model_fusions(
+            evaluator.model, args.opt4_model_fusions
+        )
+        fusion_metadata = configured.as_dict()
+        fusion_metadata.update(
+            {
+                "kernel_fusion": True,
+                "kernel_fusion_stage": args.opt4_fusion_stage,
+                "opt4_scope": "matbench-nhc-whole-step",
+            }
+        )
     state = _make_gpu_state(torch, atoms, device)
     integrator = MatbenchNHCIntegrator(
         torch.as_tensor(atoms.get_masses(), dtype=torch.float64, device=device),
@@ -350,6 +397,7 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
     probe_started = time.perf_counter()
     setup_rng = _capture_torch_rng(torch)
     graph_stats: dict[str, Any] = {}
+    graph_metadata: dict[str, Any] = {}
     graph = None
     dynamics = None
     whole = None
@@ -397,43 +445,66 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         graph.reset_production_stats()
         dynamics = GPUResidentMD(state, graph, integrator)
         graph_stats = graph.stats()
-        graph_stats.update(
-            {
-                "matbench_probe_max_edges": max(probe_edges),
-                "matbench_edge_capacity": edge_capacity,
-            }
-        )
+        graph_metadata = {
+            "matbench_probe_max_edges": max(probe_edges),
+            "matbench_edge_capacity": edge_capacity,
+        }
+        graph_stats.update(graph_metadata)
     else:
-        probe_degrees = [
-            maximum_neighbors_in_graph(
-                evaluator.build_neighbor_graph(state.positions)["edge_index"],
-                len(atoms),
-            )
-        ]
+        initial_graph = evaluator.build_neighbor_graph(state.positions)
+        probe_max_degrees = neighbor_counts_in_graph(
+            initial_graph["edge_index"], len(atoms)
+        )
         probe_dynamics = GPUResidentMD(state, evaluator, integrator)
         for _ in range(args.probe_steps):
             probe_dynamics.run(1)
-            probe_degrees.append(
-                maximum_neighbors_in_graph(
-                    evaluator.build_neighbor_graph(state.positions)["edge_index"],
-                    len(atoms),
-                )
+            probe_graph = evaluator.build_neighbor_graph(state.positions)
+            probe_max_degrees = torch.maximum(
+                probe_max_degrees,
+                neighbor_counts_in_graph(probe_graph["edge_index"], len(atoms)),
             )
         torch.cuda.synchronize()
         probe_elapsed = time.perf_counter() - probe_started
         state.restore_(initial_state)
         integrator.restore_thermostat_state_(*initial_thermostat)
         _restore_torch_rng(torch, setup_rng)
-        neighbors_per_atom = neighbor_capacity_from_probe(
-            max(probe_degrees),
+        probe_max_neighbors = int(probe_max_degrees.max().item())
+        uniform_capacity = neighbor_capacity_from_probe(
+            probe_max_neighbors,
             margin=args.neighbor_margin,
             slot_step=args.neighbor_slot_step,
         )
+        neighbor_capacities = None
+        effective_capacity_policy = "uniform"
+        auto_reduction = 0.0
+        if (
+            backend == "opt4"
+            and args.opt4_neighbor_capacity_policy == "auto-safe"
+        ):
+            neighbor_capacities, auto_reduction = (
+                auto_neighbor_capacities_from_probe(
+                    probe_max_degrees,
+                    margin=args.neighbor_margin,
+                    slot_step=args.neighbor_slot_step,
+                    minimum_reduction=args.neighbor_auto_min_reduction,
+                    guard_slots=args.neighbor_auto_guard_slots,
+                )
+            )
+            if neighbor_capacities is not None:
+                effective_capacity_policy = "atom-safe"
+        effective_capacities = (
+            neighbor_capacities
+            if neighbor_capacities is not None
+            else (uniform_capacity,) * len(atoms)
+        )
+        neighbors_per_atom = max(effective_capacities)
         whole = MatbenchNHCWholeStepCUDAGraphMD(
             state,
             evaluator,
             integrator,
             neighbors_per_atom=neighbors_per_atom,
+            neighbor_capacities=neighbor_capacities,
+            neighbor_capacity_policy=effective_capacity_policy,
             dummy_atoms=args.dummy_atoms,
             capture_warmup=args.capture_warmup,
             max_neighbors=args.max_neighbors,
@@ -442,12 +513,27 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         whole.capture(initial_state)
         whole.reset_production(initial_state)
         graph_stats = whole.stats()
-        graph_stats.update(
-            {
-                "matbench_probe_max_neighbors_per_atom": max(probe_degrees),
+        graph_metadata = {
+                "matbench_probe_max_neighbors_per_atom": probe_max_neighbors,
                 "matbench_neighbors_per_atom": neighbors_per_atom,
-            }
-        )
+                "matbench_neighbor_capacity_policy_requested": (
+                    args.opt4_neighbor_capacity_policy
+                    if backend == "opt4"
+                    else "uniform"
+                ),
+                "matbench_neighbor_capacity_policy_effective": (
+                    effective_capacity_policy
+                ),
+                "matbench_neighbor_uniform_edge_capacity": (
+                    len(atoms) * uniform_capacity
+                ),
+                "matbench_neighbor_edge_capacity": sum(effective_capacities),
+                "matbench_neighbor_capacity_reduction_vs_uniform": (
+                    auto_reduction if neighbor_capacities is not None else 0.0
+                ),
+                **fusion_metadata,
+        }
+        graph_stats.update(graph_metadata)
 
     # One un-timed initial graph replay supplies the numerical audit values.
     # Resetting production state afterwards keeps the measured sequence at one
@@ -458,7 +544,7 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         cg_initial_forces = cg_initial_forces.detach().clone()
         cg_initial_energy = cg_initial_energy.detach().clone()
         graph.reset_production_stats()
-    elif backend == "opt3":
+    elif backend in {"opt3", "opt4"}:
         assert whole is not None
         whole.reset_production(initial_state)
         cg_initial_forces, cg_initial_energy = whole.evaluate_initial()
@@ -499,6 +585,7 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
             if step % args.record_interval == 0:
                 _record_gpu(recorder, step, whole.state_view(), as_numpy_state)
         graph_stats = whole.stats()
+    graph_stats.update(graph_metadata)
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
     initial_validation: dict[str, Any] = {}
@@ -687,6 +774,10 @@ def _evaluate_public_metrics(args, systems, result_rows, output_dir):
         return unavailable
     metrics_root = output_dir / "metrics"
     metrics_root.mkdir(parents=True, exist_ok=True)
+    from fairchem.core.applications.esen_matbench import (
+        matched_trajectory_window,
+    )
+
     aggregate: dict[str, Any] = {"status": "computed"}
     all_metric_rows: list[dict[str, Any]] = []
     for backend in args.backend:
@@ -710,6 +801,14 @@ def _evaluate_public_metrics(args, systems, result_rows, output_dir):
                     str(args.reference_h5), system.name
                 )
                 prediction = _read_prediction(prediction_path)
+                metric_window = matched_trajectory_window(
+                    reference_frames=reference.n_frames,
+                    prediction_frames=prediction.n_frames,
+                    reference_dt_fs=reference_dt,
+                    prediction_dt_fs=(
+                        args.timestep_fs * args.record_interval
+                    ),
+                )
                 values = evaluate_md_system(
                     reference,
                     prediction,
@@ -736,6 +835,7 @@ def _evaluate_public_metrics(args, systems, result_rows, output_dir):
                     "temperature_kelvin": temperature,
                     "n_atoms": system.atomic_numbers.size,
                     "metric_status": "computed",
+                    **metric_window,
                     **values,
                 }
             )
@@ -836,6 +936,9 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         "",
         "The rollout uses the official NHC protocol. Public HDF5 data does not "
         "contain energy/force labels; predicted stress is not computed in this run.",
+        "Short/single-system runs use the official RDF/ADF/vDOS definitions and "
+        "a matched physical-time window, but are pilot results rather than a "
+        "17-system leaderboard score.",
         "",
         "## Protocol",
         "",
@@ -930,6 +1033,14 @@ def main(argv: list[str] | None = None) -> int:
                 "seed": args.seed,
                 "warmup_steps": 0,
             },
+            "opt4": {
+                "fusion_stage": args.opt4_fusion_stage,
+                "model_fusions": args.opt4_model_fusions,
+                "neighbor_capacity_policy": (
+                    args.opt4_neighbor_capacity_policy
+                ),
+                "tf32_mode": "off",
+            },
             "systems": [
                 {
                     "name": system.name,
@@ -999,6 +1110,12 @@ def main(argv: list[str] | None = None) -> int:
                         "seed": args.seed,
                         "checkpoint_sha256": checkpoint_hash,
                         "host": platform.node(),
+                        "opt4_fusion_stage": (
+                            args.opt4_fusion_stage if backend == "opt4" else ""
+                        ),
+                        "opt4_model_fusions": (
+                            args.opt4_model_fusions if backend == "opt4" else ""
+                        ),
                         **_runtime_metadata(torch),
                     },
                 )
@@ -1019,7 +1136,7 @@ def main(argv: list[str] | None = None) -> int:
                 record["process_wall_time_s"] = time.perf_counter() - process_started
                 record["status"] = "success"
                 record["exit_code"] = 0
-                if backend in {"opt2", "opt3"}:
+                if backend in {"opt2", "opt3", "opt4"}:
                     record["graph_invariants_pass"] = bool(
                         graph_stats.get("cuda_graph_capture_count", 0) == 1
                         and graph_stats.get("cuda_graph_production_capture_count", 0)
@@ -1131,6 +1248,12 @@ def main(argv: list[str] | None = None) -> int:
             "warmup_steps": 0,
             "dtype": "FP64 MD state / FP32 eSEN model",
         },
+        "opt4": {
+            "fusion_stage": args.opt4_fusion_stage,
+            "model_fusions": args.opt4_model_fusions,
+            "neighbor_capacity_policy": args.opt4_neighbor_capacity_policy,
+            "tf32_mode": "off",
+        },
         "systems": [
             {
                 "name": system.name,
@@ -1157,7 +1280,17 @@ def main(argv: list[str] | None = None) -> int:
             "complete_matrix": all(
                 row.get("status") == "success" for row in run_rows
             ),
-            "public_metrics_comparable_only_when_all_17_systems_complete": True,
+            "leaderboard_protocol_complete": bool(
+                len(systems) == 17
+                and args.steps == STEPS
+                and args.record_interval == RECORD_INTERVAL
+                and all(row.get("status") == "success" for row in run_rows)
+            ),
+            "pilot_metrics_use_official_definitions": True,
+            "pilot_metrics_use_matched_reference_time_window": True,
+            "pilot_metrics_not_a_17_system_leaderboard_score": bool(
+                len(systems) != 17 or args.steps != STEPS
+            ),
             "pressure_status": "unavailable_stress_not_computed",
             "private_energy_force_status": "unavailable_public_reference_has_no_labels",
             "speed_comparison_scope": "same GPU, same software, same NHC protocol",

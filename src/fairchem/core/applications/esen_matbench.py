@@ -10,6 +10,8 @@ adapter used only by the Matbench runner.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
+import math
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -36,6 +38,55 @@ MATBENCH_SEED = 0
 MATBENCH_TCHAIN = 3
 MATBENCH_TLOOP = 1
 MATBENCH_DUMMY_ATOMS = 32
+
+
+def matched_trajectory_window(
+    *,
+    reference_frames: int,
+    prediction_frames: int,
+    reference_dt_fs: float,
+    prediction_dt_fs: float,
+) -> dict[str, int | float]:
+    """Describe the exact common-time window used by public MD metrics.
+
+    This mirrors ``matbench_discovery.metrics.md.matched_frame_counts`` while
+    keeping the alignment metadata available even when the optional Matbench
+    Python package cannot be imported.  Decimal time steps are converted via
+    :class:`fractions.Fraction`, so 0.5/1/2/2.5 fs grids are matched exactly.
+    """
+
+    if min(reference_frames, prediction_frames) < 1:
+        raise ValueError("trajectory frame counts must be positive")
+    if reference_dt_fs <= 0 or prediction_dt_fs <= 0:
+        raise ValueError("trajectory frame time steps must be positive")
+    reference_dt = Fraction(str(reference_dt_fs))
+    prediction_dt = Fraction(str(prediction_dt_fs))
+    denominator = math.lcm(reference_dt.denominator, prediction_dt.denominator)
+    reference_ticks = reference_dt.numerator * (
+        denominator // reference_dt.denominator
+    )
+    prediction_ticks = prediction_dt.numerator * (
+        denominator // prediction_dt.denominator
+    )
+    common_ticks = math.lcm(reference_ticks, prediction_ticks)
+    reference_stride = common_ticks // reference_ticks
+    prediction_stride = common_ticks // prediction_ticks
+    common_intervals = min(
+        (reference_frames - 1) // reference_stride,
+        (prediction_frames - 1) // prediction_stride,
+    )
+    reference_used = common_intervals * reference_stride + 1
+    prediction_used = common_intervals * prediction_stride + 1
+    duration = Fraction(common_intervals * common_ticks, denominator)
+    return {
+        "reference_frames_available": int(reference_frames),
+        "prediction_frames_available": int(prediction_frames),
+        "reference_frames_used": int(reference_used),
+        "prediction_frames_used": int(prediction_used),
+        "reference_stride": int(reference_stride),
+        "prediction_stride": int(prediction_stride),
+        "matched_duration_fs": float(duration),
+    }
 
 
 @dataclass(frozen=True)

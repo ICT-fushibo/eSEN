@@ -19,6 +19,30 @@ The Matbench-specific GPU integrator and whole-step graph live in
 `src/fairchem/core/applications/esen_matbench.py`.  The original
 `GPUIntegrator` and existing CUDA Graph classes are not replaced.
 
+The Matbench `opt4` backend uses the frozen Opt4 v4 FP32 configuration:
+`rmsnorm,so2-epilogue,so2-gate-bridge,so2-block-gemm,so2-prepare-backward-reduce`
+with the `auto-safe` fixed-neighbor capacity policy. It keeps the Matbench NHC
+integrator rather than reusing the Cu/H2O Berendsen path.
+
+## 10,000-step aligned pilot
+
+This launcher pins every physical setting to Matbench and changes only the
+step count. It runs baseline, Opt2, Opt3, and Opt4 serially on one GPU and uses
+`anthracene_293K_Sharma_S` by default because its reference trajectory covers
+the complete 2.5 ps prediction window:
+
+```bash
+GPU=0 \
+REFERENCE_H5=/home/fushibo/matbench-discovery-data/2026-06-29-dynamat-v1.0-reference-trajectories.h5 \
+MATBENCH_REPO=/home/fushibo/matbench-discovery \
+SAVE_DIR=/home/fushibo/eSEN/example/md_out/matbench_10k_pilot \
+bash example/run_esen_matbench_10k_pilot.sh
+```
+
+RDF/ADF/vDOS use the official implementation and the common 0--2.5 ps time
+window. A one-system 10,000-step result is a diagnostic pilot, not a published
+17-system leaderboard score.
+
 ## Smoke
 
 Run one backend and one small system first:
@@ -32,26 +56,26 @@ OUTPUT_DIR=/public-data/fushibo/eSEN/example/md_out/matbench_opt3_smoke \
 bash example/run_esen_matbench.sh
 ```
 
-Repeat with `BACKEND=baseline`, `opt1`, and `opt2`, using separate output
+Repeat with `BACKEND=baseline`, `opt1`, `opt2`, and `opt4`, using separate output
 directories.  The launcher never starts or stops MPS; it only sets
 `CUDA_VISIBLE_DEVICES`.
 
 ## Formal backend runs
 
-For a directly comparable speedup report, run all four backends in one process
+For a directly comparable speedup report, run all requested backends in one process
 and one output directory.  Each backend is still initialized and recorded as an
 independent run; the runner releases the previous system's model/cache before
 continuing after OOM or capacity failure. `--save-dir` is an alias for
 `--output-dir` and is the explicit persistence interface:
 
 ```bash
-GPU=2 BACKENDS='baseline opt1 opt2 opt3' \
+GPU=2 BACKENDS='baseline opt1 opt2 opt3 opt4' \
   SAVE_DIR=/public-data/fushibo/eSEN/example/md_out/matbench_all_gpu2 \
   bash example/run_esen_matbench.sh
 ```
 
 For multiple GPUs, `run_esen_matbench_8gpu.sh` polls the GPU pool and assigns
-one system per job. All four backends for that system remain on the same
+one system per job. All requested backends for that system remain on the same
 physical GPU, and each system is saved below `<SAVE_DIR>/systems/<system>`.
 The queue writes `matbench_esen_queue_report.{json,md}` after pending jobs
 finish.

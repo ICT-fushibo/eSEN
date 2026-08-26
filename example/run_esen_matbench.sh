@@ -25,7 +25,14 @@ SYSTEMS=${SYSTEMS:-}
 STEPS=${STEPS:-80000}
 RECORD_INTERVAL=${RECORD_INTERVAL:-10}
 SEED=${SEED:-0}
-REFERENCE_H5=${REFERENCE_H5:-"$ROOT_DEFAULT/matbench-discovery-data/md/2026-06-29-dynamat-v1.0-reference-trajectories.h5"}
+REFERENCE_NAME=2026-06-29-dynamat-v1.0-reference-trajectories.h5
+if [[ -z "${REFERENCE_H5:-}" ]]; then
+    if [[ -f "$ROOT_DEFAULT/matbench-discovery-data/$REFERENCE_NAME" ]]; then
+        REFERENCE_H5="$ROOT_DEFAULT/matbench-discovery-data/$REFERENCE_NAME"
+    else
+        REFERENCE_H5="$ROOT_DEFAULT/matbench-discovery-data/md/$REFERENCE_NAME"
+    fi
+fi
 MATBENCH_REPO=${MATBENCH_REPO:-"$ROOT_DEFAULT/matbench-discovery"}
 CHECKPOINT=${CHECKPOINT:-"$REPO_ROOT/esen_30m_oam.pt"}
 # SAVE_DIR is the explicit persistence interface.  OUTPUT_DIR remains a
@@ -40,6 +47,11 @@ DUMMY_ATOMS=${DUMMY_ATOMS:-32}
 CAPTURE_WARMUP=${CAPTURE_WARMUP:-3}
 MAX_NEIGHBORS=${MAX_NEIGHBORS:-300}
 DEGENERACY_TOLERANCE=${DEGENERACY_TOLERANCE:-0.01}
+OPT4_MODEL_FUSIONS=${OPT4_MODEL_FUSIONS:-rmsnorm,so2-epilogue,so2-gate-bridge,so2-block-gemm,so2-prepare-backward-reduce}
+OPT4_FUSION_STAGE=${OPT4_FUSION_STAGE:-OPT4V4_FP32}
+OPT4_NEIGHBOR_CAPACITY_POLICY=${OPT4_NEIGHBOR_CAPACITY_POLICY:-auto-safe}
+NEIGHBOR_AUTO_MIN_REDUCTION=${NEIGHBOR_AUTO_MIN_REDUCTION:-0.05}
+NEIGHBOR_AUTO_GUARD_SLOTS=${NEIGHBOR_AUTO_GUARD_SLOTS:-1}
 STATISTICS=${STATISTICS:-1}
 STRICT=${STRICT:-0}
 OVERWRITE=${OVERWRITE:-0}
@@ -77,6 +89,11 @@ args=(
     --capture-warmup "$CAPTURE_WARMUP"
     --max-neighbors "$MAX_NEIGHBORS"
     --degeneracy-tolerance "$DEGENERACY_TOLERANCE"
+    --opt4-model-fusions "$OPT4_MODEL_FUSIONS"
+    --opt4-fusion-stage "$OPT4_FUSION_STAGE"
+    --opt4-neighbor-capacity-policy "$OPT4_NEIGHBOR_CAPACITY_POLICY"
+    --neighbor-auto-min-reduction "$NEIGHBOR_AUTO_MIN_REDUCTION"
+    --neighbor-auto-guard-slots "$NEIGHBOR_AUTO_GUARD_SLOTS"
 )
 if [[ -n "$SYSTEMS" ]]; then
     read -r -a systems_array <<< "$SYSTEMS"
