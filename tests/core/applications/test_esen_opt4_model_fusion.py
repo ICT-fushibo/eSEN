@@ -22,12 +22,14 @@ from fairchem.core.applications.esen_opt4_model_fusion import (
     _SO2GateBridge,
     _SO2Prepare,
     _SO2PrepareBackwardReduce,
+    _WignerSO2Hybrid,
     _WignerSO2Prepare,
     gather_cat_wigner,
     model_fusion_available,
     parse_model_fusions,
     reverse_envelope_scatter,
     wigner_so2_prepare,
+    wigner_so2_hybrid,
     _energy_head_candidates,
     configure_esen_30m_model_fusions,
 )
@@ -230,6 +232,27 @@ def test_parse_model_fusions_is_ordered_and_strict():
         match="requires so2-epilogue and so2-gate-bridge",
     ):
         parse_model_fusions("so2-epilogue,so2-prepare-backward-reduce")
+    assert parse_model_fusions(
+        "wigner-so2-hybrid,so2-prepare-backward-reduce,"
+        "so2-gate-bridge,so2-epilogue"
+    ) == (
+        "so2-epilogue",
+        "so2-gate-bridge",
+        "wigner-so2-hybrid",
+        "so2-prepare-backward-reduce",
+    )
+    with pytest.raises(
+        UnsupportedFusionConfigError,
+        match="requires so2-epilogue, so2-gate-bridge and",
+    ):
+        parse_model_fusions(
+            "so2-epilogue,so2-gate-bridge,wigner-so2-hybrid"
+        )
+    with pytest.raises(UnsupportedFusionConfigError, match="mutually exclusive"):
+        parse_model_fusions(
+            "so2-epilogue,so2-gate-bridge,so2-prepare-backward-reduce,"
+            "wigner-so2-bridge,wigner-so2-hybrid"
+        )
     assert parse_model_fusions(
         "so3-weight-cache,so2-block-gemm,so2-gate-bridge,so2-epilogue"
     ) == (
@@ -519,7 +542,12 @@ def test_so2_block_gate_bridge_forward_and_gradients_match_torch():
 
 
 @pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
-def test_wigner_so2_prepare_forward_and_gradients_match_torch():
+@pytest.mark.parametrize(
+    "producer",
+    (wigner_so2_prepare, wigner_so2_hybrid),
+    ids=("kf11", "kf15-hybrid"),
+)
+def test_wigner_so2_prepare_forward_and_gradients_match_torch(producer):
     torch.manual_seed(42)
     device = torch.device("cuda")
     mapping = CoefficientMapping(3, 2).to(device)
@@ -573,7 +601,7 @@ def test_wigner_so2_prepare_forward_and_gradients_match_torch():
         torch.randn(edges, 2, 512, device=device),
     )
     torch.autograd.backward(expected, gradients)
-    actual = wigner_so2_prepare(
+    actual = producer(
         x_actual,
         edge_index,
         w_actual,
@@ -594,7 +622,12 @@ def test_wigner_so2_prepare_forward_and_gradients_match_torch():
 
 
 @pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
-def test_wigner_so2_prepare_accepts_empty_edges():
+@pytest.mark.parametrize(
+    "producer",
+    (_WignerSO2Prepare, _WignerSO2Hybrid),
+    ids=("kf11", "kf15-hybrid"),
+)
+def test_wigner_so2_prepare_accepts_empty_edges(producer):
     mapping = CoefficientMapping(3, 2).cuda()
     to_m, _ = _so2_indices(mapping)
     x = torch.randn(3, 16, 128, device="cuda", requires_grad=True)
@@ -605,7 +638,7 @@ def test_wigner_so2_prepare_accepts_empty_edges():
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14],
         device="cuda",
     )
-    outputs = _WignerSO2Prepare.apply(
+    outputs = producer.apply(
         x, edge_index, wigner, out_mask, radial, to_m
     )
     sum(output.sum() for output in outputs).backward()
@@ -620,7 +653,12 @@ def test_wigner_so2_prepare_accepts_empty_edges():
 
 
 @pytest.mark.skipif(not CUDA_TRITON, reason="requires CUDA and Triton")
-def test_wigner_so2_prepare_is_cuda_graph_capture_safe():
+@pytest.mark.parametrize(
+    "producer",
+    (wigner_so2_prepare, wigner_so2_hybrid),
+    ids=("kf11", "kf15-hybrid"),
+)
+def test_wigner_so2_prepare_is_cuda_graph_capture_safe(producer):
     torch.manual_seed(42)
     mapping = CoefficientMapping(3, 2).cuda()
     to_m, _ = _so2_indices(mapping)
@@ -637,7 +675,7 @@ def test_wigner_so2_prepare_is_cuda_graph_capture_safe():
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
-            outputs = wigner_so2_prepare(
+            outputs = producer(
                 x, edge_index, wigner, out_mask, radial, to_m
             )
             torch.autograd.grad(sum(output.sum() for output in outputs), inputs)
@@ -645,7 +683,7 @@ def test_wigner_so2_prepare_is_cuda_graph_capture_safe():
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        outputs = wigner_so2_prepare(
+        outputs = producer(
             x, edge_index, wigner, out_mask, radial, to_m
         )
         gradients = torch.autograd.grad(

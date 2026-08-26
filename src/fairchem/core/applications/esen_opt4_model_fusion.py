@@ -42,6 +42,7 @@ SO3_WEIGHT_CACHE_VERSION = "opt4-model-fusion-v7-so3-weight-cache"
 SO2_PREPARE_BACKWARD_REDUCE_VERSION = (
     "opt4-model-fusion-v8-so2-prepare-backward-reduce"
 )
+WIGNER_SO2_HYBRID_KERNEL_VERSION = "opt4-model-fusion-v9-wigner-so2-hybrid"
 SO2_KERNEL_BLOCK = 512
 SUPPORTED_FUSIONS = (
     "gather-wigner",
@@ -54,6 +55,7 @@ SUPPORTED_FUSIONS = (
     "so2-epilogue",
     "so2-gate-bridge",
     "wigner-so2-bridge",
+    "wigner-so2-hybrid",
     "so2-block-gemm",
     "so3-weight-cache",
     "so2-prepare-backward-reduce",
@@ -100,6 +102,23 @@ def parse_model_fusions(value: str | Iterable[str]) -> tuple[str, ...]:
     }.issubset(requested_set):
         raise UnsupportedFusionConfigError(
             "wigner-so2-bridge subsumes gather-wigner; request only the bridge"
+        )
+    if "wigner-so2-hybrid" in requested_set and not {
+        "so2-epilogue",
+        "so2-gate-bridge",
+        "so2-prepare-backward-reduce",
+    }.issubset(requested_set):
+        raise UnsupportedFusionConfigError(
+            "wigner-so2-hybrid requires so2-epilogue, so2-gate-bridge and "
+            "so2-prepare-backward-reduce to be requested explicitly"
+        )
+    if "wigner-so2-hybrid" in requested_set and {
+        "gather-wigner",
+        "wigner-so2-bridge",
+    }.intersection(requested_set):
+        raise UnsupportedFusionConfigError(
+            "wigner-so2-hybrid is mutually exclusive with gather-wigner "
+            "and wigner-so2-bridge"
         )
     if (
         "so2-block-gemm" in requested_set
@@ -1013,6 +1032,118 @@ if triton is not None:
         value = rotated * tl.load(radial_ptr + radial_offset, mask=active, other=0.0)
         tl.store(
             m0_ptr + edge * 4 * input_channels + coefficient * input_channels + channel2,
+            value,
+            mask=active & (coefficient < 4),
+        )
+        tl.store(
+            m1_ptr
+            + edge * 6 * input_channels
+            + (coefficient - 4) * input_channels
+            + channel2,
+            value,
+            mask=active & (coefficient >= 4) & (coefficient < 10),
+        )
+        tl.store(
+            m2_ptr
+            + edge * 4 * input_channels
+            + (coefficient - 10) * input_channels
+            + channel2,
+            value,
+            mask=active & (coefficient >= 10),
+        )
+
+    @triton.jit
+    def _wigner_so2_hybrid_forward_kernel(
+        x_ptr,
+        source_ptr,
+        target_ptr,
+        wigner_ptr,
+        out_mask_ptr,
+        to_m_ptr,
+        radial_ptr,
+        m0_ptr,
+        m1_ptr,
+        m2_ptr,
+        gathered_ptr,
+        rotated_ptr,
+        node_channels: tl.constexpr,
+        full_coefficients: tl.constexpr,
+        input_channels: tl.constexpr,
+        radial_channels: tl.constexpr,
+        block_channels: tl.constexpr,
+    ):
+        """KF15 fused forward with cuBLAS-compatible saved intermediates."""
+        edge = tl.program_id(0)
+        coefficient = tl.program_id(1)
+        channel2 = tl.arange(0, block_channels)
+        active = channel2 < input_channels
+        source_half = channel2 < node_channels
+        channel = channel2 % node_channels
+        source = tl.load(source_ptr + edge)
+        target = tl.load(target_ptr + edge)
+        node = tl.where(source_half, source, target)
+        source_coefficient = tl.load(to_m_ptr + coefficient)
+        full_out = tl.load(out_mask_ptr + source_coefficient)
+        rotated = tl.zeros((block_channels,), tl.float32)
+        for full_in in range(full_coefficients):
+            weight = tl.load(
+                wigner_ptr
+                + edge * full_coefficients * full_coefficients
+                + full_out * full_coefficients
+                + full_in
+            )
+            feature = tl.load(
+                x_ptr
+                + node * full_coefficients * node_channels
+                + full_in * node_channels
+                + channel,
+                mask=active,
+                other=0.0,
+            )
+            # Only one coefficient program materializes the gathered input.
+            # The remaining programs reuse the value in registers for their
+            # Wigner dot product without racing on the auxiliary buffer.
+            tl.store(
+                gathered_ptr
+                + edge * full_coefficients * input_channels
+                + full_in * input_channels
+                + channel2,
+                feature,
+                mask=active & (coefficient == 0),
+            )
+            rotated += weight * feature
+        # SO2 prepare consumes the Wigner result in l-order.  ``coefficient``
+        # is m-order here, so save through the fixed inverse permutation.
+        tl.store(
+            rotated_ptr
+            + edge * 14 * input_channels
+            + source_coefficient * input_channels
+            + channel2,
+            rotated,
+            mask=active,
+        )
+        radial_coefficient = tl.where(
+            coefficient < 4,
+            coefficient,
+            tl.where(
+                coefficient < 10,
+                4 + ((coefficient - 4) % 3),
+                7 + ((coefficient - 10) % 2),
+            ),
+        )
+        radial_offset = (
+            edge * radial_channels
+            + radial_coefficient * input_channels
+            + channel2
+        )
+        value = rotated * tl.load(
+            radial_ptr + radial_offset, mask=active, other=0.0
+        )
+        tl.store(
+            m0_ptr
+            + edge * 4 * input_channels
+            + coefficient * input_channels
+            + channel2,
             value,
             mask=active & (coefficient < 4),
         )
@@ -3294,41 +3425,212 @@ class _SO2Prepare(torch.autograd.Function):
         return grad_x, (grad_radial if ctx.use_radial else None), None, None, None
 
 
+def _so2_prepare_backward_reduce_impl(
+    grad_m0: Tensor,
+    grad_m1: Tensor,
+    grad_m2: Tensor,
+    x: Tensor,
+    radial: Tensor,
+    to_m_index: Tensor,
+    *,
+    use_radial: bool,
+    radial_channels: int,
+) -> tuple[Tensor, Tensor]:
+    """Launch KF14's edge-local reduction outside an autograd context."""
+    grad_m0 = grad_m0.contiguous()
+    grad_m1 = grad_m1.contiguous()
+    grad_m2 = grad_m2.contiguous()
+    grad_x = torch.empty_like(x)
+    grad_radial = torch.empty_like(radial)
+    if x.shape[0] > 0:
+        block = triton.next_power_of_2(x.shape[2])
+        if block not in (128, 256):
+            raise UnsupportedFusionConfigError(
+                "SO2 prepare backward reduction supports 128 or 256 channels"
+            )
+        _so2_prepare_backward_reduce_kernel[(x.shape[0],)](
+            grad_m0,
+            grad_m1,
+            grad_m2,
+            x,
+            radial,
+            to_m_index,
+            grad_x,
+            grad_radial,
+            rows=x.shape[0],
+            coefficients=14,
+            channels=x.shape[2],
+            radial_channels=int(radial_channels),
+            use_radial=bool(use_radial),
+            block=block,
+            num_warps=8 if block == 256 else 4,
+        )
+    return grad_x, grad_radial
+
+
 class _SO2PrepareBackwardReduce(_SO2Prepare):
     """KF14 SO2 prepare with an edge-local, non-atomic backward."""
 
     @staticmethod
     def backward(ctx, grad_m0: Tensor, grad_m1: Tensor, grad_m2: Tensor):
         x, radial, to_m_index = ctx.saved_tensors
-        grad_m0 = grad_m0.contiguous()
-        grad_m1 = grad_m1.contiguous()
-        grad_m2 = grad_m2.contiguous()
-        grad_x = torch.empty_like(x)
-        grad_radial = torch.empty_like(radial)
-        if x.shape[0] > 0:
-            block = triton.next_power_of_2(x.shape[2])
-            if block not in (128, 256):
-                raise UnsupportedFusionConfigError(
-                    "SO2 prepare backward reduction supports 128 or 256 channels"
-                )
-            _so2_prepare_backward_reduce_kernel[(x.shape[0],)](
-                grad_m0,
-                grad_m1,
-                grad_m2,
-                x,
-                radial,
-                to_m_index,
-                grad_x,
-                grad_radial,
-                rows=x.shape[0],
-                coefficients=14,
-                channels=x.shape[2],
-                radial_channels=ctx.radial_channels,
-                use_radial=ctx.use_radial,
-                block=block,
-                num_warps=8 if block == 256 else 4,
-            )
+        grad_x, grad_radial = _so2_prepare_backward_reduce_impl(
+            grad_m0,
+            grad_m1,
+            grad_m2,
+            x,
+            radial,
+            to_m_index,
+            use_radial=ctx.use_radial,
+            radial_channels=ctx.radial_channels,
+        )
         return grad_x, (grad_radial if ctx.use_radial else None), None, None, None
+
+
+class _WignerSO2Hybrid(torch.autograd.Function):
+    """KF15 fused producer forward with KF14/cuBLAS backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: Tensor,
+        edge_index: Tensor,
+        wigner: Tensor,
+        out_mask: Tensor,
+        radial: Tensor,
+        to_m_index: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if x.ndim != 3 or x.shape[1:] != (16, 128):
+            raise UnsupportedFusionConfigError(
+                f"Wigner/SO2 hybrid expected x=[N,16,128], got {tuple(x.shape)}"
+            )
+        if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+            raise UnsupportedFusionConfigError(
+                "Wigner/SO2 hybrid expected edge_index=[2,E]"
+            )
+        edges = edge_index.shape[1]
+        if wigner.shape != (edges, 16, 16):
+            raise UnsupportedFusionConfigError(
+                f"Wigner/SO2 hybrid received wigner={tuple(wigner.shape)}"
+            )
+        if radial.shape != (edges, 2304):
+            raise UnsupportedFusionConfigError(
+                f"Wigner/SO2 hybrid expected radial=[E,2304], got {tuple(radial.shape)}"
+            )
+        x = x.contiguous()
+        source_index = edge_index[0].contiguous()
+        target_index = edge_index[1].contiguous()
+        wigner = wigner.contiguous()
+        radial = radial.contiguous()
+        out_mask = out_mask.to(device=x.device, dtype=torch.long).contiguous()
+        to_m_index = to_m_index.to(
+            device=x.device, dtype=torch.long
+        ).contiguous()
+        _require_triton_cuda_fp32(
+            x,
+            source_index,
+            target_index,
+            wigner,
+            out_mask,
+            radial,
+            to_m_index,
+        )
+        if source_index.dtype != torch.long or target_index.dtype != torch.long:
+            raise UnsupportedFusionConfigError(
+                "Wigner/SO2 hybrid requires int64 edge indices"
+            )
+        if out_mask.shape != (14,) or to_m_index.shape != (14,):
+            raise UnsupportedFusionConfigError(
+                "Wigner/SO2 hybrid requires [14] mask and permutation tensors"
+            )
+
+        m0 = x.new_empty((edges, 1024))
+        m1 = x.new_empty((edges, 2, 768))
+        m2 = x.new_empty((edges, 2, 512))
+        gathered = x.new_empty((edges, 16, 256))
+        rotated = x.new_empty((edges, 14, 256))
+        if edges > 0:
+            _wigner_so2_hybrid_forward_kernel[(edges, 14)](
+                x,
+                source_index,
+                target_index,
+                wigner,
+                out_mask,
+                to_m_index,
+                radial,
+                m0,
+                m1,
+                m2,
+                gathered,
+                rotated,
+                node_channels=128,
+                full_coefficients=16,
+                input_channels=256,
+                radial_channels=2304,
+                block_channels=256,
+                num_warps=8,
+            )
+        ctx.node_count = x.shape[0]
+        ctx.save_for_backward(
+            gathered,
+            rotated,
+            source_index,
+            target_index,
+            wigner,
+            out_mask,
+            radial,
+            to_m_index,
+        )
+        return m0, m1, m2
+
+    @staticmethod
+    def backward(ctx, grad_m0: Tensor, grad_m1: Tensor, grad_m2: Tensor):
+        (
+            gathered,
+            rotated,
+            source_index,
+            target_index,
+            wigner,
+            out_mask,
+            radial,
+            to_m_index,
+        ) = ctx.saved_tensors
+        edges = source_index.numel()
+        if grad_m0 is None:
+            grad_m0 = radial.new_zeros((edges, 1024))
+        if grad_m1 is None:
+            grad_m1 = radial.new_zeros((edges, 2, 768))
+        if grad_m2 is None:
+            grad_m2 = radial.new_zeros((edges, 2, 512))
+
+        grad_rotated, grad_radial = _so2_prepare_backward_reduce_impl(
+            grad_m0,
+            grad_m1,
+            grad_m2,
+            rotated,
+            radial,
+            to_m_index,
+            use_radial=True,
+            radial_channels=2304,
+        )
+        grad_x = wigner.new_zeros((ctx.node_count, 16, 128))
+        grad_wigner = torch.zeros_like(wigner)
+        if edges > 0:
+            selected_wigner = wigner.index_select(1, out_mask)
+            grad_gathered = torch.bmm(
+                selected_wigner.transpose(1, 2), grad_rotated
+            )
+            grad_selected_wigner = torch.bmm(
+                grad_rotated, gathered.transpose(1, 2)
+            )
+            grad_wigner.index_copy_(1, out_mask, grad_selected_wigner)
+            grad_x.index_add_(
+                0, source_index, grad_gathered[:, :, :128]
+            )
+            grad_x.index_add_(
+                0, target_index, grad_gathered[:, :, 128:]
+            )
+        return grad_x, None, grad_wigner, None, grad_radial, None
 
 
 class _SO2Epilogue(torch.autograd.Function):
@@ -4267,6 +4569,25 @@ def wigner_so2_prepare(
     )
 
 
+def wigner_so2_hybrid(
+    x: Tensor,
+    edge_index: Tensor,
+    wigner: Tensor,
+    out_mask: Tensor,
+    radial: Tensor,
+    to_m_index: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Run KF15's fused forward and KF14/cuBLAS backward."""
+    return _WignerSO2Hybrid.apply(
+        x,
+        edge_index,
+        wigner,
+        out_mask,
+        radial,
+        to_m_index,
+    )
+
+
 def reverse_envelope_scatter(
     message: Tensor,
     wigner_inv: Tensor,
@@ -4339,6 +4660,7 @@ class FusedEdgewise(nn.Module):
         so2_epilogue: bool = False,
         so2_gate_bridge: bool = False,
         wigner_so2_bridge: bool = False,
+        wigner_so2_hybrid: bool = False,
     ) -> None:
         super().__init__()
         self.sphere_channels = original.sphere_channels
@@ -4361,9 +4683,14 @@ class FusedEdgewise(nn.Module):
         self.fuse_so2_epilogue = so2_epilogue
         self.fuse_so2_gate_bridge = so2_gate_bridge
         self.fuse_wigner_so2_bridge = wigner_so2_bridge
-        if wigner_so2_bridge and not so2_gate_bridge:
+        self.fuse_wigner_so2_hybrid = wigner_so2_hybrid
+        if (wigner_so2_bridge or wigner_so2_hybrid) and not so2_gate_bridge:
             raise UnsupportedFusionConfigError(
-                "Wigner/SO2 bridge requires the SO2 gate bridge"
+                "Wigner/SO2 producer fusion requires the SO2 gate bridge"
+            )
+        if wigner_so2_bridge and wigner_so2_hybrid:
+            raise UnsupportedFusionConfigError(
+                "Wigner/SO2 bridge and hybrid are mutually exclusive"
             )
         if so2_gate_bridge:
             if not isinstance(self.act, GateActivation):
@@ -4379,8 +4706,13 @@ class FusedEdgewise(nn.Module):
     def forward(self, x, x_edge, edge_distance, edge_index, wigner, wigner_inv, node_offset: int = 0):
         out_mask = self.out_mask.to(device=x.device)
         if self.fuse_so2_gate_bridge:
-            if self.fuse_wigner_so2_bridge:
-                prepared = wigner_so2_prepare(
+            if self.fuse_wigner_so2_bridge or self.fuse_wigner_so2_hybrid:
+                producer = (
+                    wigner_so2_hybrid
+                    if self.fuse_wigner_so2_hybrid
+                    else wigner_so2_prepare
+                )
+                prepared = producer(
                     x.contiguous(),
                     edge_index.contiguous(),
                     wigner.contiguous(),
@@ -4683,6 +5015,11 @@ class FusionMetadata:
     wigner_so2_bridge_forward_kernel_count: int
     wigner_so2_bridge_backward_kernel_count: int
     wigner_so2_bridge_kernel_version: str
+    wigner_so2_hybrid_replacements: int
+    wigner_so2_hybrid_forward_kernel_count: int
+    wigner_so2_hybrid_backward_reduce_kernel_count: int
+    wigner_so2_hybrid_backward_cublas_bmm_count: int
+    wigner_so2_hybrid_kernel_version: str
     so2_block_gemm_convolution_replacements: int
     so2_block_gemm_linear_replacements: int
     so2_block_gemm_version: str
@@ -4735,6 +5072,21 @@ class FusionMetadata:
             ),
             "model_fusion_wigner_so2_bridge_kernel_version": (
                 self.wigner_so2_bridge_kernel_version
+            ),
+            "model_fusion_wigner_so2_hybrid_replacements": (
+                self.wigner_so2_hybrid_replacements
+            ),
+            "model_fusion_wigner_so2_hybrid_forward_kernel_count": (
+                self.wigner_so2_hybrid_forward_kernel_count
+            ),
+            "model_fusion_wigner_so2_hybrid_backward_reduce_kernel_count": (
+                self.wigner_so2_hybrid_backward_reduce_kernel_count
+            ),
+            "model_fusion_wigner_so2_hybrid_backward_cublas_bmm_count": (
+                self.wigner_so2_hybrid_backward_cublas_bmm_count
+            ),
+            "model_fusion_wigner_so2_hybrid_kernel_version": (
+                self.wigner_so2_hybrid_kernel_version
             ),
             "model_fusion_so2_block_gemm_convolution_replacements": (
                 self.so2_block_gemm_convolution_replacements
@@ -4828,6 +5180,7 @@ def configure_esen_30m_model_fusions(
     so2 = "so2-epilogue" in selected
     so2_gate_bridge = "so2-gate-bridge" in selected
     wigner_so2_bridge = "wigner-so2-bridge" in selected
+    wigner_so2_hybrid = "wigner-so2-hybrid" in selected
     so2_block_gemm = "so2-block-gemm" in selected
     so3_weight_cache = "so3-weight-cache" in selected
     so2_prepare_backward_reduce = "so2-prepare-backward-reduce" in selected
@@ -4841,6 +5194,7 @@ def configure_esen_30m_model_fusions(
     so2_count = 0
     so2_gate_bridge_count = 0
     wigner_so2_bridge_count = 0
+    wigner_so2_hybrid_count = 0
     so2_block_gemm_count = 0
     so3_weight_cache_count = 0
     so3_weight_cache_bytes = 0
@@ -4907,12 +5261,15 @@ def configure_esen_30m_model_fusions(
                 so2_epilogue=so2,
                 so2_gate_bridge=so2_gate_bridge,
                 wigner_so2_bridge=wigner_so2_bridge,
+                wigner_so2_hybrid=wigner_so2_hybrid,
             )
             edgewise_count += 1
             if so2_gate_bridge:
                 so2_gate_bridge_count += 1
             if wigner_so2_bridge:
                 wigner_so2_bridge_count += 1
+            if wigner_so2_hybrid:
+                wigner_so2_hybrid_count += 1
     if so2_gate_bridge and so2_gate_bridge_count != 10:
         raise UnsupportedFusionConfigError(
             "SO2 gate bridge must replace all 10 Edgewise blocks, replaced "
@@ -4922,6 +5279,11 @@ def configure_esen_30m_model_fusions(
         raise UnsupportedFusionConfigError(
             "Wigner/SO2 bridge must replace all 10 Edgewise blocks, replaced "
             f"{wigner_so2_bridge_count}"
+        )
+    if wigner_so2_hybrid and wigner_so2_hybrid_count != 10:
+        raise UnsupportedFusionConfigError(
+            "Wigner/SO2 hybrid must replace all 10 Edgewise blocks, replaced "
+            f"{wigner_so2_hybrid_count}"
         )
     if so2_block_gemm and so2_block_gemm_count != 20:
         raise UnsupportedFusionConfigError(
@@ -5017,7 +5379,10 @@ def configure_esen_30m_model_fusions(
         so2_convolution_replacements=so2_count,
         # KF10 bypasses conv1 epilogue and conv2 prepare once per Edgewise.
         so2_prepare_kernel_count=(
-            so2_count - so2_gate_bridge_count - wigner_so2_bridge_count
+            so2_count
+            - so2_gate_bridge_count
+            - wigner_so2_bridge_count
+            - wigner_so2_hybrid_count
         ),
         so2_epilogue_kernel_count=so2_count - so2_gate_bridge_count,
         so2_fusion_kernel_version=(SO2_FUSION_KERNEL_VERSION if so2 else ""),
@@ -5033,6 +5398,17 @@ def configure_esen_30m_model_fusions(
         wigner_so2_bridge_backward_kernel_count=3 * wigner_so2_bridge_count,
         wigner_so2_bridge_kernel_version=(
             WIGNER_SO2_BRIDGE_KERNEL_VERSION if wigner_so2_bridge else ""
+        ),
+        wigner_so2_hybrid_replacements=wigner_so2_hybrid_count,
+        wigner_so2_hybrid_forward_kernel_count=wigner_so2_hybrid_count,
+        wigner_so2_hybrid_backward_reduce_kernel_count=(
+            wigner_so2_hybrid_count
+        ),
+        wigner_so2_hybrid_backward_cublas_bmm_count=(
+            2 * wigner_so2_hybrid_count
+        ),
+        wigner_so2_hybrid_kernel_version=(
+            WIGNER_SO2_HYBRID_KERNEL_VERSION if wigner_so2_hybrid else ""
         ),
         so2_block_gemm_convolution_replacements=so2_block_gemm_count,
         # Each convolution has one m=1 and one m=2 complex GEMM.

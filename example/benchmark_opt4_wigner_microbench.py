@@ -22,6 +22,7 @@ import torch
 from fairchem.core.applications.esen_opt4_model_fusion import (
     _SO2PrepareBackwardReduce,
     model_fusion_available,
+    wigner_so2_hybrid,
     wigner_so2_prepare,
 )
 from fairchem.core.models.esen.common.so3 import CoefficientMapping
@@ -37,7 +38,9 @@ OUT_MASK = (0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--system", choices=tuple(SYSTEM_SHAPES), required=True)
-    parser.add_argument("--variant", choices=("base", "bridge"), required=True)
+    parser.add_argument(
+        "--variant", choices=("base", "bridge", "hybrid"), required=True
+    )
     parser.add_argument(
         "--mode", choices=("forward", "forward-backward"), required=True
     )
@@ -94,6 +97,22 @@ def make_bridge(
     return forward
 
 
+def make_hybrid(
+    x: torch.Tensor,
+    edge_index: torch.Tensor,
+    wigner: torch.Tensor,
+    out_mask: torch.Tensor,
+    radial: torch.Tensor,
+    to_m: torch.Tensor,
+):
+    def forward() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return wigner_so2_hybrid(
+            x, edge_index, wigner, out_mask, radial, to_m
+        )
+
+    return forward
+
+
 def capture(
     forward,
     inputs: tuple[torch.Tensor, ...],
@@ -127,7 +146,7 @@ def main() -> int:
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if args.variant == "bridge" and not model_fusion_available():
+    if args.variant in {"bridge", "hybrid"} and not model_fusion_available():
         raise RuntimeError("The Triton model-fusion runtime is unavailable")
 
     torch.manual_seed(args.seed)
@@ -158,7 +177,12 @@ def main() -> int:
     )
     inputs = (x, wigner, radial)
 
-    factory = make_reference if args.variant == "base" else make_bridge
+    factories = {
+        "base": make_reference,
+        "bridge": make_bridge,
+        "hybrid": make_hybrid,
+    }
+    factory = factories[args.variant]
     forward = factory(x, edge_index, wigner, out_mask, radial, to_m)
     sample_outputs = forward()
     grad_outputs = (
