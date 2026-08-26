@@ -53,6 +53,7 @@ OPT4_NEIGHBOR_CAPACITY_POLICY=${OPT4_NEIGHBOR_CAPACITY_POLICY:-auto-safe}
 NEIGHBOR_AUTO_MIN_REDUCTION=${NEIGHBOR_AUTO_MIN_REDUCTION:-0.05}
 NEIGHBOR_AUTO_GUARD_SLOTS=${NEIGHBOR_AUTO_GUARD_SLOTS:-1}
 STATISTICS=${STATISTICS:-1}
+OFFLINE_STRESS=${OFFLINE_STRESS:-0}
 STRICT=${STRICT:-0}
 OVERWRITE=${OVERWRITE:-0}
 
@@ -101,6 +102,9 @@ if [[ -n "$SYSTEMS" ]]; then
 fi
 if [[ "$STATISTICS" != "1" ]]; then
     args+=(--no-statistics)
+fi
+if [[ "$OFFLINE_STRESS" == "1" ]]; then
+    args+=(--offline-stress)
 fi
 if [[ "$STRICT" == "1" ]]; then
     args+=(--strict)

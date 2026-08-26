@@ -4,9 +4,9 @@
 This runner is intentionally independent from the existing Cu/H2O and Opt4
 benchmarks.  It uses the official DynaMat NHC protocol and writes sampled
 trajectories to HDF5 so the public RDF/ADF/vDOS metrics can be evaluated later.
-The current eSEN energy-force path does not calculate stress, so pressure and
-private energy/force RMSE values are reported as unavailable rather than being
-silently inferred.
+The timed energy-force path does not calculate stress.  An optional untimed
+canonical checkpoint pass adds stress to saved frames for the public pressure
+metrics; private energy/force RMSE remains unavailable from the public HDF5.
 """
 
 from __future__ import annotations
@@ -107,6 +107,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Evaluate public Matbench metrics after trajectories are complete",
+    )
+    parser.add_argument(
+        "--offline-stress",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "After the timed rollout, evaluate canonical eSEN stress on saved "
+            "frames so public pressure metrics can be computed"
+        ),
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--strict", action="store_true")
@@ -736,8 +745,90 @@ def _read_prediction(path: Path):
             pbc=handle["pbc"][:].astype(bool),
             energy=handle["energy"][:],
             forces=handle["forces"][:],
+            stress=(handle["stress"][:] if "stress" in handle else None),
             md_step=handle["md_step"][:],
         )
+
+
+def _append_prediction_stress(
+    path: Path,
+    *,
+    checkpoint: Path,
+    seed: int,
+) -> dict[str, Any]:
+    """Add canonical eSEN stress to one completed prediction trajectory.
+
+    This pass is deliberately outside rollout timing.  All backends use the
+    same unfused checkpoint stress evaluator, so pressure differences measure
+    the distributions sampled by their trajectories rather than a different
+    stress implementation.  The checkpoint's EFS head computes stress as the
+    energy derivative with respect to strain/displacement.
+    """
+
+    import h5py
+    import torch
+    from ase import Atoms
+    from fairchem.core import OCPCalculator
+
+    started = time.perf_counter()
+    calculator = OCPCalculator(
+        checkpoint_path=checkpoint,
+        cpu=False,
+        seed=seed,
+        only_output=["stress"],
+        disable_amp=True,
+    )
+    try:
+        with h5py.File(path, "r+") as handle:
+            if not bool(handle.attrs.get("complete", False)):
+                raise ValueError(f"Cannot evaluate stress on incomplete {path}")
+            atomic_numbers = np.asarray(handle["atomic_numbers"][:])
+            pbc = np.asarray(handle["pbc"][:], dtype=bool)
+            positions = handle["positions"]
+            cells = handle["cell"]
+            n_frames = int(positions.shape[0])
+            if "stress" in handle:
+                del handle["stress"]
+            stress = handle.create_dataset(
+                "stress", shape=(n_frames, 6), dtype=np.float64
+            )
+            try:
+                for frame in range(n_frames):
+                    atoms = Atoms(
+                        numbers=atomic_numbers,
+                        positions=np.asarray(positions[frame]),
+                        cell=np.asarray(cells[frame]),
+                        pbc=pbc,
+                    )
+                    atoms.calc = calculator
+                    stress[frame] = np.asarray(
+                        atoms.get_stress(voigt=True), dtype=np.float64
+                    )
+                    if frame and frame % 100 == 0:
+                        print(
+                            f"offline stress {path.stem}: "
+                            f"{frame}/{n_frames}",
+                            flush=True,
+                        )
+            except BaseException:
+                del handle["stress"]
+                handle.attrs["stress_status"] = "error"
+                raise
+            handle.attrs["stress_status"] = "computed_offline"
+            handle.attrs["stress_evaluator"] = "canonical_esen_checkpoint"
+            handle.attrs["stress_frames"] = n_frames
+        torch.cuda.synchronize()
+        return {
+            "stress_status": "computed_offline",
+            "stress_frames": n_frames,
+            "stress_evaluation_wall_time_s": time.perf_counter() - started,
+            "stress_evaluator": "canonical_esen_checkpoint",
+        }
+    finally:
+        del calculator
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def _evaluate_public_metrics(args, systems, result_rows, output_dir):
@@ -924,8 +1015,8 @@ def _load_published(path: Path) -> dict[str, Any]:
         },
         "private_label_note": (
             "energy/force RMSE and pressure values are published references; "
-            "the public HDF5 has no energy/force labels and this runner does not "
-            "compute predicted stress."
+            "the public HDF5 has no energy/force labels. Local pressure is "
+            "reproducible only when the independent offline stress pass is enabled."
         ),
     }
 
@@ -935,7 +1026,8 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         "# eSEN Matbench MD report",
         "",
         "The rollout uses the official NHC protocol. Public HDF5 data does not "
-        "contain energy/force labels; predicted stress is not computed in this run.",
+        "contain energy/force labels. Stress, when requested, is computed in a "
+        "separate canonical eSEN pass outside rollout timing.",
         "Short/single-system runs use the official RDF/ADF/vDOS definitions and "
         "a matched physical-time window, but are pilot results rather than a "
         "17-system leaderboard score.",
@@ -973,8 +1065,8 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         json.dumps(report["published_esen_30m_oam"], indent=2),
         "```",
         "",
-        "Pressure and private energy/force metrics are intentionally marked "
-        "unavailable until the independent stress/private-label pass is added.",
+        "Private energy/force metrics remain unavailable. Pressure metrics are "
+        "reported only for trajectories whose offline stress pass completed.",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1032,6 +1124,8 @@ def main(argv: list[str] | None = None) -> int:
                 "thermostat_time_fs": args.thermostat_time_fs,
                 "seed": args.seed,
                 "warmup_steps": 0,
+                "offline_stress": args.offline_stress,
+                "offline_stress_in_rollout_timing": False,
             },
             "opt4": {
                 "fusion_stage": args.opt4_fusion_stage,
@@ -1120,8 +1214,26 @@ def main(argv: list[str] | None = None) -> int:
                     },
                 )
                 serialization_elapsed = time.perf_counter() - serialization_started
+                stress_result: dict[str, Any] = {
+                    "stress_status": "not_requested"
+                }
+                if args.offline_stress:
+                    try:
+                        stress_result = _append_prediction_stress(
+                            trajectory_path,
+                            checkpoint=args.checkpoint,
+                            seed=args.seed,
+                        )
+                    except Exception as stress_exc:
+                        stress_result = {
+                            "stress_status": "error",
+                            "stress_error": (
+                                f"{type(stress_exc).__name__}: {stress_exc}"
+                            ),
+                        }
                 graph_stats = execution.pop("graph_stats", {})
                 record.update(execution)
+                record.update(stress_result)
                 record["graph_stats"] = graph_stats
                 record["trajectory_path"] = str(trajectory_path.resolve())
                 record["trajectory_frames"] = recorder.completed_frames
@@ -1153,6 +1265,13 @@ def main(argv: list[str] | None = None) -> int:
                         else:
                             record["status"] = "graph_invariant_failed"
                             record["exit_code"] = 43
+                if (
+                    args.offline_stress
+                    and record["status"] == "success"
+                    and record.get("stress_status") != "computed_offline"
+                ):
+                    record["status"] = "stress_failed"
+                    record["exit_code"] = 47
             except BaseException as exc:
                 if _is_oom(exc):
                     record["status"] = "oom"
@@ -1228,6 +1347,18 @@ def main(argv: list[str] | None = None) -> int:
     public_metrics = _evaluate_public_metrics(
         args, systems, run_rows, args.output_dir
     )
+    successful_rows = [
+        row for row in run_rows if row.get("status") == "success"
+    ]
+    pressure_status = (
+        "available_offline_canonical_esen"
+        if successful_rows
+        and all(
+            row.get("stress_status") == "computed_offline"
+            for row in successful_rows
+        )
+        else "unavailable_or_partial_stress"
+    )
     report = {
         "schema": 1,
         "benchmark": "matbench-dynamat-v1.0",
@@ -1246,6 +1377,8 @@ def main(argv: list[str] | None = None) -> int:
             "thermostat_time_fs": args.thermostat_time_fs,
             "seed": args.seed,
             "warmup_steps": 0,
+            "offline_stress": args.offline_stress,
+            "offline_stress_in_rollout_timing": False,
             "dtype": "FP64 MD state / FP32 eSEN model",
         },
         "opt4": {
@@ -1291,7 +1424,7 @@ def main(argv: list[str] | None = None) -> int:
             "pilot_metrics_not_a_17_system_leaderboard_score": bool(
                 len(systems) != 17 or args.steps != STEPS
             ),
-            "pressure_status": "unavailable_stress_not_computed",
+            "pressure_status": pressure_status,
             "private_energy_force_status": "unavailable_public_reference_has_no_labels",
             "speed_comparison_scope": "same GPU, same software, same NHC protocol",
         },

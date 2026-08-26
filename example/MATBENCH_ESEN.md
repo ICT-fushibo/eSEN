@@ -28,8 +28,8 @@ integrator rather than reusing the Cu/H2O Berendsen path.
 
 This launcher pins every physical setting to Matbench and changes only the
 step count. It runs baseline, Opt2, Opt3, and Opt4 serially on one GPU and uses
-`anthracene_293K_Sharma_S` by default because its reference trajectory covers
-the complete 2.5 ps prediction window:
+`bulkCu_1000K_Kapil` (108 atoms, with reference stress) by default. Its
+reference trajectory covers the complete 2.5 ps prediction window:
 
 ```bash
 GPU=0 \
@@ -39,8 +39,10 @@ SAVE_DIR=/home/fushibo/eSEN/example/md_out/matbench_10k_pilot \
 bash example/run_esen_matbench_10k_pilot.sh
 ```
 
-RDF/ADF/vDOS use the official implementation and the common 0--2.5 ps time
-window. A one-system 10,000-step result is a diagnostic pilot, not a published
+RDF/ADF/vDOS and pressure PMAE/PW1/error use the official implementation and
+the common 0--2.5 ps time window. Predicted stress is evaluated after rollout
+with the canonical checkpoint and is explicitly excluded from seconds/step.
+A one-system 10,000-step result is a diagnostic pilot, not a published
 17-system leaderboard score.
 
 ## Smoke

@@ -11,7 +11,7 @@ GPU=${GPU:-0}
 REFERENCE_H5=${REFERENCE_H5:-/home/fushibo/matbench-discovery-data/2026-06-29-dynamat-v1.0-reference-trajectories.h5}
 MATBENCH_REPO=${MATBENCH_REPO:-/home/fushibo/matbench-discovery}
 CHECKPOINT=${CHECKPOINT:-$REPO_ROOT/esen_30m_oam.pt}
-SYSTEM=${SYSTEM:-anthracene_293K_Sharma_S}
+SYSTEM=${SYSTEM:-bulkCu_1000K_Kapil}
 SAVE_DIR=${SAVE_DIR:-$REPO_ROOT/example/md_out/matbench_10k_${SYSTEM}_gpu${GPU}_$(date '+%Y%m%d_%H%M%S')}
 
 if [[ "${STEPS:-10000}" != "10000" ]]; then
@@ -34,7 +34,7 @@ fi
 
 export GPU REFERENCE_H5 MATBENCH_REPO CHECKPOINT SYSTEMS="$SYSTEM" SAVE_DIR
 export BACKENDS="baseline opt2 opt3 opt4"
-export STEPS=10000 RECORD_INTERVAL=10 SEED=0 STATISTICS=1
+export STEPS=10000 RECORD_INTERVAL=10 SEED=0 STATISTICS=1 OFFLINE_STRESS=1
 export OPT4_MODEL_FUSIONS="rmsnorm,so2-epilogue,so2-gate-bridge,so2-block-gemm,so2-prepare-backward-reduce"
 export OPT4_FUSION_STAGE=OPT4V4_FP32
 export OPT4_NEIGHBOR_CAPACITY_POLICY=auto-safe
