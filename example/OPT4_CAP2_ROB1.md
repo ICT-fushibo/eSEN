@@ -26,6 +26,9 @@ python -m pytest -q --noconftest \
 The smoke includes normal Cu32/H2O32/bulkCu runs and forced-low-capacity runs
 that must roll back, recapture, and reproduce the sufficient-capacity bulkCu
 trajectory.
+Standard smoke systems can be overridden with `SMOKE_SYSTEMS`; the generic
+`SYSTEMS` variable is intentionally ignored so an exported formal-test matrix
+cannot leak into this test.
 
 ```bash
 GPU=0 \

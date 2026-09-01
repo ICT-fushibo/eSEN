@@ -10,7 +10,9 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CHECKPOINT=${CHECKPOINT:-"$REPO_ROOT/esen_30m_oam.pt"}
 STRUCTURE_DIR=${STRUCTURE_DIR:-"$REPO_ROOT/../MatRIS-09bk/example/cif_file"}
 MATBENCH_REPO=${MATBENCH_REPO:-"$REPO_ROOT/../matbench-discovery"}
-SYSTEMS=${SYSTEMS:-"Cu32 H2O32"}
+# Use a smoke-specific name so that a SYSTEMS value exported by a previous
+# formal run cannot accidentally expand this recovery test to the full matrix.
+SMOKE_SYSTEMS=${SMOKE_SYSTEMS:-"Cu32 H2O32"}
 V4_FUSIONS=${V4_FUSIONS:-rmsnorm,so2-epilogue,so2-gate-bridge,so2-block-gemm,so2-prepare-backward-reduce}
 
 mkdir -p "$OUTPUT_DIR"
@@ -57,7 +59,7 @@ run_standard() {
 
 for mode in normal forced; do
     if [[ "$mode" == normal ]]; then limit=0; else limit=1; fi
-    for system in $SYSTEMS; do
+    for system in $SMOKE_SYSTEMS; do
         run_standard "$mode" "$limit" "$system"
     done
 
@@ -83,7 +85,7 @@ for mode in normal forced; do
     fi
 done
 
-python - "$OUTPUT_DIR" <<'PY'
+python - "$OUTPUT_DIR" "$SMOKE_SYSTEMS" <<'PY'
 import json
 import pathlib
 import sys
@@ -92,6 +94,7 @@ import h5py
 import numpy as np
 
 root = pathlib.Path(sys.argv[1])
+smoke_systems = sys.argv[2].split()
 failures = []
 checked = 0
 
@@ -100,7 +103,13 @@ paths += list(root.glob("matbench_*/runs/opt4/*.json"))
 for path in sorted(paths):
     row = json.loads(path.read_text(encoding="utf-8"))
     stats = row.get("graph_stats", row)
-    mode = "forced" if "forced" in path.parts else "normal"
+    # The directory components are named standard_forced/matbench_forced;
+    # checking for an exact component named "forced" misclassifies them.
+    mode = (
+        "forced"
+        if any(part.endswith("_forced") for part in path.parts)
+        else "normal"
+    )
     checked += 1
     expected_replays = 31
     checks = {
@@ -135,8 +144,9 @@ for path in sorted(paths):
         if not passed:
             failures.append(f"{path}: {name}")
 
-if checked != 6:
-    failures.append(f"expected 6 smoke JSON files, found {checked}")
+expected = 2 * len(smoke_systems) + 2  # normal/forced standard + Matbench
+if checked != expected:
+    failures.append(f"expected {expected} smoke JSON files, found {checked}")
 
 normal_h5 = root / "matbench_normal/trajectories/opt4/bulkCu_1000K_Kapil.h5"
 forced_h5 = root / "matbench_forced/trajectories/opt4/bulkCu_1000K_Kapil.h5"
