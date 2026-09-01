@@ -9,9 +9,11 @@ from fairchem.core.applications.esen_fixed_neighbor import (
     FixedShapePBCNeighborBuilder,
     atom_neighbor_capacities_from_probe,
     auto_neighbor_capacities_from_probe,
+    elastic_neighbor_capacities_from_probe,
     maximum_neighbors_in_graph,
     neighbor_counts_in_graph,
     neighbor_capacity_from_probe,
+    promote_elastic_neighbor_capacities,
     species_neighbor_capacities_from_probe,
 )
 from fairchem.core.common.utils import radius_graph_pbc
@@ -43,6 +45,58 @@ def test_neighbor_capacity_from_probe_adds_margin_and_rounds():
     assert neighbor_capacity_from_probe(8, margin=0.0, slot_step=8) == 16
     with pytest.raises(ValueError):
         neighbor_capacity_from_probe(0)
+
+
+def test_elastic_capacity_uses_compact_start_and_monotonic_promotions():
+    selected, compact_selected, reduction, compact = (
+        elastic_neighbor_capacities_from_probe(
+            [79, 12, 11],
+            [88, 24, 24],
+            margin=0.0,
+            slot_step=4,
+            minimum_reduction=0.05,
+        )
+    )
+    assert selected == compact == (80, 16, 12)
+    assert compact_selected
+    assert reduction > 0.05
+
+    species, policy = promote_elastic_neighbor_capacities(
+        selected,
+        [81, 17, 15],
+        [29, 8, 8],
+        promotion_index=0,
+    )
+    assert policy == "species"
+    assert species == (84, 20, 20)
+    uniform, policy = promote_elastic_neighbor_capacities(
+        species,
+        [85, 18, 17],
+        [29, 8, 8],
+        promotion_index=1,
+    )
+    assert policy == "uniform"
+    assert uniform == (96, 96, 96)
+    assert all(after >= before for before, after in zip(species, uniform))
+    with pytest.raises(ValueError, match="at most two"):
+        promote_elastic_neighbor_capacities(
+            uniform,
+            [97, 97, 97],
+            [29, 8, 8],
+            promotion_index=2,
+        )
+
+
+def test_elastic_capacity_falls_back_to_auto_safe_when_reduction_is_small():
+    selected, compact_selected, reduction, compact = (
+        elastic_neighbor_capacities_from_probe(
+            [79, 79], [88, 88], minimum_reduction=0.20
+        )
+    )
+    assert compact == (80, 80)
+    assert selected == (88, 88)
+    assert not compact_selected
+    assert reduction < 0.20
 
 
 def test_species_neighbor_capacities_use_each_species_probe_maximum():
@@ -275,3 +329,44 @@ def test_fixed_builder_detects_heterogeneous_slot_overflow():
     assert stats["fixed_builder_max_capacity_excess"] == 1
     assert stats["fixed_builder_max_overflow_required"] == 2
     assert stats["fixed_builder_max_overflow_capacity"] == 1
+
+
+def test_fixed_builder_overflow_uses_balanced_dummy_only_sink_graph():
+    positions = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.8, 0.0, 0.0], [1.6, 0.0, 0.0]]
+    )
+    builder = FixedShapePBCNeighborBuilder(
+        num_atoms=3,
+        cell=torch.diag(torch.tensor([20.0, 20.0, 20.0])),
+        pbc=torch.tensor([False, False, False]),
+        cutoff=1.0,
+        neighbors_per_atom=1,
+        neighbor_capacities=(1, 1, 1),
+        capacity_policy="elastic",
+        dummy_atoms=2,
+        overflow_to_dummy_only=True,
+    )
+    edge_address = builder.edge_index.data_ptr()
+    builder.reset_window_stats()
+    builder.build(positions, step=torch.tensor(3))
+
+    assert builder.edge_index.data_ptr() == edge_address
+    assert bool((builder.edge_index >= 3).all())
+    torch.testing.assert_close(builder.edge_index[0], builder.edge_index[1])
+    sink_vectors = builder.cell_offsets @ builder.cell
+    sink_distances = torch.linalg.vector_norm(sink_vectors, dim=1)
+    assert bool((sink_distances > builder.cutoff).all())
+    assert bool(torch.isfinite(sink_vectors / sink_distances[:, None]).all())
+    counts = torch.bincount(builder.edge_index[0] - 3, minlength=2)
+    assert int(counts.max() - counts.min()) <= 1
+    window = builder.window_stats()
+    assert window["fixed_builder_window_capacity_misses"] == 1
+    assert window["fixed_builder_window_overflow_dummy_only_replays"] == 1
+    assert window[
+        "fixed_builder_window_maximum_included_neighbors_by_atom"
+    ] == [1, 2, 1]
+    stats = builder.stats()
+    assert stats["sink_padding_mode"] == "distributed_dummy_self_edges"
+    assert stats["sink_nonzero_shift_verified"]
+    assert stats["sink_cutoff_zero_verified"]
+    assert stats["overflow_dummy_only_replays"] == 1

@@ -7,6 +7,7 @@ capture used to isolate the incremental benefit of widening CUDA Graph scope.
 
 from __future__ import annotations
 
+import gc
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -21,6 +22,7 @@ from fairchem.core.applications.esen_cuda_graph import (
 )
 from fairchem.core.applications.esen_fixed_neighbor import (
     FixedShapePBCNeighborBuilder,
+    promote_elastic_neighbor_capacities,
 )
 from fairchem.core.applications.esen_gpu_md import (
     ESENEnergyForceEvaluator,
@@ -257,6 +259,7 @@ class ESENWholeStepCUDAGraphMD:
         capture_warmup: int = 3,
         max_neighbors: int = 300,
         degeneracy_tolerance: float = 0.01,
+        overflow_to_dummy_only: bool = False,
     ) -> None:
         if eager_evaluator.device.type != "cuda":
             raise ValueError("Whole-step CUDA Graph requires CUDA")
@@ -301,6 +304,7 @@ class ESENWholeStepCUDAGraphMD:
             dummy_atoms=dummy_atoms,
             max_neighbors=max_neighbors,
             degeneracy_tolerance=degeneracy_tolerance,
+            overflow_to_dummy_only=overflow_to_dummy_only,
             output_edge_index=self.core.static_edge_index,
             output_cell_offsets=self.core.static_cell_offsets,
         )
@@ -540,3 +544,489 @@ class ESENWholeStepCUDAGraphMD:
                 else self.capture_device_used_delta_bytes / 1024**3
             ),
         }
+
+
+class UnrecoveredCapacityOverflow(CUDAGraphCapacityError):
+    """Raised after CAP2 exhausts its monotonic promotion budget."""
+
+    def __init__(
+        self,
+        required_edges: int,
+        edge_capacity: int,
+        graph_stats: dict[str, Any],
+    ) -> None:
+        super().__init__(required_edges, edge_capacity)
+        self.graph_stats = graph_stats
+
+
+class WholeStepTransactionSnapshot:
+    """Fixed-address GPU backup for one rollback transaction."""
+
+    def __init__(self, whole: ESENWholeStepCUDAGraphMD) -> None:
+        self.positions = torch.empty_like(whole.positions)
+        self.momenta = torch.empty_like(whole.momenta)
+        self.forces = torch.empty_like(whole.forces)
+        self.potential_energy = torch.empty_like(whole.potential_energy)
+        self.step_counter = torch.empty_like(whole.step_counter)
+        self.advance = torch.empty_like(whole.advance)
+        eta = getattr(whole.integrator, "eta", None)
+        p_eta = getattr(whole.integrator, "p_eta", None)
+        self.eta = torch.empty_like(eta) if isinstance(eta, Tensor) else None
+        self.p_eta = (
+            torch.empty_like(p_eta) if isinstance(p_eta, Tensor) else None
+        )
+        self._addresses = self.addresses()
+
+    def addresses(self) -> tuple[int, ...]:
+        tensors = [
+            self.positions,
+            self.momenta,
+            self.forces,
+            self.potential_energy,
+            self.step_counter,
+            self.advance,
+        ]
+        if self.eta is not None:
+            tensors.append(self.eta)
+        if self.p_eta is not None:
+            tensors.append(self.p_eta)
+        return tuple(tensor.data_ptr() for tensor in tensors)
+
+    @property
+    def addresses_stable(self) -> bool:
+        return self.addresses() == self._addresses
+
+    @torch.no_grad()
+    def save_from_(self, whole: ESENWholeStepCUDAGraphMD) -> None:
+        self.positions.copy_(whole.positions)
+        self.momenta.copy_(whole.momenta)
+        self.forces.copy_(whole.forces)
+        self.potential_energy.copy_(whole.potential_energy)
+        self.step_counter.copy_(whole.step_counter)
+        self.advance.copy_(whole.advance)
+        if self.eta is not None:
+            self.eta.copy_(whole.integrator.eta)
+        if self.p_eta is not None:
+            self.p_eta.copy_(whole.integrator.p_eta)
+
+    def state_view(self) -> GPUMDState:
+        return GPUMDState(
+            positions=self.positions,
+            momenta=self.momenta,
+            forces=self.forces,
+            potential_energy=self.potential_energy,
+        )
+
+    @torch.no_grad()
+    def restore_integrator_(self, integrator: GPUIntegrator) -> None:
+        if self.eta is not None:
+            integrator.eta.copy_(self.eta)
+        if self.p_eta is not None:
+            integrator.p_eta.copy_(self.p_eta)
+
+    @torch.no_grad()
+    def restore_into_(self, whole: ESENWholeStepCUDAGraphMD) -> None:
+        whole.positions.copy_(self.positions)
+        whole.momenta.copy_(self.momenta)
+        whole.forces.copy_(self.forces)
+        whole.potential_energy.copy_(self.potential_energy)
+        whole.step_counter.copy_(self.step_counter)
+        whole.advance.copy_(self.advance)
+        self.restore_integrator_(whole.integrator)
+
+
+class ElasticWholeStepCUDAGraphController:
+    """CAP2/ROB1 wrapper around a single active whole-step CUDA Graph.
+
+    A failed transaction is never committed.  Its complete MD state is
+    restored, the capacity is promoted from device-observed per-atom demand,
+    and the same physical steps are replayed with a newly captured graph.
+    """
+
+    def __init__(
+        self,
+        state: GPUMDState,
+        eager_evaluator: ESENEnergyForceEvaluator,
+        integrator: GPUIntegrator,
+        *,
+        whole_class: type[ESENWholeStepCUDAGraphMD],
+        atomic_numbers: Tensor | Sequence[int],
+        neighbor_capacities: Tensor | Sequence[int],
+        max_promotions: int = 2,
+        whole_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        if max_promotions < 0 or max_promotions > 2:
+            raise ValueError("CAP2 max_promotions must be between zero and two")
+        capacities = tuple(
+            int(value)
+            for value in torch.as_tensor(
+                neighbor_capacities, device="cpu", dtype=torch.long
+            )
+            .reshape(-1)
+            .tolist()
+        )
+        numbers = tuple(
+            int(value)
+            for value in torch.as_tensor(
+                atomic_numbers, device="cpu", dtype=torch.long
+            )
+            .reshape(-1)
+            .tolist()
+        )
+        if len(capacities) != eager_evaluator.num_atoms:
+            raise ValueError("CAP2 requires one capacity per real atom")
+        if len(numbers) != len(capacities):
+            raise ValueError("atomic_numbers must match CAP2 capacities")
+        self.eager_evaluator = eager_evaluator
+        self.integrator = integrator
+        self.whole_class = whole_class
+        self.atomic_numbers = numbers
+        self.current_capacities = capacities
+        self.initial_capacities = capacities
+        self.max_promotions = int(max_promotions)
+        self.whole_kwargs = dict(whole_kwargs or {})
+        self.whole: ESENWholeStepCUDAGraphMD | None = self._new_whole(state)
+        self.snapshot: WholeStepTransactionSnapshot | None = None
+        self.setup_capture_count = 0
+        self.recovery_capture_count = 0
+        self.capture_wall_time_s = 0.0
+        self.recovery_capture_wall_time_s = 0.0
+        self.attempted_replays = 0
+        self.committed_replays = 0
+        self.discarded_replays = 0
+        self.committed_physical_steps = 0
+        self.rollback_count = 0
+        self.retried_physical_steps = 0
+        self.detected_overflow_replays = 0
+        self.unrecovered_overflows = 0
+        self.promotion_count = 0
+        self.promotion_history: list[dict[str, Any]] = []
+        self._retired_stats: list[dict[str, Any]] = []
+
+    def _new_whole(self, state: GPUMDState) -> ESENWholeStepCUDAGraphMD:
+        kwargs = dict(self.whole_kwargs)
+        kwargs.update(
+            neighbors_per_atom=max(self.current_capacities),
+            neighbor_capacities=self.current_capacities,
+            neighbor_capacity_policy="elastic",
+            overflow_to_dummy_only=True,
+        )
+        return self.whole_class(
+            state,
+            self.eager_evaluator,
+            self.integrator,
+            **kwargs,
+        )
+
+    def capture(self, initial_state: GPUMDState) -> None:
+        if self.whole is None:
+            raise RuntimeError("CAP2 controller has no active graph")
+        self.whole.capture(initial_state)
+        self.setup_capture_count = 1
+        self.capture_wall_time_s = self.whole.capture_wall_time_s
+        self.snapshot = WholeStepTransactionSnapshot(self.whole)
+
+    def _active(self) -> ESENWholeStepCUDAGraphMD:
+        if self.whole is None or self.snapshot is None:
+            raise RuntimeError("CAP2 graph must be captured before replay")
+        return self.whole
+
+    @staticmethod
+    def _synchronize(whole: ESENWholeStepCUDAGraphMD) -> None:
+        if torch.device(whole.device).type == "cuda":
+            torch.cuda.synchronize(whole.device)
+
+    def reset_production(self, initial_state: GPUMDState) -> None:
+        whole = self._active()
+        whole.reset_production(initial_state)
+        self.attempted_replays = 0
+        self.committed_replays = 0
+        self.discarded_replays = 0
+        self.committed_physical_steps = 0
+        self.rollback_count = 0
+        self.retried_physical_steps = 0
+        self.detected_overflow_replays = 0
+        self.unrecovered_overflows = 0
+        # Capacity is monotonic for the lifetime of the controller.  In
+        # particular, a setup/warmup promotion must still consume one of the
+        # two allowed promotions; resetting the physical MD state may not
+        # silently reset the CAP2 safety state or resurrect an old graph.
+
+    def _promote_and_recapture(
+        self,
+        demand: Sequence[int],
+        *,
+        transaction_steps: int,
+    ) -> None:
+        whole = self._active()
+        assert self.snapshot is not None
+        if self.promotion_count >= self.max_promotions:
+            self.snapshot.restore_into_(whole)
+            self._synchronize(whole)
+            self.unrecovered_overflows += 1
+            stats = self.stats()
+            required = max(int(value) for value in demand)
+            raise UnrecoveredCapacityOverflow(
+                required, max(self.current_capacities), stats
+            )
+        previous = self.current_capacities
+        promoted, policy = promote_elastic_neighbor_capacities(
+            previous,
+            demand,
+            self.atomic_numbers,
+            promotion_index=self.promotion_count,
+        )
+        if sum(promoted) <= sum(previous):
+            self.snapshot.restore_into_(whole)
+            self._synchronize(whole)
+            self.unrecovered_overflows += 1
+            stats = self.stats()
+            raise UnrecoveredCapacityOverflow(
+                max(int(value) for value in demand),
+                max(previous),
+                stats,
+            )
+        recovery_started = time.perf_counter()
+        self.snapshot.restore_into_(whole)
+        self._synchronize(whole)
+        retired = whole.stats()
+        self._retired_stats.append(retired)
+        old_edge_capacity = sum(previous)
+        whole.graph = None
+        whole.capture_stream = None
+        self.whole = None
+        del whole
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        self.current_capacities = promoted
+        self.snapshot.restore_integrator_(self.integrator)
+        state = self.snapshot.state_view()
+        replacement = self._new_whole(state)
+        replacement.capture(state)
+        self._synchronize(replacement)
+        capture_elapsed = time.perf_counter() - recovery_started
+        self.snapshot.restore_into_(replacement)
+        replacement.fixed_builder.reset_stats()
+        self.whole = replacement
+        self.promotion_history.append(
+            {
+                "promotion_index": self.promotion_count + 1,
+                "policy": policy,
+                "transaction_steps": transaction_steps,
+                "required_max_neighbors": max(int(value) for value in demand),
+                "old_edge_capacity": old_edge_capacity,
+                "new_edge_capacity": sum(promoted),
+                "old_capacity_min": min(previous),
+                "old_capacity_max": max(previous),
+                "new_capacity_min": min(promoted),
+                "new_capacity_max": max(promoted),
+                "capture_wall_time_s": capture_elapsed,
+            }
+        )
+        self.promotion_count += 1
+        self.recovery_capture_count += 1
+        self.recovery_capture_wall_time_s += capture_elapsed
+
+    def _run_transaction(
+        self,
+        steps: int,
+        *,
+        initial: bool,
+        checkpoint_offsets: Sequence[int] = (),
+    ) -> tuple[Tensor, Tensor, dict[int, Tensor]]:
+        if steps < 0 or (initial and steps != 0) or (not initial and steps < 1):
+            raise ValueError("invalid ROB1 transaction length")
+        requested_offsets = {int(value) for value in checkpoint_offsets}
+        if initial and requested_offsets:
+            raise ValueError("initial transactions do not have step offsets")
+        if any(value < 1 or value > steps for value in requested_offsets):
+            raise ValueError("checkpoint offsets must lie inside the transaction")
+        while True:
+            whole = self._active()
+            assert self.snapshot is not None
+            self.snapshot.save_from_(whole)
+            whole.fixed_builder.reset_window_stats()
+            if initial:
+                forces, energy = whole.evaluate_initial()
+                replay_count = 1
+            else:
+                forces = whole.forces
+                energy = whole.potential_energy
+                pending_checkpoints: dict[int, Tensor] = {}
+                for offset in range(1, steps + 1):
+                    forces, energy = whole.step()
+                    if offset in requested_offsets:
+                        pending_checkpoints[offset] = energy.detach().clone()
+                replay_count = steps
+            if initial:
+                pending_checkpoints = {}
+            self._synchronize(whole)
+            window = whole.fixed_builder.window_stats()
+            self.attempted_replays += replay_count
+            misses = int(window["fixed_builder_window_capacity_misses"])
+            if misses == 0:
+                self.committed_replays += replay_count
+                if not initial:
+                    self.committed_physical_steps += steps
+                return forces, energy, pending_checkpoints
+
+            self.detected_overflow_replays += int(
+                window["fixed_builder_window_overflow_dummy_only_replays"]
+            )
+            self.discarded_replays += replay_count
+            self.rollback_count += 1
+            if not initial:
+                self.retried_physical_steps += steps
+            demand = window[
+                "fixed_builder_window_maximum_included_neighbors_by_atom"
+            ]
+            self._promote_and_recapture(
+                demand, transaction_steps=(0 if initial else steps)
+            )
+
+    def evaluate_initial(self) -> tuple[Tensor, Tensor]:
+        forces, energy, _ = self._run_transaction(0, initial=True)
+        return forces, energy
+
+    def run_steps(self, steps: int) -> tuple[Tensor, Tensor]:
+        forces, energy, _ = self._run_transaction(steps, initial=False)
+        return forces, energy
+
+    def run_steps_with_checkpoints(
+        self,
+        steps: int,
+        checkpoint_offsets: Sequence[int],
+    ) -> tuple[Tensor, Tensor, dict[int, Tensor]]:
+        """Run one transaction and publish only checkpoints from its commit."""
+
+        return self._run_transaction(
+            steps,
+            initial=False,
+            checkpoint_offsets=checkpoint_offsets,
+        )
+
+    def step(self) -> tuple[Tensor, Tensor]:
+        return self.run_steps(1)
+
+    def state_view(self) -> GPUMDState:
+        return self._active().state_view()
+
+    def stats(self) -> dict[str, Any]:
+        whole = self._active()
+        active = whole.stats()
+        histories = [*self._retired_stats, active]
+        addresses_stable = bool(
+            self.snapshot is not None
+            and self.snapshot.addresses_stable
+            and all(
+                row.get("cuda_graph_replay_output_addresses_stable", False)
+                for row in histories
+            )
+        )
+        min_real_values = [
+            row.get("fixed_builder_min_real_edges")
+            for row in histories
+            if row.get("fixed_builder_min_real_edges") is not None
+        ]
+        max_real_values = [
+            row.get("fixed_builder_max_real_edges")
+            for row in histories
+            if row.get("fixed_builder_max_real_edges") is not None
+        ]
+        sink_min_values = [
+            row.get("sink_padding_edges_min")
+            for row in histories
+            if row.get("sink_padding_edges_min") is not None
+        ]
+        sink_max_values = [
+            row.get("sink_padding_edges_max")
+            for row in histories
+            if row.get("sink_padding_edges_max") is not None
+        ]
+        total_calls = sum(
+            int(row.get("fixed_builder_build_calls", 0)) for row in histories
+        )
+        total_dummy_only = sum(
+            int(row.get("overflow_dummy_only_replays", 0))
+            for row in histories
+        )
+        active.update(
+            {
+                "cuda_graph_capture_count": self.setup_capture_count,
+                "cuda_graph_recovery_capture_count": self.recovery_capture_count,
+                "cuda_graph_total_capture_count": (
+                    self.setup_capture_count + self.recovery_capture_count
+                ),
+                "cuda_graph_production_capture_count": self.recovery_capture_count,
+                "cuda_graph_capture_wall_time_s": self.capture_wall_time_s,
+                "cuda_graph_recovery_capture_wall_time_s": (
+                    self.recovery_capture_wall_time_s
+                ),
+                "cuda_graph_total_capture_wall_time_s": (
+                    self.capture_wall_time_s + self.recovery_capture_wall_time_s
+                ),
+                "setup_capture_count": self.setup_capture_count,
+                "setup_capture_wall_time_s": self.capture_wall_time_s,
+                "recovery_capture_count": self.recovery_capture_count,
+                "recovery_capture_wall_time_s": (
+                    self.recovery_capture_wall_time_s
+                ),
+                "cuda_graph_total_replays": self.attempted_replays,
+                "cuda_graph_attempted_replays": self.attempted_replays,
+                "cuda_graph_production_replays": self.committed_replays,
+                "cuda_graph_committed_replays": self.committed_replays,
+                "cuda_graph_discarded_replays": self.discarded_replays,
+                "cuda_graph_production_calls": self.committed_replays,
+                "cuda_graph_attempted_calls": total_calls,
+                "cuda_graph_capacity_misses": self.unrecovered_overflows,
+                "cuda_graph_recovered_capacity_misses": self.rollback_count,
+                "cuda_graph_hit_rate": (
+                    1.0 if self.committed_replays else 0.0
+                ),
+                "cuda_graph_attempted_hit_rate": (
+                    self.committed_replays / self.attempted_replays
+                    if self.attempted_replays
+                    else 0.0
+                ),
+                "cuda_graph_edge_capacity": sum(self.current_capacities),
+                "cuda_graph_initial_edge_capacity": sum(self.initial_capacities),
+                "cuda_graph_final_edge_capacity": sum(self.current_capacities),
+                "cuda_graph_min_real_edges": (
+                    min(min_real_values) if min_real_values else None
+                ),
+                "cuda_graph_max_real_edges": (
+                    max(max_real_values) if max_real_values else None
+                ),
+                "cuda_graph_replay_output_addresses_stable": addresses_stable,
+                "rob1_enabled": True,
+                "rob1_attempted_replays": self.attempted_replays,
+                "rob1_committed_replays": self.committed_replays,
+                "rob1_discarded_replays": self.discarded_replays,
+                "rob1_committed_physical_steps": self.committed_physical_steps,
+                "rob1_rollback_count": self.rollback_count,
+                "rob1_retried_physical_steps": self.retried_physical_steps,
+                "rob1_unrecovered_overflows": self.unrecovered_overflows,
+                "capacity_misses_after_final_retry": (
+                    self.unrecovered_overflows
+                ),
+                "unrecovered_overflow_count": self.unrecovered_overflows,
+                "rob1_snapshot_addresses_stable": (
+                    self.snapshot.addresses_stable
+                    if self.snapshot is not None
+                    else False
+                ),
+                "cap2_promotion_count": self.promotion_count,
+                "cap2_promotion_history": self.promotion_history,
+                "cap2_initial_capacities": list(self.initial_capacities),
+                "cap2_final_capacities": list(self.current_capacities),
+                "sink_padding_edges_min": (
+                    min(sink_min_values) if sink_min_values else None
+                ),
+                "sink_padding_edges_max": (
+                    max(sink_max_values) if sink_max_values else None
+                ),
+                "overflow_dummy_only_replays": total_dummy_only,
+            }
+        )
+        return active

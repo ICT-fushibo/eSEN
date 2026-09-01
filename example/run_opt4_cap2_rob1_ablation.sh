@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Interleaved CAP1-auto-safe versus CAP2+sink+ROB1 whole-step ablation.
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+: "${GPU:?Set the physical GPU index}"
+: "${OUTPUT_DIR:?Set OUTPUT_DIR}"
+
+CHECKPOINT=${CHECKPOINT:-"$REPO_ROOT/esen_30m_oam.pt"}
+STRUCTURE_DIR=${STRUCTURE_DIR:-"$REPO_ROOT/../MatRIS-09bk/example/cif_file"}
+BASELINE_DIR=${BASELINE_DIR:-}
+SYSTEMS=${SYSTEMS:-"Cu32 Cu512 H2O32 H2O192"}
+TEMPERATURES=${TEMPERATURES:-"300"}
+STEPS=${STEPS:-100}
+REPEATS=${REPEATS:-3}
+WARMUP_STEPS=${WARMUP_STEPS:-3}
+PROBE_STEPS=${PROBE_STEPS:-50}
+ROB1_WINDOW_STEPS=${ROB1_WINDOW_STEPS:-10}
+ROB1_MAX_RETRIES=${ROB1_MAX_RETRIES:-2}
+CAP2_COMPACT_SLOT_STEP=${CAP2_COMPACT_SLOT_STEP:-4}
+CAP2_COMPACT_MARGIN=${CAP2_COMPACT_MARGIN:-0.0}
+CAP2_MIN_REDUCTION=${CAP2_MIN_REDUCTION:-0.05}
+V4_FUSIONS=${V4_FUSIONS:-rmsnorm,so2-epilogue,so2-gate-bridge,so2-block-gemm,so2-prepare-backward-reduce}
+
+env \
+    GPU="$GPU" \
+    SCOPE=whole-step \
+    CHECKPOINT="$CHECKPOINT" \
+    STRUCTURE_DIR="$STRUCTURE_DIR" \
+    BASELINE_DIR="$BASELINE_DIR" \
+    SYSTEMS="$SYSTEMS" \
+    TEMPERATURES="$TEMPERATURES" \
+    STEPS="$STEPS" \
+    REPEATS="$REPEATS" \
+    WARMUP_STEPS="$WARMUP_STEPS" \
+    PROBE_STEPS="$PROBE_STEPS" \
+    OUTPUT_DIR="$OUTPUT_DIR" \
+    BASE_STAGE=OPT4V4_CAP1_AUTO_SAFE \
+    BASE_FUSIONS="$V4_FUSIONS" \
+    BASE_NEIGHBOR_CAPACITY_POLICY=auto-safe \
+    BASE_ROB1=0 \
+    CANDIDATE_STAGE=CAP2_ROB1 \
+    CANDIDATE_FUSIONS="$V4_FUSIONS" \
+    CANDIDATE_NEIGHBOR_CAPACITY_POLICY=elastic \
+    CANDIDATE_ROB1=1 \
+    ROB1_WINDOW_STEPS="$ROB1_WINDOW_STEPS" \
+    ROB1_MAX_RETRIES="$ROB1_MAX_RETRIES" \
+    CAP2_COMPACT_SLOT_STEP="$CAP2_COMPACT_SLOT_STEP" \
+    CAP2_COMPACT_MARGIN="$CAP2_COMPACT_MARGIN" \
+    CAP2_MIN_REDUCTION="$CAP2_MIN_REDUCTION" \
+    bash "$REPO_ROOT/example/run_opt4_interleaved_stage.sh"
+
+python "$REPO_ROOT/example/select_opt4_cap2_rob1.py" \
+    --input-dir "$OUTPUT_DIR" \
+    --base-stage OPT4V4_CAP1_AUTO_SAFE \
+    --candidate-stage CAP2_ROB1 \
+    --focus-systems Cu512 H2O192 \
+    --guardrail-systems Cu32 H2O32 \
+    --repeats "$REPEATS" \
+    --output "$OUTPUT_DIR/CAP2_ROB1_selection.json"
+

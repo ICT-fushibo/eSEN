@@ -52,8 +52,16 @@ OPT4_FUSION_STAGE=${OPT4_FUSION_STAGE:-OPT4V4_FP32}
 OPT4_NEIGHBOR_CAPACITY_POLICY=${OPT4_NEIGHBOR_CAPACITY_POLICY:-auto-safe}
 NEIGHBOR_AUTO_MIN_REDUCTION=${NEIGHBOR_AUTO_MIN_REDUCTION:-0.05}
 NEIGHBOR_AUTO_GUARD_SLOTS=${NEIGHBOR_AUTO_GUARD_SLOTS:-1}
+ROB1=${ROB1:-0}
+ROB1_WINDOW_STEPS=${ROB1_WINDOW_STEPS:-0}
+ROB1_MAX_RETRIES=${ROB1_MAX_RETRIES:-2}
+CAP2_COMPACT_SLOT_STEP=${CAP2_COMPACT_SLOT_STEP:-4}
+CAP2_COMPACT_MARGIN=${CAP2_COMPACT_MARGIN:-0.0}
+CAP2_MIN_REDUCTION=${CAP2_MIN_REDUCTION:-0.05}
+CAP2_TEST_CAPACITY_LIMIT=${CAP2_TEST_CAPACITY_LIMIT:-0}
 STATISTICS=${STATISTICS:-1}
 OFFLINE_STRESS=${OFFLINE_STRESS:-0}
+METRICS_ONLY=${METRICS_ONLY:-0}
 STRICT=${STRICT:-0}
 OVERWRITE=${OVERWRITE:-0}
 
@@ -65,7 +73,7 @@ if [[ ! -f "$REFERENCE_H5" ]]; then
     echo "Reference HDF5 not found: $REFERENCE_H5" >&2
     exit 2
 fi
-if [[ ! -f "$CHECKPOINT" ]]; then
+if [[ "$METRICS_ONLY" != "1" && ! -f "$CHECKPOINT" ]]; then
     echo "Checkpoint not found: $CHECKPOINT" >&2
     exit 2
 fi
@@ -99,6 +107,12 @@ args=(
     --opt4-neighbor-capacity-policy "$OPT4_NEIGHBOR_CAPACITY_POLICY"
     --neighbor-auto-min-reduction "$NEIGHBOR_AUTO_MIN_REDUCTION"
     --neighbor-auto-guard-slots "$NEIGHBOR_AUTO_GUARD_SLOTS"
+    --rob1-window-steps "$ROB1_WINDOW_STEPS"
+    --rob1-max-retries "$ROB1_MAX_RETRIES"
+    --cap2-compact-slot-step "$CAP2_COMPACT_SLOT_STEP"
+    --cap2-compact-margin "$CAP2_COMPACT_MARGIN"
+    --cap2-min-reduction "$CAP2_MIN_REDUCTION"
+    --cap2-test-capacity-limit "$CAP2_TEST_CAPACITY_LIMIT"
 )
 if [[ -n "$SYSTEMS" ]]; then
     read -r -a systems_array <<< "$SYSTEMS"
@@ -109,6 +123,12 @@ if [[ "$STATISTICS" != "1" ]]; then
 fi
 if [[ "$OFFLINE_STRESS" == "1" ]]; then
     args+=(--offline-stress)
+fi
+if [[ "$ROB1" == "1" ]]; then
+    args+=(--rob1)
+fi
+if [[ "$METRICS_ONLY" == "1" ]]; then
+    args+=(--metrics-only)
 fi
 if [[ "$STRICT" == "1" ]]; then
     args+=(--strict)
@@ -122,6 +142,9 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export CUDA_VISIBLE_DEVICES="$GPU"
 export PYTHONPATH="$REPO_ROOT/src:$MATBENCH_REPO:$ROOT_DEFAULT${PYTHONPATH:+:$PYTHONPATH}"
 LOG_NAME=${BACKENDS// /_}
+if [[ "$METRICS_ONLY" == "1" ]]; then
+    LOG_NAME="${LOG_NAME}_metrics_only"
+fi
 LIVE_LOG="${SAVE_DIR%/}.${LOG_NAME}.log"
 
 python -u "$REPO_ROOT/example/run_esen_matbench.py" "${args[@]}" \

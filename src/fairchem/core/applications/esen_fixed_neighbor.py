@@ -200,6 +200,111 @@ def auto_neighbor_capacities_from_probe(
     return selected, float(reduction)
 
 
+def elastic_neighbor_capacities_from_probe(
+    maximum_neighbors_by_atom: Tensor | Sequence[int],
+    safe_capacities: Tensor | Sequence[int],
+    *,
+    margin: float = 0.0,
+    slot_step: int = 4,
+    minimum_reduction: float = 0.05,
+) -> tuple[tuple[int, ...], bool, float, tuple[int, ...]]:
+    """Choose a compact CAP2 start only when it beats CAP1-auto-safe.
+
+    The compact candidate keeps at least one neighbor beyond every probed
+    per-atom maximum and rounds to ``slot_step``.  ``safe_capacities`` is the
+    effective CAP1-auto-safe allocation (including a uniform fallback).  The
+    selected allocation is therefore never larger than the frozen baseline.
+    """
+
+    if (
+        not math.isfinite(minimum_reduction)
+        or not 0.0 <= minimum_reduction <= 1.0
+    ):
+        raise ValueError("minimum_reduction must be finite and between 0 and 1")
+    compact = atom_neighbor_capacities_from_probe(
+        maximum_neighbors_by_atom,
+        margin=margin,
+        slot_step=slot_step,
+    )
+    safe = tuple(
+        int(value)
+        for value in torch.as_tensor(
+            safe_capacities, device="cpu", dtype=torch.long
+        )
+        .reshape(-1)
+        .tolist()
+    )
+    if len(compact) != len(safe) or not safe:
+        raise ValueError("safe_capacities must match the probe atom count")
+    if any(value < 1 for value in safe):
+        raise ValueError("safe capacities must be positive")
+    safe_edges = sum(safe)
+    reduction = (safe_edges - sum(compact)) / safe_edges
+    selected = compact if reduction >= minimum_reduction else safe
+    return selected, selected == compact, float(reduction), compact
+
+
+def promote_elastic_neighbor_capacities(
+    current_capacities: Tensor | Sequence[int],
+    maximum_required_by_atom: Tensor | Sequence[int],
+    atomic_numbers: Tensor | Sequence[int],
+    *,
+    promotion_index: int,
+    species_slot_step: int = 4,
+    uniform_margin: float = 0.10,
+    uniform_slot_step: int = 8,
+) -> tuple[tuple[int, ...], str]:
+    """Return the next monotonic CAP2 allocation after a failed transaction.
+
+    Promotion zero groups the actual window demand by chemical species and
+    keeps one spare neighbor before four-slot rounding.  Promotion one uses a
+    conservative uniform allocation.  Higher promotion indices are rejected;
+    the controller treats them as an unrecoverable capacity overflow.
+    """
+
+    current = torch.as_tensor(
+        current_capacities, device="cpu", dtype=torch.long
+    ).reshape(-1)
+    required = torch.as_tensor(
+        maximum_required_by_atom, device="cpu", dtype=torch.long
+    ).reshape(-1)
+    numbers = torch.as_tensor(
+        atomic_numbers, device="cpu", dtype=torch.long
+    ).reshape(-1)
+    if current.numel() < 1 or current.shape != required.shape:
+        raise ValueError("current capacities and actual demand must match")
+    if numbers.shape != current.shape:
+        raise ValueError("atomic_numbers must match the capacity vector")
+    if bool((current < 1).any()) or bool((required < 0).any()):
+        raise ValueError("capacities must be positive and demand non-negative")
+    if promotion_index == 0:
+        promoted = current.clone()
+        for atomic_number in torch.unique(numbers, sorted=True):
+            mask = numbers == atomic_number
+            species_required = int(required[mask].max().item())
+            species_capacity = neighbor_capacity_from_probe(
+                max(1, species_required),
+                margin=0.0,
+                slot_step=species_slot_step,
+            )
+            promoted[mask] = torch.maximum(
+                promoted[mask],
+                torch.full_like(promoted[mask], species_capacity),
+            )
+        return tuple(int(value) for value in promoted.tolist()), "species"
+    if promotion_index == 1:
+        uniform_capacity = neighbor_capacity_from_probe(
+            max(1, int(required.max().item())),
+            margin=uniform_margin,
+            slot_step=uniform_slot_step,
+        )
+        promoted = torch.maximum(
+            current, torch.full_like(current, uniform_capacity)
+        )
+        return tuple(int(value) for value in promoted.tolist()), "uniform"
+    raise ValueError("CAP2 supports at most two capacity promotions")
+
+
 def _pbc_repetitions(cell: Tensor, cutoff: float, pbc: Tensor) -> tuple[int, int, int]:
     """Match the plane-distance repetition calculation in radius_graph_pbc."""
 
@@ -249,6 +354,7 @@ class FixedShapePBCNeighborBuilder:
         dummy_atoms: int,
         max_neighbors: int = 300,
         degeneracy_tolerance: float = 0.01,
+        overflow_to_dummy_only: bool = False,
         output_edge_index: Tensor | None = None,
         output_cell_offsets: Tensor | None = None,
     ) -> None:
@@ -289,6 +395,7 @@ class FixedShapePBCNeighborBuilder:
         self.dummy_atoms = int(dummy_atoms)
         self.max_neighbors = int(max_neighbors)
         self.degeneracy_tolerance = float(degeneracy_tolerance)
+        self.overflow_to_dummy_only = bool(overflow_to_dummy_only)
         self.device = cell.device
         self.position_dtype = cell.dtype
         self.edge_capacity = int(capacity_values.sum().item())
@@ -383,6 +490,9 @@ class FixedShapePBCNeighborBuilder:
             self.edge_capacity, 3
         )
         self.padding_cell_offsets[:, axis] = far_shift
+        padding_distance = axis_norm * far_shift
+        self.sink_nonzero_shift_verified = bool(far_shift != 0)
+        self.sink_cutoff_zero_verified = bool(padding_distance > self.cutoff)
 
         # Device-resident production diagnostics.  Updating these tensors is
         # capture-safe and does not introduce a host synchronization.
@@ -417,6 +527,27 @@ class FixedShapePBCNeighborBuilder:
         self.maximum_overflow_capacity = torch.zeros(
             (), device=self.device, dtype=torch.long
         )
+        self.maximum_included_neighbors_by_atom = torch.zeros(
+            self.num_atoms, device=self.device, dtype=torch.long
+        )
+        self.minimum_padding_edges = torch.full(
+            (), self.edge_capacity, device=self.device, dtype=torch.long
+        )
+        self.maximum_padding_edges = torch.zeros(
+            (), device=self.device, dtype=torch.long
+        )
+        self.overflow_dummy_only_replays = torch.zeros(
+            (), device=self.device, dtype=torch.long
+        )
+        self.window_capacity_misses = torch.zeros(
+            (), device=self.device, dtype=torch.long
+        )
+        self.window_overflow_dummy_only_replays = torch.zeros(
+            (), device=self.device, dtype=torch.long
+        )
+        self.window_maximum_included_neighbors_by_atom = torch.zeros(
+            self.num_atoms, device=self.device, dtype=torch.long
+        )
 
     def reset_stats(self) -> None:
         """Reset production counters without changing their addresses."""
@@ -432,6 +563,18 @@ class FixedShapePBCNeighborBuilder:
         self.maximum_capacity_excess.zero_()
         self.maximum_overflow_required.zero_()
         self.maximum_overflow_capacity.zero_()
+        self.maximum_included_neighbors_by_atom.zero_()
+        self.minimum_padding_edges.fill_(self.edge_capacity)
+        self.maximum_padding_edges.zero_()
+        self.overflow_dummy_only_replays.zero_()
+        self.reset_window_stats()
+
+    def reset_window_stats(self) -> None:
+        """Reset transaction-local telemetry without changing addresses."""
+
+        self.window_capacity_misses.zero_()
+        self.window_overflow_dummy_only_replays.zero_()
+        self.window_maximum_included_neighbors_by_atom.zero_()
 
     def build(
         self,
@@ -540,26 +683,42 @@ class FixedShapePBCNeighborBuilder:
         selected_offsets = self.candidate_cell_offsets.index_select(
             0, safe_selected
         )
+        if self.overflow_to_dummy_only:
+            capacity_excess = torch.clamp_min(
+                included_counts - self.neighbor_capacities, 0
+            )
+            current_excess, overflow_atom = capacity_excess.max(dim=0)
+            overflow = current_excess > 0
+            output_valid = flat_valid & ~overflow
+            # Slot ids already map round-robin to the fixed dummy sinks.  On
+            # overflow every slot becomes padding, so the distribution is
+            # exactly balanced without adding a replay-time prefix scan.
+            padding_sinks = self.dummy_sinks
+        else:
+            output_valid = flat_valid
+            padding_sinks = self.dummy_sinks
         self.edge_index[0].copy_(
-            torch.where(flat_valid, sources, self.dummy_sinks)
+            torch.where(output_valid, sources, padding_sinks)
         )
         self.edge_index[1].copy_(
-            torch.where(flat_valid, self.slot_centres, self.dummy_sinks)
+            torch.where(output_valid, self.slot_centres, padding_sinks)
         )
         self.cell_offsets.copy_(
             torch.where(
-                flat_valid.unsqueeze(1),
+                output_valid.unsqueeze(1),
                 selected_offsets.to(dtype=self.cell_offsets.dtype),
                 self.padding_cell_offsets,
             )
         )
 
-        real_edges = flat_valid.sum()
-        capacity_excess = torch.clamp_min(
-            included_counts - self.neighbor_capacities, 0
-        )
-        current_excess, overflow_atom = capacity_excess.max(dim=0)
-        overflow = current_excess > 0
+        real_edges = output_valid.sum()
+        if not self.overflow_to_dummy_only:
+            # Preserve the original Opt3/CAP1 operation order exactly.
+            capacity_excess = torch.clamp_min(
+                included_counts - self.neighbor_capacities, 0
+            )
+            current_excess, overflow_atom = capacity_excess.max(dim=0)
+            overflow = current_excess > 0
         call_step = self.build_calls if step is None else step
         self.current_real_edges.copy_(real_edges)
         self.minimum_real_edges.copy_(
@@ -576,6 +735,25 @@ class FixedShapePBCNeighborBuilder:
                 self.maximum_included_neighbors, included_counts.max()
             )
         )
+        if self.overflow_to_dummy_only:
+            padding_edges = self.edge_capacity - real_edges
+            self.maximum_included_neighbors_by_atom.copy_(
+                torch.maximum(
+                    self.maximum_included_neighbors_by_atom, included_counts
+                )
+            )
+            self.window_maximum_included_neighbors_by_atom.copy_(
+                torch.maximum(
+                    self.window_maximum_included_neighbors_by_atom,
+                    included_counts,
+                )
+            )
+            self.minimum_padding_edges.copy_(
+                torch.minimum(self.minimum_padding_edges, padding_edges)
+            )
+            self.maximum_padding_edges.copy_(
+                torch.maximum(self.maximum_padding_edges, padding_edges)
+            )
         replace_overflow = current_excess > self.maximum_capacity_excess
         current_required = included_counts.index_select(
             0, overflow_atom.reshape(1)
@@ -605,11 +783,33 @@ class FixedShapePBCNeighborBuilder:
             )
         )
         self.capacity_misses.add_(overflow.to(dtype=torch.long))
+        if self.overflow_to_dummy_only:
+            self.window_capacity_misses.add_(overflow.to(dtype=torch.long))
+            self.overflow_dummy_only_replays.add_(overflow.to(dtype=torch.long))
+            self.window_overflow_dummy_only_replays.add_(
+                overflow.to(dtype=torch.long)
+            )
         first = (self.first_overflow_step < 0) & overflow
         self.first_overflow_step.copy_(
             torch.where(first, call_step, self.first_overflow_step)
         )
         self.build_calls.add_(1)
+
+    def window_stats(self) -> dict[str, Any]:
+        """Synchronize once and return transaction-local demand telemetry."""
+
+        return {
+            "fixed_builder_window_capacity_misses": int(
+                self.window_capacity_misses.item()
+            ),
+            "fixed_builder_window_overflow_dummy_only_replays": int(
+                self.window_overflow_dummy_only_replays.item()
+            ),
+            "fixed_builder_window_maximum_included_neighbors_by_atom": [
+                int(value)
+                for value in self.window_maximum_included_neighbors_by_atom.tolist()
+            ],
+        }
 
     def stats(self) -> dict[str, Any]:
         """Synchronize once and return host-side builder diagnostics."""
@@ -619,6 +819,15 @@ class FixedShapePBCNeighborBuilder:
         maximum = int(self.maximum_real_edges.item()) if calls else None
         misses = int(self.capacity_misses.item())
         first_overflow = int(self.first_overflow_step.item())
+        if calls and self.overflow_to_dummy_only:
+            min_padding = int(self.minimum_padding_edges.item())
+            max_padding = int(self.maximum_padding_edges.item())
+        elif calls:
+            min_padding = self.edge_capacity - maximum
+            max_padding = self.edge_capacity - minimum
+        else:
+            min_padding = None
+            max_padding = None
         return {
             "fixed_builder_build_calls": calls,
             "fixed_builder_capacity_misses": misses,
@@ -662,6 +871,28 @@ class FixedShapePBCNeighborBuilder:
             ),
             "fixed_builder_max_overflow_capacity": int(
                 self.maximum_overflow_capacity.item()
+            ),
+            "fixed_builder_maximum_included_neighbors_by_atom": [
+                int(value)
+                for value in self.maximum_included_neighbors_by_atom.tolist()
+            ],
+            "sink_padding_mode": "distributed_dummy_self_edges",
+            "sink_dummy_atoms": self.dummy_atoms,
+            "sink_padding_edges_min": min_padding,
+            "sink_padding_edges_max": max_padding,
+            "sink_distribution_min": (
+                None if max_padding is None else max_padding // self.dummy_atoms
+            ),
+            "sink_distribution_max": (
+                None
+                if max_padding is None
+                else math.ceil(max_padding / self.dummy_atoms)
+            ),
+            "sink_nonzero_shift_verified": self.sink_nonzero_shift_verified,
+            "sink_cutoff_zero_verified": self.sink_cutoff_zero_verified,
+            "overflow_to_dummy_only": self.overflow_to_dummy_only,
+            "overflow_dummy_only_replays": int(
+                self.overflow_dummy_only_replays.item()
             ),
             "fixed_builder_candidate_universe_size": (
                 self.num_atoms * self.candidates_per_atom

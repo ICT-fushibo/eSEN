@@ -119,3 +119,9 @@ and HDF5 trajectory per backend/system, `matbench_esen_report.{json,md}`,
 `matbench_esen_speedups.tsv`, and `matbench_esen_metrics.tsv`.  Per-backend metric
 CSV/aggregate JSON files are written below `metrics/`.  Incomplete trajectories are
 kept with `complete=false` and are excluded from public metric aggregation.
+
+Completed trajectories can be re-scored without repeating MD by setting
+`METRICS_ONLY=1` and reusing `SAVE_DIR`. The compatibility loader supports the
+project's Python 3.9 / NumPy 1.26 server environment. Opt4's experimental
+elastic-capacity and transactional-replay path is documented separately in
+[`OPT4_CAP2_ROB1.md`](OPT4_CAP2_ROB1.md); the default remains `auto-safe`.

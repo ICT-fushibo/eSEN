@@ -16,6 +16,14 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BASE_FUSIONS=${BASE_FUSIONS:-}
 BASE_NEIGHBOR_CAPACITY_POLICY=${BASE_NEIGHBOR_CAPACITY_POLICY:-uniform}
 CANDIDATE_NEIGHBOR_CAPACITY_POLICY=${CANDIDATE_NEIGHBOR_CAPACITY_POLICY:-uniform}
+BASE_ROB1=${BASE_ROB1:-0}
+CANDIDATE_ROB1=${CANDIDATE_ROB1:-0}
+ROB1_WINDOW_STEPS=${ROB1_WINDOW_STEPS:-10}
+ROB1_MAX_RETRIES=${ROB1_MAX_RETRIES:-2}
+CAP2_COMPACT_SLOT_STEP=${CAP2_COMPACT_SLOT_STEP:-4}
+CAP2_COMPACT_MARGIN=${CAP2_COMPACT_MARGIN:-0.0}
+CAP2_MIN_REDUCTION=${CAP2_MIN_REDUCTION:-0.05}
+CAP2_TEST_CAPACITY_LIMIT=${CAP2_TEST_CAPACITY_LIMIT:-0}
 BASE_TF32_MODE=${BASE_TF32_MODE:-off}
 CANDIDATE_TF32_MODE=${CANDIDATE_TF32_MODE:-off}
 NEIGHBOR_AUTO_MIN_REDUCTION=${NEIGHBOR_AUTO_MIN_REDUCTION:-0.05}
@@ -50,6 +58,14 @@ printf 'scope\tvariant\tfusion_stage\tmodel_fusions\tneighbor_capacity_policy\ts
     echo "candidate_fusions=$CANDIDATE_FUSIONS"
     echo "base_neighbor_capacity_policy=$BASE_NEIGHBOR_CAPACITY_POLICY"
     echo "candidate_neighbor_capacity_policy=$CANDIDATE_NEIGHBOR_CAPACITY_POLICY"
+    echo "base_rob1=$BASE_ROB1"
+    echo "candidate_rob1=$CANDIDATE_ROB1"
+    echo "rob1_window_steps=$ROB1_WINDOW_STEPS"
+    echo "rob1_max_retries=$ROB1_MAX_RETRIES"
+    echo "cap2_compact_slot_step=$CAP2_COMPACT_SLOT_STEP"
+    echo "cap2_compact_margin=$CAP2_COMPACT_MARGIN"
+    echo "cap2_min_reduction=$CAP2_MIN_REDUCTION"
+    echo "cap2_test_capacity_limit=$CAP2_TEST_CAPACITY_LIMIT"
     echo "base_tf32_mode=$BASE_TF32_MODE"
     echo "candidate_tf32_mode=$CANDIDATE_TF32_MODE"
     echo "neighbor_auto_min_reduction=$NEIGHBOR_AUTO_MIN_REDUCTION"
@@ -90,14 +106,16 @@ classify() {
 
 run_one() {
     local variant=$1 system=$2 temperature=$3 repeat=$4
-    local stage fusions capacity_policy tf32_mode backend
+    local stage fusions capacity_policy tf32_mode backend rob1
     if [[ "$variant" == base ]]; then
         stage=$BASE_STAGE; fusions=$BASE_FUSIONS
         capacity_policy=$BASE_NEIGHBOR_CAPACITY_POLICY
+        rob1=$BASE_ROB1
         tf32_mode=$BASE_TF32_MODE
     else
         stage=$CANDIDATE_STAGE; fusions=$CANDIDATE_FUSIONS
         capacity_policy=$CANDIDATE_NEIGHBOR_CAPACITY_POLICY
+        rob1=$CANDIDATE_ROB1
         tf32_mode=$CANDIDATE_TF32_MODE
     fi
     if [[ "$SCOPE" == "model-only" ]]; then
@@ -154,6 +172,9 @@ run_one() {
         else
             whole_args+=(--model-fusions "$fusions" --fusion-stage "$stage")
         fi
+        if [[ "$rob1" == "1" ]]; then
+            whole_args+=(--rob1)
+        fi
         CUDA_VISIBLE_DEVICES="$GPU" PYTHONHASHSEED=42 \
         CUBLAS_WORKSPACE_CONFIG=:4096:8 \
         PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
@@ -169,6 +190,12 @@ run_one() {
                 --neighbor-capacity-policy "$capacity_policy" \
                 --neighbor-auto-min-reduction "$NEIGHBOR_AUTO_MIN_REDUCTION" \
                 --neighbor-auto-guard-slots "$NEIGHBOR_AUTO_GUARD_SLOTS" \
+                --rob1-window-steps "$ROB1_WINDOW_STEPS" \
+                --rob1-max-retries "$ROB1_MAX_RETRIES" \
+                --cap2-compact-slot-step "$CAP2_COMPACT_SLOT_STEP" \
+                --cap2-compact-margin "$CAP2_COMPACT_MARGIN" \
+                --cap2-min-reduction "$CAP2_MIN_REDUCTION" \
+                --cap2-test-capacity-limit "$CAP2_TEST_CAPACITY_LIMIT" \
                 --dummy-atoms 32 \
                 --capture-warmup 3 --max-neighbors 300 \
                 --degeneracy-tolerance 0.01 --energy-per-atom-atol 1e-5 \

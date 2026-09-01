@@ -76,7 +76,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neighbor-slot-step", type=int, default=8)
     parser.add_argument(
         "--neighbor-capacity-policy",
-        choices=("uniform", "species", "atom", "auto", "auto-safe"),
+        "--opt4-neighbor-capacity-policy",
+        dest="neighbor_capacity_policy",
+        choices=(
+            "uniform",
+            "species",
+            "atom",
+            "auto",
+            "auto-safe",
+            "elastic",
+        ),
         default="uniform",
         help=(
             "Static neighbor-slot allocation. 'uniform' preserves Opt3/Opt4 "
@@ -105,6 +114,13 @@ def parse_args() -> argparse.Namespace:
             "minimum-reduction decision (default: 1)."
         ),
     )
+    parser.add_argument("--rob1", action="store_true")
+    parser.add_argument("--rob1-window-steps", type=int, default=10)
+    parser.add_argument("--rob1-max-retries", type=int, default=2)
+    parser.add_argument("--cap2-compact-slot-step", type=int, default=4)
+    parser.add_argument("--cap2-compact-margin", type=float, default=0.0)
+    parser.add_argument("--cap2-min-reduction", type=float, default=0.05)
+    parser.add_argument("--cap2-test-capacity-limit", type=int, default=0)
     parser.add_argument("--dummy-atoms", type=int, default=32)
     parser.add_argument("--capture-warmup", type=int, default=3)
     parser.add_argument("--max-neighbors", type=int, default=300)
@@ -148,6 +164,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("invalid neighbor capacity parameters")
     if args.neighbor_auto_guard_slots < 1:
         parser.error("neighbor auto-safe guard slots must be positive")
+    if args.rob1_window_steps < 1:
+        parser.error("ROB1 window steps must be positive")
+    if not 0 <= args.rob1_max_retries <= 2:
+        parser.error("ROB1 max retries must be between zero and two")
+    if args.cap2_compact_slot_step < 1 or args.cap2_compact_margin < 0:
+        parser.error("invalid CAP2 compact capacity parameters")
+    if not 0.0 <= args.cap2_min_reduction <= 1.0:
+        parser.error("CAP2 minimum reduction must be between zero and one")
+    if args.cap2_test_capacity_limit < 0:
+        parser.error("CAP2 test capacity limit must be non-negative")
     if (
         not np.isfinite(args.neighbor_auto_min_reduction)
         or not 0.0 <= args.neighbor_auto_min_reduction <= 1.0
@@ -165,6 +191,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("triton block size must be a power of two")
     if args.baseline_result is not None and args.missing_baseline_reference:
         parser.error("baseline path and missing-reference flag are exclusive")
+    if args.neighbor_capacity_policy == "elastic" and not args.rob1:
+        parser.error("elastic capacity requires --rob1")
+    if args.rob1 and args.neighbor_capacity_policy != "elastic":
+        parser.error("--rob1 is only valid with elastic capacity")
+    if args.neighbor_capacity_policy == "elastic" and (
+        args.backend != "whole-step-cg-opt4"
+    ):
+        parser.error("CAP2/ROB1 is only supported by whole-step-cg-opt4")
     return args
 
 
@@ -238,6 +272,7 @@ def main() -> int:
     from fairchem.core.applications.esen_fixed_neighbor import (
         atom_neighbor_capacities_from_probe,
         auto_neighbor_capacities_from_probe,
+        elastic_neighbor_capacities_from_probe,
         neighbor_counts_in_graph,
         neighbor_capacity_from_probe,
         species_neighbor_capacities_from_probe,
@@ -249,6 +284,7 @@ def main() -> int:
         GPUResidentMD,
     )
     from fairchem.core.applications.esen_whole_step_cuda_graph import (
+        ElasticWholeStepCUDAGraphController,
         ESENFixedBuilderModelCUDAGraphEvaluator,
         ESENWholeStepCUDAGraphMD,
     )
@@ -397,6 +433,14 @@ def main() -> int:
         )
         for capacity in unprotected_atom_capacities
     )
+    safe_effective_capacities = (
+        safe_auto_candidate_capacities
+        if safe_auto_candidate_capacities is not None
+        else (uniform_neighbor_capacity,) * len(atoms)
+    )
+    cap2_compact_selected = False
+    cap2_reduction_vs_safe = 0.0
+    cap2_compact_capacities = None
     if args.neighbor_capacity_policy == "species":
         neighbor_capacities = species_neighbor_capacities_from_probe(
             probe_max_degrees,
@@ -414,20 +458,48 @@ def main() -> int:
         neighbor_capacities = auto_candidate_capacities
     elif args.neighbor_capacity_policy == "auto-safe":
         neighbor_capacities = safe_auto_candidate_capacities
+    elif args.neighbor_capacity_policy == "elastic":
+        (
+            neighbor_capacities,
+            cap2_compact_selected,
+            cap2_reduction_vs_safe,
+            cap2_compact_capacities,
+        ) = elastic_neighbor_capacities_from_probe(
+            probe_max_degrees,
+            safe_effective_capacities,
+            margin=args.cap2_compact_margin,
+            slot_step=args.cap2_compact_slot_step,
+            minimum_reduction=args.cap2_min_reduction,
+        )
+        if args.cap2_test_capacity_limit:
+            neighbor_capacities = tuple(
+                max(1, min(value, args.cap2_test_capacity_limit))
+                for value in neighbor_capacities
+            )
     else:
         neighbor_capacities = None
     effective_neighbor_capacity_policy = (
         (
             "atom-safe"
             if args.neighbor_capacity_policy == "auto-safe"
-            else "atom"
+            else (
+                "elastic-compact"
+                if args.neighbor_capacity_policy == "elastic"
+                and cap2_compact_selected
+                else (
+                    "elastic-auto-safe"
+                    if args.neighbor_capacity_policy == "elastic"
+                    else "atom"
+                )
+            )
         )
         if neighbor_capacities is not None
-        and args.neighbor_capacity_policy in {"atom", "auto", "auto-safe"}
+        and args.neighbor_capacity_policy
+        in {"atom", "auto", "auto-safe", "elastic"}
         else args.neighbor_capacity_policy
     )
     if (
-        args.neighbor_capacity_policy in {"auto", "auto-safe"}
+        args.neighbor_capacity_policy in {"auto", "auto-safe", "elastic"}
         and neighbor_capacities is None
     ):
         effective_neighbor_capacity_policy = "uniform"
@@ -531,19 +603,33 @@ def main() -> int:
                 model_fusions=",".join(selected_model_fusions),
                 fusion_stage=args.fusion_stage,
             )
-        whole_md = whole_class(
-            state,
-            evaluator,
-            integrator,
-            neighbors_per_atom=neighbor_capacity,
-            neighbor_capacities=neighbor_capacities,
-            neighbor_capacity_policy=effective_neighbor_capacity_policy,
+        whole_kwargs.update(
             dummy_atoms=args.dummy_atoms,
             capture_warmup=args.capture_warmup,
             max_neighbors=args.max_neighbors,
             degeneracy_tolerance=args.degeneracy_tolerance,
-            **whole_kwargs,
         )
+        if args.neighbor_capacity_policy == "elastic":
+            whole_md = ElasticWholeStepCUDAGraphController(
+                state,
+                evaluator,
+                integrator,
+                whole_class=whole_class,
+                atomic_numbers=atoms.numbers,
+                neighbor_capacities=effective_neighbor_capacities,
+                max_promotions=args.rob1_max_retries,
+                whole_kwargs=whole_kwargs,
+            )
+        else:
+            whole_md = whole_class(
+                state,
+                evaluator,
+                integrator,
+                neighbors_per_atom=neighbor_capacity,
+                neighbor_capacities=neighbor_capacities,
+                neighbor_capacity_policy=effective_neighbor_capacity_policy,
+                **whole_kwargs,
+            )
         torch.cuda.empty_cache()
         whole_md.capture(initial_state)
         dynamics = None
@@ -551,7 +637,11 @@ def main() -> int:
     device_used_after_capture = _device_memory_used(torch, device)
     setup_wall_time = time.perf_counter() - setup_start
 
-    # Standard three-step warmup is trajectory-neutral and excluded from timing.
+    adaptive = args.neighbor_capacity_policy == "elastic"
+    # Standard warmup is trajectory-neutral and excluded from timing.  CAP2's
+    # initial force transaction is intentionally not preflighted when warmup
+    # is zero: forced-low-capacity smoke tests must exercise rollback inside
+    # the measured production path rather than silently promoting in setup.
     if fixed_builder_backend:
         assert dynamics is not None
         dynamics.run(args.warmup_steps)
@@ -564,23 +654,25 @@ def main() -> int:
     else:
         assert whole_md is not None
         whole_md.reset_production(initial_state)
-        whole_md.evaluate_initial()
-        for _ in range(args.warmup_steps):
-            whole_md.step()
-        torch.cuda.synchronize()
-        whole_md.reset_production(initial_state)
-        initial_forces_device, initial_energy_device = whole_md.evaluate_initial()
+        if adaptive:
+            if args.warmup_steps:
+                whole_md.evaluate_initial()
+                for _ in range(args.warmup_steps):
+                    whole_md.step()
+                torch.cuda.synchronize()
+                whole_md.reset_production(initial_state)
+            initial_forces_device = None
+            initial_energy_device = None
+        else:
+            whole_md.evaluate_initial()
+            for _ in range(args.warmup_steps):
+                whole_md.step()
+            torch.cuda.synchronize()
+            whole_md.reset_production(initial_state)
+            initial_forces_device, initial_energy_device = (
+                whole_md.evaluate_initial()
+            )
     torch.cuda.synchronize()
-
-    initial_energy = float(initial_energy_device.item())
-    initial_force_error = float(
-        (initial_forces_device - eager_initial_forces).abs().max().item()
-    )
-    initial_energy_error = abs(
-        initial_energy - float(eager_initial_energy.item())
-    )
-    initial_energy_error_per_atom = initial_energy_error / len(atoms)
-    force_validation_pass = initial_force_error < args.force_max_atol
 
     # Reset after validation.  The timed region starts from the original state.
     if fixed_builder_backend:
@@ -613,17 +705,50 @@ def main() -> int:
         final_state = state
     else:
         assert whole_md is not None
-        whole_md.evaluate_initial()
-        for step in range(1, args.steps + 1):
-            _, energy = whole_md.step()
-            if step in checkpoints:
-                checkpoint_tensors[step] = energy.detach().clone()
+        timed_initial_forces, timed_initial_energy = whole_md.evaluate_initial()
+        if adaptive:
+            initial_forces_device = timed_initial_forces.detach().clone()
+            initial_energy_device = timed_initial_energy.detach().clone()
+            completed = 0
+            while completed < args.steps:
+                transaction_steps = min(
+                    args.rob1_window_steps, args.steps - completed
+                )
+                local_offsets = [
+                    checkpoint - completed
+                    for checkpoint in checkpoints
+                    if completed < checkpoint <= completed + transaction_steps
+                ]
+                _, _, committed_checkpoints = (
+                    whole_md.run_steps_with_checkpoints(
+                        transaction_steps, local_offsets
+                    )
+                )
+                for offset, value in committed_checkpoints.items():
+                    checkpoint_tensors[completed + offset] = value
+                completed += transaction_steps
+        else:
+            for step in range(1, args.steps + 1):
+                _, energy = whole_md.step()
+                if step in checkpoints:
+                    checkpoint_tensors[step] = energy.detach().clone()
         final_state = whole_md.state_view()
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - timed_start
     if args.external_profiler:
         _stop_external_profiler(torch)
     device_used_after_timing = _device_memory_used(torch, device)
+    assert initial_forces_device is not None
+    assert initial_energy_device is not None
+    initial_energy = float(initial_energy_device.item())
+    initial_force_error = float(
+        (initial_forces_device - eager_initial_forces).abs().max().item()
+    )
+    initial_energy_error = abs(
+        initial_energy - float(eager_initial_energy.item())
+    )
+    initial_energy_error_per_atom = initial_energy_error / len(atoms)
+    force_validation_pass = initial_force_error < args.force_max_atol
     checkpoint_energies = {
         step: float(value.item()) for step, value in checkpoint_tensors.items()
     }
@@ -646,13 +771,23 @@ def main() -> int:
         graph_stats = whole_md.stats()
     capacity_overflow = int(graph_stats["cuda_graph_capacity_misses"]) > 0
     expected_replays = args.steps + 1
-    graph_invariants_pass = (
+    graph_invariants_pass = bool(
         graph_stats["cuda_graph_capture_count"] == 1
-        and graph_stats["cuda_graph_production_capture_count"] == 0
         and graph_stats["cuda_graph_production_replays"] == expected_replays
         and not capacity_overflow
         and graph_stats["cuda_graph_hit_rate"] == 1.0
         and graph_stats.get("cuda_graph_replay_stability_pass", True)
+        and (
+            (
+                graph_stats.get("rob1_committed_physical_steps") == args.steps
+                and graph_stats.get("rob1_unrecovered_overflows") == 0
+                and graph_stats.get("rob1_snapshot_addresses_stable", False)
+                and graph_stats.get("cuda_graph_production_capture_count", 0)
+                == graph_stats.get("cuda_graph_recovery_capture_count", 0)
+            )
+            if adaptive
+            else graph_stats["cuda_graph_production_capture_count"] == 0
+        )
     )
 
     legacy_fields: dict[str, object] = {}
@@ -816,6 +951,22 @@ def main() -> int:
             args.neighbor_capacity_policy == "auto-safe"
             and effective_neighbor_capacity_policy == "atom-safe"
         ),
+        "cap2_enabled": adaptive,
+        "cap2_compact_selected": cap2_compact_selected,
+        "cap2_compact_slot_step": args.cap2_compact_slot_step,
+        "cap2_compact_margin": args.cap2_compact_margin,
+        "cap2_min_reduction": args.cap2_min_reduction,
+        "cap2_compact_reduction_vs_auto_safe": cap2_reduction_vs_safe,
+        "cap2_compact_edge_capacity": (
+            None
+            if cap2_compact_capacities is None
+            else sum(cap2_compact_capacities)
+        ),
+        "cap2_auto_safe_edge_capacity": sum(safe_effective_capacities),
+        "cap2_test_capacity_limit": args.cap2_test_capacity_limit,
+        "rob1_enabled": adaptive,
+        "rob1_window_steps": args.rob1_window_steps if adaptive else None,
+        "rob1_max_retries": args.rob1_max_retries if adaptive else None,
         "neighbor_capacity_by_species": neighbor_capacity_by_species,
         "neighbor_edge_capacity": neighbor_edge_capacity,
         "neighbor_uniform_capacity_per_atom": uniform_neighbor_capacity,
@@ -1003,6 +1154,12 @@ def entrypoint() -> int:
                 file=sys.stderr,
             )
             return 46
+        if exc.__class__.__name__ == "UnrecoveredCapacityOverflow":
+            print(
+                f"BENCHMARK_STATUS=unrecovered_capacity_overflow: {exc}",
+                file=sys.stderr,
+            )
+            return 45
         raise
 
 

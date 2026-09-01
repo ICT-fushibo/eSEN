@@ -14,6 +14,10 @@ from fairchem.core.applications.esen_matbench import (
     matched_trajectory_window,
     read_matbench_systems,
 )
+from fairchem.core.applications.esen_whole_step_cuda_graph import (
+    ElasticWholeStepCUDAGraphController,
+    WholeStepTransactionSnapshot,
+)
 
 
 class HarmonicCalculator(Calculator):
@@ -230,3 +234,156 @@ def test_matbench_whole_step_initial_replay_arms_production_without_advancing():
     assert whole.advance.item() == 1.0
     torch.testing.assert_close(forces, whole.forces)
     torch.testing.assert_close(energy, whole.potential_energy)
+
+
+def test_rob1_snapshot_restores_complete_md_and_nhc_state():
+    class FakeIntegrator:
+        def __init__(self):
+            self.eta = torch.tensor([0.1, 0.2, 0.3], dtype=torch.float64)
+            self.p_eta = torch.tensor([1.1, 1.2, 1.3], dtype=torch.float64)
+
+    whole = type("Whole", (), {})()
+    whole.positions = torch.arange(6, dtype=torch.float64).reshape(2, 3)
+    whole.momenta = whole.positions + 10.0
+    whole.forces = whole.positions + 20.0
+    whole.potential_energy = torch.tensor(31.0, dtype=torch.float32)
+    whole.step_counter = torch.tensor(7, dtype=torch.long)
+    whole.advance = torch.tensor(1.0, dtype=torch.float64)
+    whole.integrator = FakeIntegrator()
+
+    snapshot = WholeStepTransactionSnapshot(whole)
+    snapshot.save_from_(whole)
+    saved_addresses = snapshot.addresses()
+
+    for tensor in (
+        whole.positions,
+        whole.momenta,
+        whole.forces,
+        whole.potential_energy,
+        whole.step_counter,
+        whole.advance,
+        whole.integrator.eta,
+        whole.integrator.p_eta,
+    ):
+        tensor.add_(100)
+
+    snapshot.restore_into_(whole)
+
+    torch.testing.assert_close(
+        whole.positions, torch.arange(6, dtype=torch.float64).reshape(2, 3)
+    )
+    torch.testing.assert_close(whole.momenta, whole.positions + 10.0)
+    torch.testing.assert_close(whole.forces, whole.positions + 20.0)
+    assert whole.potential_energy.item() == 31.0
+    assert whole.step_counter.item() == 7
+    assert whole.advance.item() == 1.0
+    torch.testing.assert_close(
+        whole.integrator.eta,
+        torch.tensor([0.1, 0.2, 0.3], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        whole.integrator.p_eta,
+        torch.tensor([1.1, 1.2, 1.3], dtype=torch.float64),
+    )
+    assert snapshot.addresses() == saved_addresses
+    assert snapshot.addresses_stable
+
+
+def test_rob1_third_step_overflow_rolls_back_and_replays_transaction():
+    class FakeIntegrator:
+        def __init__(self):
+            self.eta = torch.zeros(2, dtype=torch.float64)
+            self.p_eta = torch.zeros(2, dtype=torch.float64)
+
+    class FakeBuilder:
+        def __init__(self):
+            self.injected = False
+            self.local_step = 0
+            self.misses = 0
+
+        def reset_window_stats(self):
+            self.local_step = 0
+            self.misses = 0
+
+        def observe_step(self):
+            self.local_step += 1
+            if self.local_step == 3 and not self.injected:
+                self.injected = True
+                self.misses = 1
+
+        def window_stats(self):
+            return {
+                "fixed_builder_window_capacity_misses": self.misses,
+                "fixed_builder_window_overflow_dummy_only_replays": self.misses,
+                "fixed_builder_window_maximum_included_neighbors_by_atom": [5],
+            }
+
+    class FakeWhole:
+        device = torch.device("cpu")
+
+        def __init__(self):
+            self.positions = torch.zeros((1, 3), dtype=torch.float64)
+            self.momenta = torch.zeros((1, 3), dtype=torch.float64)
+            self.forces = torch.zeros((1, 3), dtype=torch.float64)
+            self.potential_energy = torch.zeros((), dtype=torch.float32)
+            self.step_counter = torch.zeros((), dtype=torch.long)
+            self.advance = torch.ones((), dtype=torch.float64)
+            self.integrator = FakeIntegrator()
+            self.fixed_builder = FakeBuilder()
+
+        def step(self):
+            self.fixed_builder.observe_step()
+            self.positions.add_(1.0)
+            self.momenta.add_(2.0)
+            self.forces.fill_(3.0)
+            self.potential_energy.add_(4.0)
+            self.step_counter.add_(1)
+            self.integrator.eta.add_(5.0)
+            self.integrator.p_eta.add_(6.0)
+            return self.forces, self.potential_energy
+
+    whole = FakeWhole()
+    controller = object.__new__(ElasticWholeStepCUDAGraphController)
+    controller.whole = whole
+    controller.snapshot = WholeStepTransactionSnapshot(whole)
+    controller.attempted_replays = 0
+    controller.committed_replays = 0
+    controller.discarded_replays = 0
+    controller.committed_physical_steps = 0
+    controller.rollback_count = 0
+    controller.retried_physical_steps = 0
+    controller.detected_overflow_replays = 0
+
+    def promote_and_restore(demand, *, transaction_steps):
+        assert demand == [5]
+        assert transaction_steps == 10
+        controller.snapshot.restore_into_(whole)
+
+    controller._promote_and_recapture = promote_and_restore
+    controller.run_steps(10)
+
+    # The first ten attempted steps were discarded.  Final state is exactly
+    # the state obtained from ten clean reference steps, including NHC state.
+    torch.testing.assert_close(
+        whole.positions, torch.full((1, 3), 10.0, dtype=torch.float64)
+    )
+    torch.testing.assert_close(
+        whole.momenta, torch.full((1, 3), 20.0, dtype=torch.float64)
+    )
+    torch.testing.assert_close(
+        whole.forces, torch.full((1, 3), 3.0, dtype=torch.float64)
+    )
+    assert whole.potential_energy.item() == 40.0
+    assert whole.step_counter.item() == 10
+    torch.testing.assert_close(
+        whole.integrator.eta, torch.full((2,), 50.0, dtype=torch.float64)
+    )
+    torch.testing.assert_close(
+        whole.integrator.p_eta,
+        torch.full((2,), 60.0, dtype=torch.float64),
+    )
+    assert controller.attempted_replays == 20
+    assert controller.committed_replays == 10
+    assert controller.discarded_replays == 10
+    assert controller.rollback_count == 1
+    assert controller.retried_physical_steps == 10

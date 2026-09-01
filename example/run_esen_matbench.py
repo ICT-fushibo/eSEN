@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import sys
 import time
 import types
@@ -96,12 +97,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--opt4-fusion-stage", default="OPT4V4_FP32")
     parser.add_argument(
         "--opt4-neighbor-capacity-policy",
-        choices=("uniform", "auto-safe"),
+        choices=("uniform", "auto-safe", "elastic"),
         default="auto-safe",
-        help="Frozen Opt4 whole-step capacity policy",
+        help="Opt4 whole-step capacity policy; elastic enables CAP2",
     )
     parser.add_argument("--neighbor-auto-min-reduction", type=float, default=0.05)
     parser.add_argument("--neighbor-auto-guard-slots", type=int, default=1)
+    parser.add_argument(
+        "--rob1",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable transactional rollback for Opt4 elastic capacity",
+    )
+    parser.add_argument(
+        "--rob1-window-steps",
+        type=int,
+        default=0,
+        help="Transaction length; zero uses --record-interval",
+    )
+    parser.add_argument("--rob1-max-retries", type=int, default=2)
+    parser.add_argument("--cap2-compact-slot-step", type=int, default=4)
+    parser.add_argument("--cap2-compact-margin", type=float, default=0.0)
+    parser.add_argument("--cap2-min-reduction", type=float, default=0.05)
+    parser.add_argument(
+        "--cap2-test-capacity-limit",
+        type=int,
+        default=0,
+        help="Diagnostic-only initial per-atom capacity clamp for recovery smoke",
+    )
     parser.add_argument(
         "--statistics",
         action=argparse.BooleanOptionalAction,
@@ -119,6 +142,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument(
+        "--metrics-only",
+        action="store_true",
+        help="Reuse completed trajectories in --output-dir without rerunning MD",
+    )
     args = parser.parse_args(argv)
     if args.steps < 1 or args.record_interval < 1:
         parser.error("--steps and --record-interval must be positive")
@@ -138,6 +166,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("neighbor auto minimum reduction must be between 0 and 1")
     if args.neighbor_auto_guard_slots < 1:
         parser.error("neighbor auto guard slots must be positive")
+    if args.rob1_window_steps < 0:
+        parser.error("--rob1-window-steps must be non-negative")
+    args.rob1_window_steps_effective = (
+        args.record_interval
+        if args.rob1_window_steps == 0
+        else args.rob1_window_steps
+    )
+    if args.record_interval % args.rob1_window_steps_effective:
+        parser.error("--record-interval must be divisible by the ROB1 window")
+    if not 0 <= args.rob1_max_retries <= 2:
+        parser.error("--rob1-max-retries must be between zero and two")
+    if args.cap2_compact_slot_step < 1 or args.cap2_compact_margin < 0:
+        parser.error("invalid CAP2 compact capacity parameters")
+    if not 0.0 <= args.cap2_min_reduction <= 1.0:
+        parser.error("--cap2-min-reduction must be between zero and one")
+    if args.cap2_test_capacity_limit < 0:
+        parser.error("--cap2-test-capacity-limit must be non-negative")
+    if args.opt4_neighbor_capacity_policy == "elastic" and not args.rob1:
+        parser.error("Opt4 elastic capacity requires --rob1")
+    if args.rob1 and args.opt4_neighbor_capacity_policy != "elastic":
+        parser.error("--rob1 is only valid with Opt4 elastic capacity")
     if "opt4" in args.backend and (
         not args.opt4_model_fusions.strip() or not args.opt4_fusion_stage.strip()
     ):
@@ -356,6 +405,7 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
     import torch
     from fairchem.core.applications.esen_fixed_neighbor import (
         auto_neighbor_capacities_from_probe,
+        elastic_neighbor_capacities_from_probe,
         neighbor_counts_in_graph,
         neighbor_capacity_from_probe,
     )
@@ -373,6 +423,9 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         MatbenchNHCWholeStepCUDAGraphMD,
         as_numpy_state,
         initialize_matbench_atoms,
+    )
+    from fairchem.core.applications.esen_whole_step_cuda_graph import (
+        ElasticWholeStepCUDAGraphController,
     )
 
     device = torch.device("cuda:0")
@@ -491,39 +544,83 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         neighbor_capacities = None
         effective_capacity_policy = "uniform"
         auto_reduction = 0.0
-        if (
-            backend == "opt4"
-            and args.opt4_neighbor_capacity_policy == "auto-safe"
-        ):
-            neighbor_capacities, auto_reduction = (
-                auto_neighbor_capacities_from_probe(
-                    probe_max_degrees,
-                    margin=args.neighbor_margin,
-                    slot_step=args.neighbor_slot_step,
-                    minimum_reduction=args.neighbor_auto_min_reduction,
-                    guard_slots=args.neighbor_auto_guard_slots,
-                )
-            )
+        safe_capacities, safe_reduction = auto_neighbor_capacities_from_probe(
+            probe_max_degrees,
+            margin=args.neighbor_margin,
+            slot_step=args.neighbor_slot_step,
+            minimum_reduction=args.neighbor_auto_min_reduction,
+            guard_slots=args.neighbor_auto_guard_slots,
+        )
+        safe_effective_capacities = (
+            safe_capacities
+            if safe_capacities is not None
+            else (uniform_capacity,) * len(atoms)
+        )
+        cap2_compact_selected = False
+        cap2_reduction_vs_safe = 0.0
+        cap2_compact_capacities = None
+        if backend == "opt4" and args.opt4_neighbor_capacity_policy == "auto-safe":
+            neighbor_capacities = safe_capacities
+            auto_reduction = safe_reduction
             if neighbor_capacities is not None:
                 effective_capacity_policy = "atom-safe"
+        elif backend == "opt4" and args.opt4_neighbor_capacity_policy == "elastic":
+            (
+                elastic_capacities,
+                cap2_compact_selected,
+                cap2_reduction_vs_safe,
+                cap2_compact_capacities,
+            ) = elastic_neighbor_capacities_from_probe(
+                probe_max_degrees,
+                safe_effective_capacities,
+                margin=args.cap2_compact_margin,
+                slot_step=args.cap2_compact_slot_step,
+                minimum_reduction=args.cap2_min_reduction,
+            )
+            if args.cap2_test_capacity_limit:
+                elastic_capacities = tuple(
+                    max(1, min(value, args.cap2_test_capacity_limit))
+                    for value in elastic_capacities
+                )
+            neighbor_capacities = elastic_capacities
+            effective_capacity_policy = (
+                "elastic-compact"
+                if cap2_compact_selected
+                else "elastic-auto-safe"
+            )
         effective_capacities = (
             neighbor_capacities
             if neighbor_capacities is not None
             else (uniform_capacity,) * len(atoms)
         )
         neighbors_per_atom = max(effective_capacities)
-        whole = MatbenchNHCWholeStepCUDAGraphMD(
-            state,
-            evaluator,
-            integrator,
-            neighbors_per_atom=neighbors_per_atom,
-            neighbor_capacities=neighbor_capacities,
-            neighbor_capacity_policy=effective_capacity_policy,
-            dummy_atoms=args.dummy_atoms,
-            capture_warmup=args.capture_warmup,
-            max_neighbors=args.max_neighbors,
-            degeneracy_tolerance=args.degeneracy_tolerance,
-        )
+        whole_kwargs = {
+            "dummy_atoms": args.dummy_atoms,
+            "capture_warmup": args.capture_warmup,
+            "max_neighbors": args.max_neighbors,
+            "degeneracy_tolerance": args.degeneracy_tolerance,
+        }
+        if backend == "opt4" and args.opt4_neighbor_capacity_policy == "elastic":
+            whole = ElasticWholeStepCUDAGraphController(
+                state,
+                evaluator,
+                integrator,
+                whole_class=MatbenchNHCWholeStepCUDAGraphMD,
+                atomic_numbers=atoms.get_atomic_numbers(),
+                neighbor_capacities=effective_capacities,
+                max_promotions=args.rob1_max_retries,
+                whole_kwargs=whole_kwargs,
+            )
+        else:
+            whole = MatbenchNHCWholeStepCUDAGraphMD(
+                state,
+                evaluator,
+                integrator,
+                neighbors_per_atom=neighbors_per_atom,
+                neighbor_capacities=neighbor_capacities,
+                neighbor_capacity_policy=effective_capacity_policy,
+                **whole_kwargs,
+            )
         whole.capture(initial_state)
         whole.reset_production(initial_state)
         graph_stats = whole.stats()
@@ -543,8 +640,33 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
                 ),
                 "matbench_neighbor_edge_capacity": sum(effective_capacities),
                 "matbench_neighbor_capacity_reduction_vs_uniform": (
-                    auto_reduction if neighbor_capacities is not None else 0.0
+                    (
+                        len(atoms) * uniform_capacity
+                        - sum(effective_capacities)
+                    )
+                    / (len(atoms) * uniform_capacity)
                 ),
+                "matbench_neighbor_auto_safe_edge_capacity": sum(
+                    safe_effective_capacities
+                ),
+                "cap2_enabled": bool(
+                    backend == "opt4"
+                    and args.opt4_neighbor_capacity_policy == "elastic"
+                ),
+                "cap2_compact_selected": cap2_compact_selected,
+                "cap2_compact_reduction_vs_auto_safe": cap2_reduction_vs_safe,
+                "cap2_compact_edge_capacity": (
+                    None
+                    if cap2_compact_capacities is None
+                    else sum(cap2_compact_capacities)
+                ),
+                "cap2_test_capacity_limit": args.cap2_test_capacity_limit,
+                "rob1_enabled": bool(
+                    backend == "opt4"
+                    and args.opt4_neighbor_capacity_policy == "elastic"
+                ),
+                "rob1_window_steps": args.rob1_window_steps_effective,
+                "rob1_max_retries": args.rob1_max_retries,
                 **fusion_metadata,
         }
         graph_stats.update(graph_metadata)
@@ -560,11 +682,16 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         graph.reset_production_stats()
     elif backend in {"opt3", "opt4"}:
         assert whole is not None
-        whole.reset_production(initial_state)
-        cg_initial_forces, cg_initial_energy = whole.evaluate_initial()
-        cg_initial_forces = cg_initial_forces.detach().clone()
-        cg_initial_energy = cg_initial_energy.detach().clone()
-        whole.reset_production(initial_state)
+        adaptive = bool(
+            backend == "opt4"
+            and args.opt4_neighbor_capacity_policy == "elastic"
+        )
+        if not adaptive:
+            whole.reset_production(initial_state)
+            cg_initial_forces, cg_initial_energy = whole.evaluate_initial()
+            cg_initial_forces = cg_initial_forces.detach().clone()
+            cg_initial_energy = cg_initial_energy.detach().clone()
+            whole.reset_production(initial_state)
     # Keep the audit copies off device during the timed rollout.
     eager_initial_forces = eager_initial_forces.cpu()
     eager_initial_energy = eager_initial_energy.cpu()
@@ -592,16 +719,41 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
             graph_stats = graph.stats()
     else:
         assert whole is not None
-        whole.evaluate_initial()
+        timed_initial_forces, timed_initial_energy = whole.evaluate_initial()
+        if (
+            backend == "opt4"
+            and args.opt4_neighbor_capacity_policy == "elastic"
+        ):
+            cg_initial_forces = timed_initial_forces.detach().clone()
+            cg_initial_energy = timed_initial_energy.detach().clone()
         _record_gpu(recorder, 0, whole.state_view(), as_numpy_state)
-        for step in range(1, args.steps + 1):
-            whole.step()
-            if step % args.record_interval == 0:
-                _record_gpu(recorder, step, whole.state_view(), as_numpy_state)
+        if (
+            backend == "opt4"
+            and args.opt4_neighbor_capacity_policy == "elastic"
+        ):
+            step = 0
+            while step < args.steps:
+                whole.run_steps(args.rob1_window_steps_effective)
+                step += args.rob1_window_steps_effective
+                if step % args.record_interval == 0:
+                    _record_gpu(
+                        recorder, step, whole.state_view(), as_numpy_state
+                    )
+        else:
+            for step in range(1, args.steps + 1):
+                whole.step()
+                if step % args.record_interval == 0:
+                    _record_gpu(
+                        recorder, step, whole.state_view(), as_numpy_state
+                    )
         graph_stats = whole.stats()
     graph_stats.update(graph_metadata)
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
+    if cg_initial_forces is not None and cg_initial_forces.device.type != "cpu":
+        cg_initial_forces = cg_initial_forces.cpu()
+    if cg_initial_energy is not None and cg_initial_energy.device.type != "cpu":
+        cg_initial_energy = cg_initial_energy.cpu()
     initial_validation: dict[str, Any] = {}
     if cg_initial_forces is not None and cg_initial_energy is not None:
         energy_error = float(
@@ -648,12 +800,17 @@ def _load_public_metric_functions(matbench_repo: Path):
     used by ``evaluate_md_system``.
     """
 
-    try:
-        from matbench_discovery.md import read_reference_trajectory
-        from matbench_discovery.metrics.md import evaluate_md_system
-        return read_reference_trajectory, evaluate_md_system
-    except (ImportError, SyntaxError, NameError, TypeError) as exc:
-        normal_import_error = exc
+    if sys.version_info >= (3, 10):
+        try:
+            from matbench_discovery.md import read_reference_trajectory
+            from matbench_discovery.metrics.md import evaluate_md_system
+            return read_reference_trajectory, evaluate_md_system
+        except (ImportError, SyntaxError, NameError, TypeError) as exc:
+            normal_import_error = exc
+    else:
+        normal_import_error = RuntimeError(
+            "Python <3.10 requires the local Matbench compatibility loader"
+        )
 
     package_root = matbench_repo / "matbench_discovery"
     metric_path = package_root / "metrics" / "md.py"
@@ -664,6 +821,18 @@ def _load_public_metric_functions(matbench_repo: Path):
 
     def load_compat_source(module_name: str, source_path: Path):
         source = source_path.read_text(encoding="utf-8")
+        # The public repository currently targets newer Python/NumPy versions
+        # than the frozen eSEN environment.  These substitutions preserve the
+        # exact metric implementation while adapting only standard-library
+        # spelling added after Python 3.9.
+        source = re.sub(
+            r",\s*strict\s*=\s*(?:True|False)", "", source
+        )
+        source = source.replace(
+            "from datetime import UTC",
+            "from datetime import timezone\nUTC = timezone.utc",
+        )
+        source = source.replace("datetime.UTC", "datetime.timezone.utc")
         if module_name.endswith(".metrics.md"):
             # This is a runtime type-alias assignment rather than an annotation;
             # Python 3.9 cannot evaluate the PEP 604 expression.
@@ -685,6 +854,9 @@ def _load_public_metric_functions(matbench_repo: Path):
         )
         exec(code, module.__dict__)
         return module
+
+    if not hasattr(np, "trapezoid"):
+        np.trapezoid = np.trapz
 
     # Load the lightweight trajectory module, then replace only the metrics
     # package initializer that pulls in pymatviz/enums.
@@ -1077,6 +1249,62 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _run_metrics_only(args: argparse.Namespace) -> int:
+    """Recompute public metrics from completed trajectories in-place."""
+
+    from fairchem.core.applications.esen_matbench import read_matbench_systems
+
+    if not args.output_dir.is_dir():
+        raise FileNotFoundError(args.output_dir)
+    systems = read_matbench_systems(args.reference_h5, args.systems)
+    rows: list[dict[str, Any]] = []
+    for backend in args.backend:
+        for system in systems:
+            result_path = (
+                args.output_dir / "runs" / backend / f"{system.name}.json"
+            )
+            if result_path.is_file():
+                rows.append(json.loads(result_path.read_text(encoding="utf-8")))
+    if not rows:
+        raise FileNotFoundError(
+            f"No matching completed run JSON files under {args.output_dir / 'runs'}"
+        )
+    public_metrics = _evaluate_public_metrics(
+        args, systems, rows, args.output_dir
+    )
+    report_path = args.output_dir / "matbench_esen_report.json"
+    report = (
+        json.loads(report_path.read_text(encoding="utf-8"))
+        if report_path.is_file()
+        else {
+            "schema": 1,
+            "benchmark": "matbench-dynamat-v1.0",
+            "reference_h5": str(args.reference_h5.resolve()),
+            "protocol": {
+                "steps": args.steps,
+                "record_interval": args.record_interval,
+                "timestep_fs": args.timestep_fs,
+            },
+            "runs": rows,
+            "published_esen_30m_oam": _load_published(args.published_yaml),
+        }
+    )
+    report["public_metrics"] = public_metrics
+    report["metrics_only_recomputed_at"] = time.strftime(
+        "%Y-%m-%dT%H:%M:%S%z"
+    )
+    _write_json(report_path, report)
+    _write_markdown(report, args.output_dir / "matbench_esen_report.md")
+    errors = sum(
+        int(summary.get("n_metric_errors", 0))
+        for summary in public_metrics.values()
+        if isinstance(summary, dict)
+    )
+    print(f"Metrics-only results: {args.output_dir.resolve()}")
+    print(f"metric_errors={errors}")
+    return 1 if errors else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.gpu is not None:
@@ -1087,6 +1315,9 @@ def main(argv: list[str] | None = None) -> int:
     # The Matbench repository is a source checkout whose import package lives
     # one level below the checkout root (matbench-discovery/matbench_discovery).
     sys.path.insert(0, str(args.matbench_repo.resolve()))
+
+    if args.metrics_only:
+        return _run_metrics_only(args)
 
     import torch
     from fairchem.core.applications.esen_matbench import (
@@ -1141,6 +1372,12 @@ def main(argv: list[str] | None = None) -> int:
                 "neighbor_capacity_policy": (
                     args.opt4_neighbor_capacity_policy
                 ),
+                "rob1": args.rob1,
+                "rob1_window_steps": args.rob1_window_steps_effective,
+                "rob1_max_retries": args.rob1_max_retries,
+                "cap2_compact_slot_step": args.cap2_compact_slot_step,
+                "cap2_compact_margin": args.cap2_compact_margin,
+                "cap2_min_reduction": args.cap2_min_reduction,
                 "tf32_mode": "off",
             },
             "systems": [
@@ -1218,6 +1455,14 @@ def main(argv: list[str] | None = None) -> int:
                         "opt4_model_fusions": (
                             args.opt4_model_fusions if backend == "opt4" else ""
                         ),
+                        "opt4_neighbor_capacity_policy": (
+                            args.opt4_neighbor_capacity_policy
+                            if backend == "opt4"
+                            else ""
+                        ),
+                        "rob1_enabled": bool(
+                            backend == "opt4" and args.rob1
+                        ),
                         **_runtime_metadata(torch),
                     },
                 )
@@ -1257,14 +1502,49 @@ def main(argv: list[str] | None = None) -> int:
                 record["status"] = "success"
                 record["exit_code"] = 0
                 if backend in {"opt2", "opt3", "opt4"}:
-                    record["graph_invariants_pass"] = bool(
+                    adaptive = bool(
+                        backend == "opt4"
+                        and args.opt4_neighbor_capacity_policy == "elastic"
+                    )
+                    common_graph_invariants = bool(
                         graph_stats.get("cuda_graph_capture_count", 0) == 1
-                        and graph_stats.get("cuda_graph_production_capture_count", 0)
-                        == 0
                         and graph_stats.get("cuda_graph_production_replays", 0)
                         == args.steps + 1
                         and graph_stats.get("cuda_graph_capacity_misses", 0) == 0
                         and graph_stats.get("cuda_graph_hit_rate", 0.0) == 1.0
+                        and graph_stats.get(
+                            "cuda_graph_replay_output_addresses_stable", True
+                        )
+                    )
+                    adaptive_invariants = bool(
+                        not adaptive
+                        or (
+                            graph_stats.get("rob1_committed_physical_steps", -1)
+                            == args.steps
+                            and graph_stats.get("rob1_unrecovered_overflows", -1)
+                            == 0
+                            and graph_stats.get(
+                                "rob1_snapshot_addresses_stable", False
+                            )
+                        )
+                    )
+                    capture_invariants = bool(
+                        graph_stats.get(
+                            "cuda_graph_production_capture_count", 0
+                        )
+                        == graph_stats.get(
+                            "cuda_graph_recovery_capture_count", 0
+                        )
+                        if adaptive
+                        else graph_stats.get(
+                            "cuda_graph_production_capture_count", 0
+                        )
+                        == 0
+                    )
+                    record["graph_invariants_pass"] = bool(
+                        common_graph_invariants
+                        and adaptive_invariants
+                        and capture_invariants
                     )
                     if not record["graph_invariants_pass"]:
                         if graph_stats.get("cuda_graph_capacity_misses", 0):
@@ -1281,6 +1561,9 @@ def main(argv: list[str] | None = None) -> int:
                     record["status"] = "stress_failed"
                     record["exit_code"] = 47
             except BaseException as exc:
+                exception_graph_stats = getattr(exc, "graph_stats", None)
+                if isinstance(exception_graph_stats, dict):
+                    record["graph_stats"] = exception_graph_stats
                 if _is_oom(exc):
                     record["status"] = "oom"
                     record["exit_code"] = 42
@@ -1394,6 +1677,12 @@ def main(argv: list[str] | None = None) -> int:
             "fusion_stage": args.opt4_fusion_stage,
             "model_fusions": args.opt4_model_fusions,
             "neighbor_capacity_policy": args.opt4_neighbor_capacity_policy,
+            "rob1": args.rob1,
+            "rob1_window_steps": args.rob1_window_steps_effective,
+            "rob1_max_retries": args.rob1_max_retries,
+            "cap2_compact_slot_step": args.cap2_compact_slot_step,
+            "cap2_compact_margin": args.cap2_compact_margin,
+            "cap2_min_reduction": args.cap2_min_reduction,
             "tf32_mode": "off",
         },
         "systems": [
