@@ -5,11 +5,11 @@ import pytest
 import torch
 from ase import Atoms, units
 from ase.calculators.calculator import Calculator, all_changes
-from ase.md.nose_hoover_chain import NoseHooverChainNVT
 
 from fairchem.core.applications.esen_matbench import (
     MatbenchNHCIntegrator,
     MatbenchNHCWholeStepCUDAGraphMD,
+    MatbenchCanonicalNoseHooverChainNVT,
     MatbenchTrajectoryRecorder,
     matched_trajectory_window,
     read_matbench_systems,
@@ -144,7 +144,7 @@ def test_matbench_nhc_matches_ase_for_one_harmonic_step():
     atoms = Atoms("CO", positions=positions, masses=masses)
     atoms.set_momenta(momenta)
     atoms.calc = HarmonicCalculator(spring)
-    ase_md = NoseHooverChainNVT(
+    ase_md = MatbenchCanonicalNoseHooverChainNVT(
         atoms,
         timestep=0.25 * units.fs,
         temperature_K=300.0,
@@ -152,6 +152,12 @@ def test_matbench_nhc_matches_ase_for_one_harmonic_step():
         tchain=3,
         tloop=1,
     )
+    # The adapter must not call the installed ASE version's integrate_nhc;
+    # ASE 3.24 and 3.28 implement different coefficient scaling there.
+    def reject_version_dependent_integrator(*_args, **_kwargs):
+        raise AssertionError("version-dependent ASE integrate_nhc was called")
+
+    ase_md._thermostat.integrate_nhc = reject_version_dependent_integrator
     ase_md.step()
     ase_thermostat = ase_md._thermostat
 
@@ -174,18 +180,16 @@ def test_matbench_nhc_matches_ase_for_one_harmonic_step():
         return -spring * current_positions, 0.5 * spring * current_positions.square().sum()
 
     integrator.step(state, force_fn)
-    # NumPy and Torch use different exp implementations across supported
-    # CPU/Torch builds.  Their one-step FP64 round-off can reach a few e-9
-    # even though the NHC factorization and state updates are identical.
-    # This remains far tighter than any model/MD validation tolerance while
-    # avoiding a bit-level cross-library assertion.
+    # The canonical adapter removes ASE-version dependence from the baseline.
+    # NumPy and Torch may still differ by a few FP64 ulps, so this is strict
+    # numerical equivalence rather than a bitwise assertion.
     for actual, expected in (
         (state.positions.detach().numpy(), atoms.get_positions()),
         (state.momenta.detach().numpy(), atoms.get_momenta()),
         (integrator.eta.detach().numpy(), ase_thermostat._eta),
         (integrator.p_eta.detach().numpy(), ase_thermostat._p_eta),
     ):
-        np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-8)
+        np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-12)
 
 
 def test_matbench_nhc_parameters_match_ase():

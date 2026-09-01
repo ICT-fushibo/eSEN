@@ -15,6 +15,11 @@ The formal protocol is the public Matbench DynaMat v1.0 protocol:
 - 80,000 steps and one saved frame every 10 steps (`8,001` frames);
 - predicted saved-frame interval `2.5 fs`.
 
+The baseline uses a Matbench-only ASE driver that pins the ASE 3.28
+Suzuki--Yoshida coefficient rule. This avoids the extra coefficient-count
+division present in ASE 3.24 while leaving the installed ASE package and all
+non-Matbench runners untouched.
+
 The Matbench-specific GPU integrator and whole-step graph live in
 `src/fairchem/core/applications/esen_matbench.py`.  The original
 `GPUIntegrator` and existing CUDA Graph classes are not replaced.

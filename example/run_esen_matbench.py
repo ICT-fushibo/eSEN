@@ -277,12 +277,15 @@ def _new_recorder(system, args):
 def _run_baseline(system, args, checkpoint, recorder):
     import torch
     from ase import units
-    from ase.md.nose_hoover_chain import NoseHooverChainNVT
     from fairchem.core import OCPCalculator
     from fairchem.core.applications.esen_gpu_md import (
         configure_esen_energy_force_inference,
     )
-    from fairchem.core.applications.esen_matbench import initialize_matbench_atoms
+    from fairchem.core.applications.esen_matbench import (
+        MATBENCH_NHC_ALGORITHM,
+        MatbenchCanonicalNoseHooverChainNVT,
+        initialize_matbench_atoms,
+    )
 
     atoms = initialize_matbench_atoms(system, seed=args.seed)
     atoms.info["matbench_temperature_kelvin"] = system.temperature_kelvin
@@ -295,7 +298,7 @@ def _run_baseline(system, args, checkpoint, recorder):
     )
     configure_esen_energy_force_inference(calc.trainer._unwrapped_model)
     atoms.calc = calc
-    dynamics = NoseHooverChainNVT(
+    dynamics = MatbenchCanonicalNoseHooverChainNVT(
         atoms,
         timestep=args.timestep_fs * units.fs,
         temperature_K=system.temperature_kelvin,
@@ -335,6 +338,7 @@ def _run_baseline(system, args, checkpoint, recorder):
         "capture_wall_time_s": 0.0,
         "probe_wall_time_s": 0.0,
         "graph_stats": {},
+        "matbench_nhc_algorithm": MATBENCH_NHC_ALGORITHM,
         "peak_allocated_gib": (
             torch.cuda.max_memory_allocated() / 1024**3
             if torch.cuda.is_available()
@@ -364,6 +368,7 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         edge_capacity_from_probe,
     )
     from fairchem.core.applications.esen_matbench import (
+        MATBENCH_NHC_ALGORITHM,
         MatbenchNHCIntegrator,
         MatbenchNHCWholeStepCUDAGraphMD,
         as_numpy_state,
@@ -621,6 +626,7 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         "capture_wall_time_s": graph_stats.get("cuda_graph_capture_wall_time_s", 0.0),
         "probe_wall_time_s": probe_elapsed,
         "graph_stats": graph_stats,
+        "matbench_nhc_algorithm": MATBENCH_NHC_ALGORITHM,
         "peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
         "peak_reserved_gib": torch.cuda.max_memory_reserved() / 1024**3,
         "device_used_after_setup_gib": (
@@ -1084,6 +1090,7 @@ def main(argv: list[str] | None = None) -> int:
 
     import torch
     from fairchem.core.applications.esen_matbench import (
+        MATBENCH_NHC_ALGORITHM,
         initialize_matbench_atoms,
         read_matbench_systems,
     )
@@ -1117,6 +1124,7 @@ def main(argv: list[str] | None = None) -> int:
                 "integrator": "NoseHooverChainNVT",
                 "tchain": 3,
                 "tloop": 1,
+                "nhc_algorithm": MATBENCH_NHC_ALGORITHM,
                 "steps": args.steps,
                 "record_interval": args.record_interval,
                 "timestep_fs": args.timestep_fs,
@@ -1370,6 +1378,7 @@ def main(argv: list[str] | None = None) -> int:
             "integrator": "NoseHooverChainNVT",
             "tchain": 3,
             "tloop": 1,
+            "nhc_algorithm": MATBENCH_NHC_ALGORITHM,
             "steps": args.steps,
             "record_interval": args.record_interval,
             "timestep_fs": args.timestep_fs,

@@ -18,7 +18,7 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 from ase import Atoms, units
-from ase.md.nose_hoover_chain import FOURTH_ORDER_COEFFS
+from ase.md.nose_hoover_chain import FOURTH_ORDER_COEFFS, NoseHooverChainNVT
 from torch import Tensor
 
 from fairchem.core.applications.esen_gpu_md import (
@@ -38,6 +38,7 @@ MATBENCH_SEED = 0
 MATBENCH_TCHAIN = 3
 MATBENCH_TLOOP = 1
 MATBENCH_DUMMY_ATOMS = 32
+MATBENCH_NHC_ALGORITHM = "ase-3.28-suzuki-yoshida-no-extra-coefficient-division"
 
 
 def matched_trajectory_window(
@@ -87,6 +88,43 @@ def matched_trajectory_window(
         "prediction_stride": int(prediction_stride),
         "matched_duration_fs": float(duration),
     }
+
+
+class MatbenchCanonicalNoseHooverChainNVT(NoseHooverChainNVT):
+    """ASE driver with the NHC factorization required by current Matbench.
+
+    ASE 3.24 divided each Suzuki--Yoshida coefficient sub-step by both
+    ``tloop`` and the number of coefficients.  ASE 3.28 removed the latter
+    division.  eSEN's Python 3.9 environment may contain the older ASE, so the
+    Matbench baseline must not inherit that version-dependent behavior.
+
+    Force evaluation, observer scheduling and trajectory bookkeeping remain
+    ASE's implementation; only the two thermostat half-steps are made
+    explicit using the current ``coeff * delta / tloop`` rule.
+    """
+
+    matbench_nhc_algorithm = MATBENCH_NHC_ALGORITHM
+
+    def _integrate_matbench_nhc(
+        self, momenta: np.ndarray, delta: float
+    ) -> np.ndarray:
+        thermostat = self._thermostat
+        for _ in range(thermostat._tloop):
+            for coefficient in FOURTH_ORDER_COEFFS:
+                momenta = thermostat._integrate_nhc_loop(
+                    momenta,
+                    coefficient * delta / thermostat._tloop,
+                )
+        return momenta
+
+    def step(self) -> None:
+        half_dt = self.dt / 2
+        self._p = self._integrate_matbench_nhc(self._p, half_dt)
+        self._integrate_p(half_dt)
+        self._integrate_q(self.dt)
+        self._integrate_p(half_dt)
+        self._p = self._integrate_matbench_nhc(self._p, half_dt)
+        self._update_atoms()
 
 
 @dataclass(frozen=True)
