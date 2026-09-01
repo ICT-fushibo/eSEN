@@ -70,7 +70,11 @@ if [[ ! -f "$CHECKPOINT" ]]; then
     exit 2
 fi
 
-mkdir -p "$SAVE_DIR"
+# Do not create or write inside SAVE_DIR before the Python runner validates
+# that a new output directory is empty.  In particular, opening the tee log
+# there races with that validation and makes every fresh run fail unless
+# --overwrite is used.
+mkdir -p "$(dirname "$SAVE_DIR")"
 read -r -a backends_array <<< "$BACKENDS"
 args=(
     --backend "${backends_array[@]}"
@@ -118,7 +122,15 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export CUDA_VISIBLE_DEVICES="$GPU"
 export PYTHONPATH="$REPO_ROOT/src:$MATBENCH_REPO:$ROOT_DEFAULT${PYTHONPATH:+:$PYTHONPATH}"
 LOG_NAME=${BACKENDS// /_}
+LIVE_LOG="${SAVE_DIR%/}.${LOG_NAME}.log"
 
 python -u "$REPO_ROOT/example/run_esen_matbench.py" "${args[@]}" \
-    2>&1 | tee "$SAVE_DIR/${LOG_NAME}.log"
-exit "${PIPESTATUS[0]}"
+    2>&1 | tee "$LIVE_LOG"
+status=${PIPESTATUS[0]}
+
+# Keep the live log beside SAVE_DIR while the runner owns its emptiness check,
+# then place it with the other artifacts once the directory exists.
+if [[ -d "$SAVE_DIR" ]]; then
+    mv -f "$LIVE_LOG" "$SAVE_DIR/${LOG_NAME}.log"
+fi
+exit "$status"
