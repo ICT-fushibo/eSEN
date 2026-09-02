@@ -126,6 +126,8 @@ if [[ "$OFFLINE_STRESS" == "1" ]]; then
 fi
 if [[ "$ROB1" == "1" ]]; then
     args+=(--rob1)
+else
+    args+=(--no-rob1)
 fi
 if [[ "$METRICS_ONLY" == "1" ]]; then
     args+=(--metrics-only)

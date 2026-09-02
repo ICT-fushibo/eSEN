@@ -193,12 +193,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("baseline path and missing-reference flag are exclusive")
     if args.neighbor_capacity_policy == "elastic" and not args.rob1:
         parser.error("elastic capacity requires --rob1")
-    if args.rob1 and args.neighbor_capacity_policy != "elastic":
-        parser.error("--rob1 is only valid with elastic capacity")
-    if args.neighbor_capacity_policy == "elastic" and (
-        args.backend != "whole-step-cg-opt4"
-    ):
-        parser.error("CAP2/ROB1 is only supported by whole-step-cg-opt4")
+    if args.rob1 and args.neighbor_capacity_policy not in {
+        "auto-safe",
+        "elastic",
+    }:
+        parser.error("--rob1 requires auto-safe or elastic capacity")
+    if args.rob1 and args.backend != "whole-step-cg-opt4":
+        parser.error("ROB1 is only supported by whole-step-cg-opt4")
     return args
 
 
@@ -284,9 +285,9 @@ def main() -> int:
         GPUResidentMD,
     )
     from fairchem.core.applications.esen_whole_step_cuda_graph import (
-        ElasticWholeStepCUDAGraphController,
         ESENFixedBuilderModelCUDAGraphEvaluator,
         ESENWholeStepCUDAGraphMD,
+        TransactionalWholeStepCUDAGraphController,
     )
     from fairchem.core.applications.esen_opt4_kernel_fusion import (
         ESENKF1FixedBuilderModelCUDAGraphEvaluator,
@@ -609,14 +610,15 @@ def main() -> int:
             max_neighbors=args.max_neighbors,
             degeneracy_tolerance=args.degeneracy_tolerance,
         )
-        if args.neighbor_capacity_policy == "elastic":
-            whole_md = ElasticWholeStepCUDAGraphController(
+        if args.rob1:
+            whole_md = TransactionalWholeStepCUDAGraphController(
                 state,
                 evaluator,
                 integrator,
                 whole_class=whole_class,
                 atomic_numbers=atoms.numbers,
                 neighbor_capacities=effective_neighbor_capacities,
+                initial_capacity_policy=args.neighbor_capacity_policy,
                 max_promotions=args.rob1_max_retries,
                 whole_kwargs=whole_kwargs,
             )
@@ -637,7 +639,7 @@ def main() -> int:
     device_used_after_capture = _device_memory_used(torch, device)
     setup_wall_time = time.perf_counter() - setup_start
 
-    adaptive = args.neighbor_capacity_policy == "elastic"
+    transactional = args.rob1
     # Standard warmup is trajectory-neutral and excluded from timing.  CAP2's
     # initial force transaction is intentionally not preflighted when warmup
     # is zero: forced-low-capacity smoke tests must exercise rollback inside
@@ -654,7 +656,7 @@ def main() -> int:
     else:
         assert whole_md is not None
         whole_md.reset_production(initial_state)
-        if adaptive:
+        if transactional:
             if args.warmup_steps:
                 whole_md.evaluate_initial()
                 for _ in range(args.warmup_steps):
@@ -706,7 +708,7 @@ def main() -> int:
     else:
         assert whole_md is not None
         timed_initial_forces, timed_initial_energy = whole_md.evaluate_initial()
-        if adaptive:
+        if transactional:
             initial_forces_device = timed_initial_forces.detach().clone()
             initial_energy_device = timed_initial_energy.detach().clone()
             completed = 0
@@ -785,7 +787,7 @@ def main() -> int:
                 and graph_stats.get("cuda_graph_production_capture_count", 0)
                 == graph_stats.get("cuda_graph_recovery_capture_count", 0)
             )
-            if adaptive
+            if transactional
             else graph_stats["cuda_graph_production_capture_count"] == 0
         )
     )
@@ -951,7 +953,7 @@ def main() -> int:
             args.neighbor_capacity_policy == "auto-safe"
             and effective_neighbor_capacity_policy == "atom-safe"
         ),
-        "cap2_enabled": adaptive,
+        "cap2_enabled": args.neighbor_capacity_policy == "elastic",
         "cap2_compact_selected": cap2_compact_selected,
         "cap2_compact_slot_step": args.cap2_compact_slot_step,
         "cap2_compact_margin": args.cap2_compact_margin,
@@ -964,9 +966,13 @@ def main() -> int:
         ),
         "cap2_auto_safe_edge_capacity": sum(safe_effective_capacities),
         "cap2_test_capacity_limit": args.cap2_test_capacity_limit,
-        "rob1_enabled": adaptive,
-        "rob1_window_steps": args.rob1_window_steps if adaptive else None,
-        "rob1_max_retries": args.rob1_max_retries if adaptive else None,
+        "rob1_enabled": transactional,
+        "rob1_window_steps": (
+            args.rob1_window_steps if transactional else None
+        ),
+        "rob1_max_retries": (
+            args.rob1_max_retries if transactional else None
+        ),
         "neighbor_capacity_by_species": neighbor_capacity_by_species,
         "neighbor_edge_capacity": neighbor_edge_capacity,
         "neighbor_uniform_capacity_per_atom": uniform_neighbor_capacity,

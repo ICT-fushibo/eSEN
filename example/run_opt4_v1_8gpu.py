@@ -116,10 +116,17 @@ def _temperature_label(value: str) -> str:
 
 
 def _capacity_policy(value: str) -> str:
-    if value not in {"uniform", "species", "atom", "auto", "auto-safe"}:
+    if value not in {
+        "uniform",
+        "species",
+        "atom",
+        "auto",
+        "auto-safe",
+        "elastic",
+    }:
         raise ValueError(
             "neighbor capacity policy must be uniform, species, atom, auto, "
-            "or auto-safe"
+            "auto-safe, or elastic"
         )
     return value
 
@@ -266,6 +273,10 @@ class Config:
     model_candidate_capacity_policy: str
     whole_base_capacity_policy: str
     whole_candidate_capacity_policy: str
+    whole_base_rob1: bool
+    whole_candidate_rob1: bool
+    rob1_window_steps: int
+    rob1_max_retries: int
     neighbor_auto_min_reduction: float
     neighbor_auto_guard_slots: int
     whole_probe_steps: int
@@ -343,6 +354,18 @@ class Config:
             whole_candidate_capacity_policy=_capacity_policy(
                 _env("WHOLE_CANDIDATE_NEIGHBOR_CAPACITY_POLICY", "uniform")
             ),
+            whole_base_rob1=_env("WHOLE_BASE_ROB1", "0") not in {
+                "0",
+                "false",
+                "False",
+            },
+            whole_candidate_rob1=_env("WHOLE_CANDIDATE_ROB1", "0") not in {
+                "0",
+                "false",
+                "False",
+            },
+            rob1_window_steps=_env_positive_int("ROB1_WINDOW_STEPS", 10),
+            rob1_max_retries=_env_int("ROB1_MAX_RETRIES", 2),
             neighbor_auto_min_reduction=_env_fraction(
                 "NEIGHBOR_AUTO_MIN_REDUCTION", 0.05
             ),
@@ -366,6 +389,7 @@ class Task:
     model_fusions: str
     neighbor_capacity_policy: str
     tf32_mode: str
+    rob1: bool
     system: str
     temperature: str
     repeat: int
@@ -413,6 +437,7 @@ class Scheduler:
         model_fusions: str,
         neighbor_capacity_policy: str,
         tf32_mode: str,
+        rob1: bool,
     ) -> list[str]:
         if scope == "model-only":
             script = self.config.repo_root / "example" / "benchmark_md_gpu.py"
@@ -482,6 +507,16 @@ class Scheduler:
             ]
         if model_fusions:
             args.extend(["--model-fusions", model_fusions, "--fusion-stage", fusion_stage])
+        if scope == "whole-step" and rob1:
+            args.extend(
+                [
+                    "--rob1",
+                    "--rob1-window-steps",
+                    str(self.config.rob1_window_steps),
+                    "--rob1-max-retries",
+                    str(self.config.rob1_max_retries),
+                ]
+            )
         args.extend(self._reference_args(system, temperature, repeat))
         return [self.config.python, "-u", str(script), *args]
 
@@ -517,6 +552,11 @@ class Scheduler:
                 )
                 base_tf32_mode = self.config.whole_base_tf32_mode
                 candidate_tf32_mode = self.config.whole_candidate_tf32_mode
+                base_rob1 = self.config.whole_base_rob1
+                candidate_rob1 = self.config.whole_candidate_rob1
+            if scope == "model-only":
+                base_rob1 = False
+                candidate_rob1 = False
 
             for repeat in range(1, self.config.repeats + 1):
                 for system in self.config.systems:
@@ -535,6 +575,7 @@ class Scheduler:
                                 if is_candidate
                                 else base_tf32_mode
                             )
+                            rob1 = candidate_rob1 if is_candidate else base_rob1
                             label = stage
                             scope_label = scope.replace("-", "_")
                             run_name = (
@@ -554,6 +595,7 @@ class Scheduler:
                                     model_fusions=fusions,
                                     neighbor_capacity_policy=capacity_policy,
                                     tf32_mode=tf32_mode,
+                                    rob1=rob1,
                                     system=system,
                                     temperature=temperature,
                                     repeat=repeat,
@@ -574,6 +616,7 @@ class Scheduler:
                                         fusions,
                                         capacity_policy,
                                         tf32_mode,
+                                        rob1,
                                     ),
                                 )
                             )
@@ -715,6 +758,10 @@ class Scheduler:
                 "whole_candidate_neighbor_capacity_policy": (
                     self.config.whole_candidate_capacity_policy
                 ),
+                "whole_base_rob1": self.config.whole_base_rob1,
+                "whole_candidate_rob1": self.config.whole_candidate_rob1,
+                "rob1_window_steps": self.config.rob1_window_steps,
+                "rob1_max_retries": self.config.rob1_max_retries,
                 "neighbor_auto_min_reduction": (
                     self.config.neighbor_auto_min_reduction
                 ),

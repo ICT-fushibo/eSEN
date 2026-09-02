@@ -107,7 +107,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--rob1",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Enable transactional rollback for Opt4 elastic capacity",
+        help="Enable transactional rollback for Opt4 auto-safe or elastic capacity",
     )
     parser.add_argument(
         "--rob1-window-steps",
@@ -185,8 +185,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--cap2-test-capacity-limit must be non-negative")
     if args.opt4_neighbor_capacity_policy == "elastic" and not args.rob1:
         parser.error("Opt4 elastic capacity requires --rob1")
-    if args.rob1 and args.opt4_neighbor_capacity_policy != "elastic":
-        parser.error("--rob1 is only valid with Opt4 elastic capacity")
+    if args.rob1 and args.opt4_neighbor_capacity_policy not in {
+        "auto-safe",
+        "elastic",
+    }:
+        parser.error("--rob1 requires Opt4 auto-safe or elastic capacity")
     if "opt4" in args.backend and (
         not args.opt4_model_fusions.strip() or not args.opt4_fusion_stage.strip()
     ):
@@ -425,7 +428,7 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         initialize_matbench_atoms,
     )
     from fairchem.core.applications.esen_whole_step_cuda_graph import (
-        ElasticWholeStepCUDAGraphController,
+        TransactionalWholeStepCUDAGraphController,
     )
 
     device = torch.device("cuda:0")
@@ -600,14 +603,15 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
             "max_neighbors": args.max_neighbors,
             "degeneracy_tolerance": args.degeneracy_tolerance,
         }
-        if backend == "opt4" and args.opt4_neighbor_capacity_policy == "elastic":
-            whole = ElasticWholeStepCUDAGraphController(
+        if backend == "opt4" and args.rob1:
+            whole = TransactionalWholeStepCUDAGraphController(
                 state,
                 evaluator,
                 integrator,
                 whole_class=MatbenchNHCWholeStepCUDAGraphMD,
                 atomic_numbers=atoms.get_atomic_numbers(),
                 neighbor_capacities=effective_capacities,
+                initial_capacity_policy=args.opt4_neighbor_capacity_policy,
                 max_promotions=args.rob1_max_retries,
                 whole_kwargs=whole_kwargs,
             )
@@ -661,10 +665,7 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
                     else sum(cap2_compact_capacities)
                 ),
                 "cap2_test_capacity_limit": args.cap2_test_capacity_limit,
-                "rob1_enabled": bool(
-                    backend == "opt4"
-                    and args.opt4_neighbor_capacity_policy == "elastic"
-                ),
+                "rob1_enabled": bool(backend == "opt4" and args.rob1),
                 "rob1_window_steps": args.rob1_window_steps_effective,
                 "rob1_max_retries": args.rob1_max_retries,
                 **fusion_metadata,
@@ -682,11 +683,8 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         graph.reset_production_stats()
     elif backend in {"opt3", "opt4"}:
         assert whole is not None
-        adaptive = bool(
-            backend == "opt4"
-            and args.opt4_neighbor_capacity_policy == "elastic"
-        )
-        if not adaptive:
+        transactional = bool(backend == "opt4" and args.rob1)
+        if not transactional:
             whole.reset_production(initial_state)
             cg_initial_forces, cg_initial_energy = whole.evaluate_initial()
             cg_initial_forces = cg_initial_forces.detach().clone()
@@ -721,15 +719,13 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         assert whole is not None
         timed_initial_forces, timed_initial_energy = whole.evaluate_initial()
         if (
-            backend == "opt4"
-            and args.opt4_neighbor_capacity_policy == "elastic"
+            backend == "opt4" and args.rob1
         ):
             cg_initial_forces = timed_initial_forces.detach().clone()
             cg_initial_energy = timed_initial_energy.detach().clone()
         _record_gpu(recorder, 0, whole.state_view(), as_numpy_state)
         if (
-            backend == "opt4"
-            and args.opt4_neighbor_capacity_policy == "elastic"
+            backend == "opt4" and args.rob1
         ):
             step = 0
             while step < args.steps:
@@ -1502,10 +1498,7 @@ def main(argv: list[str] | None = None) -> int:
                 record["status"] = "success"
                 record["exit_code"] = 0
                 if backend in {"opt2", "opt3", "opt4"}:
-                    adaptive = bool(
-                        backend == "opt4"
-                        and args.opt4_neighbor_capacity_policy == "elastic"
-                    )
+                    transactional = bool(backend == "opt4" and args.rob1)
                     common_graph_invariants = bool(
                         graph_stats.get("cuda_graph_capture_count", 0) == 1
                         and graph_stats.get("cuda_graph_production_replays", 0)
@@ -1517,7 +1510,7 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     )
                     adaptive_invariants = bool(
-                        not adaptive
+                        not transactional
                         or (
                             graph_stats.get("rob1_committed_physical_steps", -1)
                             == args.steps
@@ -1535,7 +1528,7 @@ def main(argv: list[str] | None = None) -> int:
                         == graph_stats.get(
                             "cuda_graph_recovery_capture_count", 0
                         )
-                        if adaptive
+                        if transactional
                         else graph_stats.get(
                             "cuda_graph_production_capture_count", 0
                         )

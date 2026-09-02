@@ -1,5 +1,10 @@
 # Opt4 CAP2 / ROB1
 
+Opt4 v5 uses the ROB1 transaction controller with the frozen
+CAP1-auto-safe allocation.  That configuration is documented in
+[`OPT4_V5.md`](OPT4_V5.md).  This document remains the opt-in CAP2 compact
+capacity experiment, where ROB1 is paired with elastic promotion.
+
 CAP2 is an opt-in whole-step Opt4 capacity policy. The default remains the
 frozen `auto-safe` policy with rollback disabled, so Opt3 and Opt4 v1-v4 runs
 are unchanged.

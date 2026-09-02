@@ -635,12 +635,17 @@ class WholeStepTransactionSnapshot:
         self.restore_integrator_(whole.integrator)
 
 
-class ElasticWholeStepCUDAGraphController:
-    """CAP2/ROB1 wrapper around a single active whole-step CUDA Graph.
+class TransactionalWholeStepCUDAGraphController:
+    """ROB1 wrapper around a single active whole-step CUDA Graph.
 
     A failed transaction is never committed.  Its complete MD state is
     restored, the capacity is promoted from device-observed per-atom demand,
     and the same physical steps are replayed with a newly captured graph.
+
+    The initial allocation may be CAP1-auto-safe or CAP2 elastic.  Keeping
+    that choice independent from transactional recovery lets frozen Opt4
+    configurations add rollback safety without inheriting CAP2's aggressive
+    compact allocation.
     """
 
     def __init__(
@@ -652,6 +657,7 @@ class ElasticWholeStepCUDAGraphController:
         whole_class: type[ESENWholeStepCUDAGraphMD],
         atomic_numbers: Tensor | Sequence[int],
         neighbor_capacities: Tensor | Sequence[int],
+        initial_capacity_policy: str = "elastic",
         max_promotions: int = 2,
         whole_kwargs: dict[str, Any] | None = None,
     ) -> None:
@@ -677,12 +683,17 @@ class ElasticWholeStepCUDAGraphController:
             raise ValueError("CAP2 requires one capacity per real atom")
         if len(numbers) != len(capacities):
             raise ValueError("atomic_numbers must match CAP2 capacities")
+        if initial_capacity_policy not in {"auto-safe", "elastic"}:
+            raise ValueError(
+                "ROB1 initial capacity policy must be auto-safe or elastic"
+            )
         self.eager_evaluator = eager_evaluator
         self.integrator = integrator
         self.whole_class = whole_class
         self.atomic_numbers = numbers
         self.current_capacities = capacities
         self.initial_capacities = capacities
+        self.initial_capacity_policy = str(initial_capacity_policy)
         self.max_promotions = int(max_promotions)
         self.whole_kwargs = dict(whole_kwargs or {})
         self.whole: ESENWholeStepCUDAGraphMD | None = self._new_whole(state)
@@ -708,7 +719,9 @@ class ElasticWholeStepCUDAGraphController:
         kwargs.update(
             neighbors_per_atom=max(self.current_capacities),
             neighbor_capacities=self.current_capacities,
-            neighbor_capacity_policy="elastic",
+            neighbor_capacity_policy=(
+                f"{self.initial_capacity_policy}-rob1"
+            ),
             overflow_to_dummy_only=True,
         )
         return self.whole_class(
@@ -1016,10 +1029,33 @@ class ElasticWholeStepCUDAGraphController:
                     if self.snapshot is not None
                     else False
                 ),
-                "cap2_promotion_count": self.promotion_count,
-                "cap2_promotion_history": self.promotion_history,
-                "cap2_initial_capacities": list(self.initial_capacities),
-                "cap2_final_capacities": list(self.current_capacities),
+                "rob1_initial_capacity_policy": self.initial_capacity_policy,
+                "rob1_promotion_count": self.promotion_count,
+                "rob1_promotion_history": self.promotion_history,
+                "rob1_initial_capacities": list(self.initial_capacities),
+                "rob1_final_capacities": list(self.current_capacities),
+                # Preserve CAP2 telemetry for existing result consumers.  A
+                # CAP1-auto-safe ROB1 run is explicitly not a CAP2 run.
+                "cap2_promotion_count": (
+                    self.promotion_count
+                    if self.initial_capacity_policy == "elastic"
+                    else 0
+                ),
+                "cap2_promotion_history": (
+                    self.promotion_history
+                    if self.initial_capacity_policy == "elastic"
+                    else []
+                ),
+                "cap2_initial_capacities": (
+                    list(self.initial_capacities)
+                    if self.initial_capacity_policy == "elastic"
+                    else []
+                ),
+                "cap2_final_capacities": (
+                    list(self.current_capacities)
+                    if self.initial_capacity_policy == "elastic"
+                    else []
+                ),
                 "sink_padding_edges_min": (
                     min(sink_min_values) if sink_min_values else None
                 ),
@@ -1030,3 +1066,7 @@ class ElasticWholeStepCUDAGraphController:
             }
         )
         return active
+
+
+# Backwards-compatible name retained for CAP2 scripts and imports.
+ElasticWholeStepCUDAGraphController = TransactionalWholeStepCUDAGraphController
