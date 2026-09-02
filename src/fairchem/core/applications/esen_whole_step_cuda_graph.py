@@ -21,7 +21,8 @@ from fairchem.core.applications.esen_cuda_graph import (
     ESENModelCUDAGraphEvaluator,
 )
 from fairchem.core.applications.esen_fixed_neighbor import (
-    FixedShapePBCNeighborBuilder,
+    cell_list_bin_capacity_from_probe,
+    make_fixed_shape_pbc_neighbor_builder,
     promote_elastic_neighbor_capacities,
 )
 from fairchem.core.applications.esen_gpu_md import (
@@ -132,6 +133,10 @@ class ESENFixedBuilderModelCUDAGraphEvaluator(ESENModelCUDAGraphEvaluator):
         neighbors_per_atom: int,
         neighbor_capacities: Tensor | Sequence[int] | None = None,
         neighbor_capacity_policy: str = "uniform",
+        neighbor_builder: str = "dense",
+        cell_list_bin_capacity: int = 0,
+        cell_list_bin_margin: float = 0.25,
+        cell_list_bin_step: int = 8,
         dummy_atoms: int = 32,
         capture_warmup: int = 3,
         max_neighbors: int = 300,
@@ -146,6 +151,7 @@ class ESENFixedBuilderModelCUDAGraphEvaluator(ESENModelCUDAGraphEvaluator):
             neighbor_capacities,
         )
         self.neighbor_capacity_policy = str(neighbor_capacity_policy)
+        self.neighbor_builder = str(neighbor_builder)
         super().__init__(
             eager_evaluator,
             edge_capacity=edge_capacity,
@@ -161,7 +167,8 @@ class ESENFixedBuilderModelCUDAGraphEvaluator(ESENModelCUDAGraphEvaluator):
         self._initialize_static_edges(sample)
         assert self.static_edge_index is not None
         assert self.static_cell_offsets is not None
-        self.fixed_builder = FixedShapePBCNeighborBuilder(
+        self.fixed_builder = make_fixed_shape_pbc_neighbor_builder(
+            self.neighbor_builder,
             num_atoms=self.num_atoms,
             cell=self.static_batch.cell.reshape(-1, 3, 3)[0],
             pbc=_pbc_vector(self.static_batch, self.device),
@@ -172,6 +179,10 @@ class ESENFixedBuilderModelCUDAGraphEvaluator(ESENModelCUDAGraphEvaluator):
             dummy_atoms=self.dummy_atoms,
             max_neighbors=max_neighbors,
             degeneracy_tolerance=degeneracy_tolerance,
+            reference_positions=eager_evaluator.model_positions,
+            cell_list_bin_capacity=cell_list_bin_capacity,
+            cell_list_bin_margin=cell_list_bin_margin,
+            cell_list_bin_step=cell_list_bin_step,
             output_edge_index=self.static_edge_index,
             output_cell_offsets=self.static_cell_offsets,
         )
@@ -255,6 +266,10 @@ class ESENWholeStepCUDAGraphMD:
         neighbors_per_atom: int,
         neighbor_capacities: Tensor | Sequence[int] | None = None,
         neighbor_capacity_policy: str = "uniform",
+        neighbor_builder: str = "dense",
+        cell_list_bin_capacity: int = 0,
+        cell_list_bin_margin: float = 0.25,
+        cell_list_bin_step: int = 8,
         dummy_atoms: int = 32,
         capture_warmup: int = 3,
         max_neighbors: int = 300,
@@ -281,6 +296,7 @@ class ESENWholeStepCUDAGraphMD:
             )
         )
         self.neighbor_capacity_policy = str(neighbor_capacity_policy)
+        self.neighbor_builder = str(neighbor_builder)
         self.capture_warmup = int(capture_warmup)
         self.integrator = integrator
         self.core = ESENModelCUDAGraphEvaluator(
@@ -293,7 +309,8 @@ class ESENWholeStepCUDAGraphMD:
         self.core._initialize_static_edges(sample)
         assert self.core.static_edge_index is not None
         assert self.core.static_cell_offsets is not None
-        self.fixed_builder = FixedShapePBCNeighborBuilder(
+        self.fixed_builder = make_fixed_shape_pbc_neighbor_builder(
+            self.neighbor_builder,
             num_atoms=self.num_atoms,
             cell=self.core.static_batch.cell.reshape(-1, 3, 3)[0],
             pbc=_pbc_vector(self.core.static_batch, self.device),
@@ -305,6 +322,10 @@ class ESENWholeStepCUDAGraphMD:
             max_neighbors=max_neighbors,
             degeneracy_tolerance=degeneracy_tolerance,
             overflow_to_dummy_only=overflow_to_dummy_only,
+            reference_positions=state.positions,
+            cell_list_bin_capacity=cell_list_bin_capacity,
+            cell_list_bin_margin=cell_list_bin_margin,
+            cell_list_bin_step=cell_list_bin_step,
             output_edge_index=self.core.static_edge_index,
             output_cell_offsets=self.core.static_cell_offsets,
         )
@@ -696,7 +717,18 @@ class TransactionalWholeStepCUDAGraphController:
         self.initial_capacity_policy = str(initial_capacity_policy)
         self.max_promotions = int(max_promotions)
         self.whole_kwargs = dict(whole_kwargs or {})
+        self.current_cell_list_bin_capacity = int(
+            self.whole_kwargs.get("cell_list_bin_capacity", 0)
+        )
         self.whole: ESENWholeStepCUDAGraphMD | None = self._new_whole(state)
+        actual_bin_capacity = int(
+            getattr(self.whole.fixed_builder, "cell_list_bin_capacity", 0)
+        )
+        if actual_bin_capacity:
+            self.current_cell_list_bin_capacity = actual_bin_capacity
+        self.initial_cell_list_bin_capacity = (
+            self.current_cell_list_bin_capacity
+        )
         self.snapshot: WholeStepTransactionSnapshot | None = None
         self.setup_capture_count = 0
         self.recovery_capture_count = 0
@@ -716,6 +748,10 @@ class TransactionalWholeStepCUDAGraphController:
 
     def _new_whole(self, state: GPUMDState) -> ESENWholeStepCUDAGraphMD:
         kwargs = dict(self.whole_kwargs)
+        if self.current_cell_list_bin_capacity:
+            kwargs["cell_list_bin_capacity"] = (
+                self.current_cell_list_bin_capacity
+            )
         kwargs.update(
             neighbors_per_atom=max(self.current_capacities),
             neighbor_capacities=self.current_capacities,
@@ -770,6 +806,7 @@ class TransactionalWholeStepCUDAGraphController:
         demand: Sequence[int],
         *,
         transaction_steps: int,
+        cell_list_required_bin_capacity: int = 0,
     ) -> None:
         whole = self._active()
         assert self.snapshot is not None
@@ -778,25 +815,63 @@ class TransactionalWholeStepCUDAGraphController:
             self._synchronize(whole)
             self.unrecovered_overflows += 1
             stats = self.stats()
-            required = max(int(value) for value in demand)
+            required = max(
+                max(int(value) for value in demand),
+                int(cell_list_required_bin_capacity),
+            )
             raise UnrecoveredCapacityOverflow(
-                required, max(self.current_capacities), stats
+                required,
+                max(
+                    max(self.current_capacities),
+                    self.current_cell_list_bin_capacity,
+                ),
+                stats,
             )
         previous = self.current_capacities
-        promoted, policy = promote_elastic_neighbor_capacities(
-            previous,
-            demand,
-            self.atomic_numbers,
-            promotion_index=self.promotion_count,
+        previous_bin_capacity = self.current_cell_list_bin_capacity
+        neighbor_overflow = any(
+            int(required) > int(capacity)
+            for required, capacity in zip(demand, previous)
         )
-        if sum(promoted) <= sum(previous):
+        policies: list[str] = []
+        if neighbor_overflow:
+            promoted, neighbor_policy = promote_elastic_neighbor_capacities(
+                previous,
+                demand,
+                self.atomic_numbers,
+                promotion_index=self.promotion_count,
+            )
+            policies.append(neighbor_policy)
+        else:
+            promoted = previous
+        promoted_bin_capacity = previous_bin_capacity
+        if (
+            previous_bin_capacity
+            and cell_list_required_bin_capacity > previous_bin_capacity
+        ):
+            promoted_bin_capacity = min(
+                len(previous),
+                cell_list_bin_capacity_from_probe(
+                    cell_list_required_bin_capacity,
+                    margin=0.10,
+                    slot_step=8,
+                ),
+            )
+            policies.append("cell-list-bin")
+        if (
+            sum(promoted) <= sum(previous)
+            and promoted_bin_capacity <= previous_bin_capacity
+        ):
             self.snapshot.restore_into_(whole)
             self._synchronize(whole)
             self.unrecovered_overflows += 1
             stats = self.stats()
             raise UnrecoveredCapacityOverflow(
-                max(int(value) for value in demand),
-                max(previous),
+                max(
+                    max(int(value) for value in demand),
+                    int(cell_list_required_bin_capacity),
+                ),
+                max(max(previous), previous_bin_capacity),
                 stats,
             )
         recovery_started = time.perf_counter()
@@ -813,6 +888,7 @@ class TransactionalWholeStepCUDAGraphController:
         torch.cuda.empty_cache()
 
         self.current_capacities = promoted
+        self.current_cell_list_bin_capacity = promoted_bin_capacity
         self.snapshot.restore_integrator_(self.integrator)
         state = self.snapshot.state_view()
         replacement = self._new_whole(state)
@@ -825,7 +901,7 @@ class TransactionalWholeStepCUDAGraphController:
         self.promotion_history.append(
             {
                 "promotion_index": self.promotion_count + 1,
-                "policy": policy,
+                "policy": "+".join(policies),
                 "transaction_steps": transaction_steps,
                 "required_max_neighbors": max(int(value) for value in demand),
                 "old_edge_capacity": old_edge_capacity,
@@ -834,6 +910,11 @@ class TransactionalWholeStepCUDAGraphController:
                 "old_capacity_max": max(previous),
                 "new_capacity_min": min(promoted),
                 "new_capacity_max": max(promoted),
+                "required_cell_list_bin_capacity": int(
+                    cell_list_required_bin_capacity
+                ),
+                "old_cell_list_bin_capacity": previous_bin_capacity,
+                "new_cell_list_bin_capacity": promoted_bin_capacity,
                 "capture_wall_time_s": capture_elapsed,
             }
         )
@@ -895,7 +976,11 @@ class TransactionalWholeStepCUDAGraphController:
                 "fixed_builder_window_maximum_included_neighbors_by_atom"
             ]
             self._promote_and_recapture(
-                demand, transaction_steps=(0 if initial else steps)
+                demand,
+                transaction_steps=(0 if initial else steps),
+                cell_list_required_bin_capacity=int(
+                    window.get("cell_list_window_maximum_bin_occupancy", 0)
+                ),
             )
 
     def evaluate_initial(self) -> tuple[Tensor, Tensor]:
@@ -1034,6 +1119,12 @@ class TransactionalWholeStepCUDAGraphController:
                 "rob1_promotion_history": self.promotion_history,
                 "rob1_initial_capacities": list(self.initial_capacities),
                 "rob1_final_capacities": list(self.current_capacities),
+                "rob1_initial_cell_list_bin_capacity": (
+                    self.initial_cell_list_bin_capacity
+                ),
+                "rob1_final_cell_list_bin_capacity": (
+                    self.current_cell_list_bin_capacity
+                ),
                 # Preserve CAP2 telemetry for existing result consumers.  A
                 # CAP1-auto-safe ROB1 run is explicitly not a CAP2 run.
                 "cap2_promotion_count": (

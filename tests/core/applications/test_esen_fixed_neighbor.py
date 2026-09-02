@@ -6,9 +6,13 @@ import pytest
 import torch
 
 from fairchem.core.applications.esen_fixed_neighbor import (
+    CellListFixedShapePBCNeighborBuilder,
     FixedShapePBCNeighborBuilder,
     atom_neighbor_capacities_from_probe,
     auto_neighbor_capacities_from_probe,
+    cell_list_bin_capacity_from_probe,
+    cell_list_grid_shape,
+    cell_list_max_occupancy,
     elastic_neighbor_capacities_from_probe,
     maximum_neighbors_in_graph,
     neighbor_counts_in_graph,
@@ -45,6 +49,17 @@ def test_neighbor_capacity_from_probe_adds_margin_and_rounds():
     assert neighbor_capacity_from_probe(8, margin=0.0, slot_step=8) == 16
     with pytest.raises(ValueError):
         neighbor_capacity_from_probe(0)
+
+
+def test_cell_list_grid_and_bin_capacity_are_fixed_and_rounded():
+    cell = torch.diag(torch.tensor([10.0, 15.0, 21.0]))
+    pbc = torch.tensor([True, True, True])
+    assert cell_list_grid_shape(cell, pbc, 4.0) == (2, 3, 5)
+    positions = torch.tensor(
+        [[0.1, 0.1, 0.1], [0.2, 0.2, 0.2], [7.0, 7.0, 7.0]]
+    )
+    assert int(cell_list_max_occupancy(positions, cell, pbc, 4.0)) == 2
+    assert cell_list_bin_capacity_from_probe(7, margin=0.25, slot_step=8) == 16
 
 
 def test_elastic_capacity_uses_compact_start_and_monotonic_promotions():
@@ -216,6 +231,134 @@ def test_fixed_builder_matches_official_edge_order(cell):
     torch.testing.assert_close(
         builder.edge_index[0, padding], builder.edge_index[1, padding]
     )
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [
+        torch.diag(torch.tensor([3.0, 3.5, 4.0])),
+        torch.tensor([[3.0, 0.0, 0.0], [0.4, 3.2, 0.0], [0.2, 0.3, 3.4]]),
+    ],
+)
+def test_cell_list_builder_matches_official_edge_order(cell):
+    positions = torch.tensor(
+        [[0.1, 0.2, 0.3], [1.0, 0.2, 0.3], [2.2, 2.4, 2.7]]
+    )
+    pbc = torch.tensor([True, True, True])
+    official_edges, official_offsets = _official_graph(
+        positions, cell, pbc
+    )
+    maximum = max(1, maximum_neighbors_in_graph(official_edges, 3))
+    builder = CellListFixedShapePBCNeighborBuilder(
+        reference_positions=positions,
+        cell_list_bin_capacity=3,
+        num_atoms=3,
+        cell=cell,
+        pbc=pbc,
+        cutoff=1.25,
+        neighbors_per_atom=maximum + 1,
+        dummy_atoms=2,
+    )
+    builder.build(positions)
+    fixed_edges, fixed_offsets = _active_builder_edges(builder)
+
+    torch.testing.assert_close(fixed_edges, official_edges)
+    torch.testing.assert_close(fixed_offsets, official_offsets)
+    stats = builder.stats()
+    assert stats["fixed_builder_backend"] == "cell-list"
+    assert stats["cell_list_bin_overflow_replays"] == 0
+
+
+def test_cell_list_builder_matches_multiple_periodic_images():
+    positions = torch.tensor([[0.0, 0.0, 0.0]])
+    cell = torch.eye(3)
+    pbc = torch.tensor([True, True, True])
+    official_edges, official_offsets = _official_graph(
+        positions, cell, pbc, cutoff=1.6
+    )
+    maximum = max(1, maximum_neighbors_in_graph(official_edges, 1))
+    builder = CellListFixedShapePBCNeighborBuilder(
+        reference_positions=positions,
+        cell_list_bin_capacity=1,
+        num_atoms=1,
+        cell=cell,
+        pbc=pbc,
+        cutoff=1.6,
+        neighbors_per_atom=maximum + 1,
+        dummy_atoms=2,
+    )
+    builder.build(positions)
+    fixed_edges, fixed_offsets = _active_builder_edges(builder)
+    torch.testing.assert_close(fixed_edges, official_edges)
+    torch.testing.assert_close(fixed_offsets, official_offsets)
+
+
+def test_cell_list_bin_overflow_uses_dummy_only_and_reports_demand():
+    positions = torch.tensor(
+        [[0.10, 0.10, 0.10], [0.20, 0.20, 0.20], [0.30, 0.30, 0.30]]
+    )
+    builder = CellListFixedShapePBCNeighborBuilder(
+        reference_positions=positions,
+        cell_list_bin_capacity=1,
+        num_atoms=3,
+        cell=torch.diag(torch.tensor([10.0, 10.0, 10.0])),
+        pbc=torch.tensor([True, True, True]),
+        cutoff=1.0,
+        neighbors_per_atom=1,
+        neighbor_capacities=(1, 1, 1),
+        capacity_policy="auto-safe",
+        dummy_atoms=2,
+        overflow_to_dummy_only=True,
+    )
+    builder.reset_window_stats()
+    builder.build(positions, step=torch.tensor(4))
+
+    assert bool((builder.edge_index >= 3).all())
+    stats = builder.stats()
+    assert stats["fixed_builder_capacity_misses"] == 1
+    assert stats["cell_list_maximum_bin_occupancy"] == 3
+    assert stats["cell_list_bin_overflow_replays"] == 1
+    assert stats["overflow_dummy_only_replays"] == 1
+    window = builder.window_stats()
+    assert window["cell_list_window_maximum_bin_occupancy"] == 3
+    assert window["cell_list_window_bin_overflow_replays"] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cell_list_builder_cuda_graph_replays_at_fixed_addresses():
+    device = torch.device("cuda")
+    positions = torch.tensor(
+        [[0.1, 0.2, 0.3], [1.0, 0.2, 0.3], [2.2, 2.4, 2.7]],
+        device=device,
+    )
+    cell = torch.diag(torch.tensor([3.0, 3.5, 4.0], device=device))
+    pbc = torch.tensor([True, True, True], device=device)
+    builder = CellListFixedShapePBCNeighborBuilder(
+        reference_positions=positions,
+        cell_list_bin_capacity=3,
+        num_atoms=3,
+        cell=cell,
+        pbc=pbc,
+        cutoff=1.25,
+        neighbors_per_atom=4,
+        dummy_atoms=2,
+    )
+    static_positions = positions.clone()
+    for _ in range(3):
+        builder.build(static_positions)
+    torch.cuda.synchronize()
+    edge_address = builder.edge_index.data_ptr()
+    offset_address = builder.cell_offsets.data_ptr()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        builder.build(static_positions)
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert builder.edge_index.data_ptr() == edge_address
+    assert builder.cell_offsets.data_ptr() == offset_address
+    assert builder.stats()["cell_list_bin_overflow_replays"] == 0
 
 
 def test_fixed_builder_non_strict_degeneracy_and_overflow():

@@ -354,9 +354,12 @@ def test_rob1_third_step_overflow_rolls_back_and_replays_transaction():
     controller.retried_physical_steps = 0
     controller.detected_overflow_replays = 0
 
-    def promote_and_restore(demand, *, transaction_steps):
+    def promote_and_restore(
+        demand, *, transaction_steps, cell_list_required_bin_capacity=0
+    ):
         assert demand == [5]
         assert transaction_steps == 10
+        assert cell_list_required_bin_capacity == 0
         controller.snapshot.restore_into_(whole)
 
     controller._promote_and_recapture = promote_and_restore

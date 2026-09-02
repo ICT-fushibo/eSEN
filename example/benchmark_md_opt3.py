@@ -75,6 +75,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neighbor-margin", type=float, default=0.10)
     parser.add_argument("--neighbor-slot-step", type=int, default=8)
     parser.add_argument(
+        "--neighbor-builder",
+        choices=("dense", "cell-list"),
+        default="dense",
+        help=(
+            "Fixed-shape neighbor candidate generator. 'dense' preserves "
+            "Opt4 v5; 'cell-list' enables the experimental CELL1 path."
+        ),
+    )
+    parser.add_argument("--cell-list-bin-capacity", type=int, default=0)
+    parser.add_argument("--cell-list-bin-margin", type=float, default=0.25)
+    parser.add_argument("--cell-list-bin-step", type=int, default=8)
+    parser.add_argument(
         "--neighbor-capacity-policy",
         "--opt4-neighbor-capacity-policy",
         dest="neighbor_capacity_policy",
@@ -162,6 +174,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("NVT parameters must be positive")
     if args.neighbor_margin < 0 or args.neighbor_slot_step < 1:
         parser.error("invalid neighbor capacity parameters")
+    if (
+        args.cell_list_bin_capacity < 0
+        or args.cell_list_bin_margin < 0
+        or args.cell_list_bin_step < 1
+    ):
+        parser.error("invalid cell-list bin-capacity parameters")
     if args.neighbor_auto_guard_slots < 1:
         parser.error("neighbor auto-safe guard slots must be positive")
     if args.rob1_window_steps < 1:
@@ -200,6 +218,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--rob1 requires auto-safe or elastic capacity")
     if args.rob1 and args.backend != "whole-step-cg-opt4":
         parser.error("ROB1 is only supported by whole-step-cg-opt4")
+    if args.neighbor_builder == "cell-list" and not args.backend.endswith(
+        "-opt4"
+    ):
+        parser.error("CELL1 is only supported by Opt4 backends")
     return args
 
 
@@ -273,6 +295,9 @@ def main() -> int:
     from fairchem.core.applications.esen_fixed_neighbor import (
         atom_neighbor_capacities_from_probe,
         auto_neighbor_capacities_from_probe,
+        cell_list_bin_capacity_from_probe,
+        cell_list_grid_shape,
+        cell_list_max_occupancy,
         elastic_neighbor_capacities_from_probe,
         neighbor_counts_in_graph,
         neighbor_capacity_from_probe,
@@ -390,6 +415,27 @@ def main() -> int:
     probe_max_degrees = neighbor_counts_in_graph(
         initial_graph["edge_index"], len(atoms)
     )
+    cell_list_cell = evaluator.batch.cell.reshape(-1, 3, 3)[0]
+    cell_list_pbc = evaluator.batch.pbc.reshape(-1, 3)[0]
+    cell_list_cutoff = float(evaluator.model.backbone.cutoff)
+    probed_cell_list_grid_shape = (
+        cell_list_grid_shape(
+            cell_list_cell, cell_list_pbc, cell_list_cutoff
+        )
+        if args.neighbor_builder == "cell-list"
+        else None
+    )
+    probe_max_bin_occupancy = (
+        cell_list_max_occupancy(
+            state.positions,
+            cell_list_cell,
+            cell_list_pbc,
+            cell_list_cutoff,
+            grid_shape=probed_cell_list_grid_shape,
+        )
+        if args.neighbor_builder == "cell-list"
+        else None
+    )
     for _ in range(args.probe_steps):
         eager_md.run(1)
         graph = evaluator.build_neighbor_graph(state.positions)
@@ -397,7 +443,36 @@ def main() -> int:
             probe_max_degrees,
             neighbor_counts_in_graph(graph["edge_index"], len(atoms)),
         )
+        if probe_max_bin_occupancy is not None:
+            probe_max_bin_occupancy = torch.maximum(
+                probe_max_bin_occupancy,
+                cell_list_max_occupancy(
+                    state.positions,
+                    cell_list_cell,
+                    cell_list_pbc,
+                    cell_list_cutoff,
+                    grid_shape=probed_cell_list_grid_shape,
+                ),
+            )
     torch.cuda.synchronize()
+    probed_cell_list_bin_occupancy = (
+        0
+        if probe_max_bin_occupancy is None
+        else int(probe_max_bin_occupancy.item())
+    )
+    effective_cell_list_bin_capacity = (
+        args.cell_list_bin_capacity
+        if args.cell_list_bin_capacity
+        else (
+            cell_list_bin_capacity_from_probe(
+                probed_cell_list_bin_occupancy,
+                margin=args.cell_list_bin_margin,
+                slot_step=args.cell_list_bin_step,
+            )
+            if args.neighbor_builder == "cell-list"
+            else 0
+        )
+    )
     probe_max_neighbors = int(probe_max_degrees.max().item())
     uniform_neighbor_capacity = neighbor_capacity_from_probe(
         probe_max_neighbors,
@@ -578,6 +653,10 @@ def main() -> int:
             neighbors_per_atom=neighbor_capacity,
             neighbor_capacities=neighbor_capacities,
             neighbor_capacity_policy=effective_neighbor_capacity_policy,
+            neighbor_builder=args.neighbor_builder,
+            cell_list_bin_capacity=effective_cell_list_bin_capacity,
+            cell_list_bin_margin=args.cell_list_bin_margin,
+            cell_list_bin_step=args.cell_list_bin_step,
             dummy_atoms=args.dummy_atoms,
             capture_warmup=args.capture_warmup,
             max_neighbors=args.max_neighbors,
@@ -609,6 +688,10 @@ def main() -> int:
             capture_warmup=args.capture_warmup,
             max_neighbors=args.max_neighbors,
             degeneracy_tolerance=args.degeneracy_tolerance,
+            neighbor_builder=args.neighbor_builder,
+            cell_list_bin_capacity=effective_cell_list_bin_capacity,
+            cell_list_bin_margin=args.cell_list_bin_margin,
+            cell_list_bin_step=args.cell_list_bin_step,
         )
         if args.rob1:
             whole_md = TransactionalWholeStepCUDAGraphController(
@@ -900,8 +983,30 @@ def main() -> int:
         "neighbor_builder": (
             "fixed_shape_radius_graph_pbc_triton_kf1"
             if kf1_backend
-            else "fixed_shape_radius_graph_pbc"
+            else (
+                "fixed_shape_cell_list"
+                if args.neighbor_builder == "cell-list"
+                else "fixed_shape_radius_graph_pbc"
+            )
         ),
+        "neighbor_builder_requested": args.neighbor_builder,
+        "cell_list_probed_maximum_bin_occupancy": (
+            probed_cell_list_bin_occupancy
+            if args.neighbor_builder == "cell-list"
+            else None
+        ),
+        "cell_list_probed_grid_shape": (
+            None
+            if probed_cell_list_grid_shape is None
+            else list(probed_cell_list_grid_shape)
+        ),
+        "cell_list_initial_bin_capacity": (
+            effective_cell_list_bin_capacity
+            if args.neighbor_builder == "cell-list"
+            else None
+        ),
+        "cell_list_bin_margin": args.cell_list_bin_margin,
+        "cell_list_bin_step": args.cell_list_bin_step,
         "md_state_dtype": "float64",
         "model_dtype": str(evaluator.model_dtype).removeprefix("torch."),
         "probe_steps": args.probe_steps,

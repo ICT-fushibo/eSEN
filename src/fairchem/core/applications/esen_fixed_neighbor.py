@@ -331,6 +331,123 @@ def _pbc_repetitions(cell: Tensor, cutoff: float, pbc: Tensor) -> tuple[int, int
     return tuple(repetitions)  # type: ignore[return-value]
 
 
+def _cell_plane_distances(cell: Tensor) -> tuple[float, float, float]:
+    """Return the three real-space distances between opposite cell planes."""
+
+    cell64 = cell.detach().to(device="cpu", dtype=torch.float64).reshape(3, 3)
+    cross_a2a3 = torch.cross(cell64[1], cell64[2], dim=0)
+    volume = torch.dot(cell64[0], cross_a2a3)
+    if not bool(torch.isfinite(volume)) or float(volume.abs()) == 0.0:
+        raise ValueError("Cannot construct a cell list for a singular cell")
+    reciprocal = (
+        cross_a2a3,
+        torch.cross(cell64[2], cell64[0], dim=0),
+        torch.cross(cell64[0], cell64[1], dim=0),
+    )
+    distances = tuple(
+        float(1.0 / torch.linalg.vector_norm(vector / volume))
+        for vector in reciprocal
+    )
+    if any(not math.isfinite(value) or value <= 0 for value in distances):
+        raise ValueError("Cannot construct a cell list for an invalid cell")
+    return distances  # type: ignore[return-value]
+
+
+def cell_list_grid_shape(
+    cell: Tensor,
+    pbc: Tensor,
+    cutoff: float,
+) -> tuple[int, int, int]:
+    """Choose a conservative fixed cell-list grid for a periodic structure.
+
+    Each bin is at least ``cutoff`` wide in the corresponding reciprocal-plane
+    direction whenever the periodic cell is large enough.  Small cells retain
+    one bin and use a wider neighboring-bin stencil so multiple periodic images
+    remain visible.
+    """
+
+    if cutoff <= 0:
+        raise ValueError("cutoff must be positive")
+    pbc_cpu = pbc.detach().to(device="cpu", dtype=torch.bool).reshape(3)
+    if not bool(pbc_cpu.all()):
+        raise ValueError("GPU cell-list construction currently requires 3D PBC")
+    return tuple(
+        max(1, int(math.floor(distance / cutoff)))
+        for distance in _cell_plane_distances(cell)
+    )  # type: ignore[return-value]
+
+
+def _cell_list_bin_ids(
+    positions: Tensor,
+    cell: Tensor,
+    grid_shape: Sequence[int],
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Return wrapped bin ids, integer image indices, and bin coordinates."""
+
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("positions must have shape [num_atoms, 3]")
+    grid = torch.as_tensor(
+        tuple(int(value) for value in grid_shape),
+        device=positions.device,
+        dtype=torch.long,
+    )
+    if grid.shape != (3,) or bool((grid < 1).any()):
+        raise ValueError("grid_shape must contain three positive values")
+    inverse_cell = torch.linalg.inv(cell.to(dtype=positions.dtype).reshape(3, 3))
+    fractional = torch.mm(positions, inverse_cell)
+    image_indices = torch.floor(fractional).to(dtype=torch.long)
+    wrapped = fractional - image_indices.to(dtype=fractional.dtype)
+    bin_coordinates = torch.floor(
+        wrapped * grid.to(dtype=wrapped.dtype)
+    ).to(dtype=torch.long)
+    bin_coordinates = torch.minimum(bin_coordinates, grid - 1)
+    bin_ids = (
+        (bin_coordinates[:, 0] * grid[1] + bin_coordinates[:, 1])
+        * grid[2]
+        + bin_coordinates[:, 2]
+    )
+    return bin_ids, image_indices, bin_coordinates
+
+
+def cell_list_max_occupancy(
+    positions: Tensor,
+    cell: Tensor,
+    pbc: Tensor,
+    cutoff: float,
+    *,
+    grid_shape: Sequence[int] | None = None,
+) -> Tensor:
+    """Return the maximum GPU bin occupancy without a host synchronization."""
+
+    grid_shape = (
+        cell_list_grid_shape(cell, pbc, cutoff)
+        if grid_shape is None
+        else tuple(int(value) for value in grid_shape)
+    )
+    bin_ids, _, _ = _cell_list_bin_ids(positions, cell, grid_shape)
+    num_bins = math.prod(grid_shape)
+    counts = torch.zeros(
+        num_bins, device=positions.device, dtype=torch.long
+    )
+    counts.scatter_add_(0, bin_ids, torch.ones_like(bin_ids))
+    return counts.max()
+
+
+def cell_list_bin_capacity_from_probe(
+    maximum_occupancy: int,
+    *,
+    margin: float = 0.25,
+    slot_step: int = 8,
+) -> int:
+    """Add headroom to a probed bin occupancy and round it upward."""
+
+    if maximum_occupancy < 1:
+        raise ValueError("maximum_occupancy must be positive")
+    return neighbor_capacity_from_probe(
+        maximum_occupancy, margin=margin, slot_step=slot_step
+    )
+
+
 class FixedShapePBCNeighborBuilder:
     """Build one fixed-capacity graph for a single periodic structure.
 
@@ -683,12 +800,60 @@ class FixedShapePBCNeighborBuilder:
         selected_offsets = self.candidate_cell_offsets.index_select(
             0, safe_selected
         )
-        if self.overflow_to_dummy_only:
-            capacity_excess = torch.clamp_min(
-                included_counts - self.neighbor_capacities, 0
+        self._write_and_update_stats(
+            sources,
+            selected_offsets,
+            flat_valid,
+            raw_counts,
+            included_counts,
+            step=step,
+        )
+
+    def _write_and_update_stats(
+        self,
+        sources: Tensor,
+        selected_offsets: Tensor,
+        flat_valid: Tensor,
+        raw_counts: Tensor,
+        included_counts: Tensor,
+        *,
+        step: Tensor | None,
+        extra_overflow: Tensor | None = None,
+        extra_required: Tensor | None = None,
+        extra_capacity: Tensor | None = None,
+    ) -> None:
+        """Write fixed slots and update capture-safe capacity telemetry."""
+
+        capacity_excess = torch.clamp_min(
+            included_counts - self.neighbor_capacities, 0
+        )
+        current_excess, overflow_atom = capacity_excess.max(dim=0)
+        current_required = included_counts.index_select(
+            0, overflow_atom.reshape(1)
+        ).reshape(())
+        current_capacity = self.neighbor_capacities.index_select(
+            0, overflow_atom.reshape(1)
+        ).reshape(())
+        overflow = current_excess > 0
+        if extra_overflow is not None:
+            if extra_required is None or extra_capacity is None:
+                raise ValueError(
+                    "extra overflow requires its required and capacity values"
+                )
+            extra_excess = torch.clamp_min(
+                extra_required - extra_capacity, 0
             )
-            current_excess, overflow_atom = capacity_excess.max(dim=0)
-            overflow = current_excess > 0
+            replace_with_extra = extra_excess > current_excess
+            current_excess = torch.maximum(current_excess, extra_excess)
+            current_required = torch.where(
+                replace_with_extra, extra_required, current_required
+            )
+            current_capacity = torch.where(
+                replace_with_extra, extra_capacity, current_capacity
+            )
+            overflow = overflow | extra_overflow
+
+        if self.overflow_to_dummy_only:
             output_valid = flat_valid & ~overflow
             # Slot ids already map round-robin to the fixed dummy sinks.  On
             # overflow every slot becomes padding, so the distribution is
@@ -712,13 +877,6 @@ class FixedShapePBCNeighborBuilder:
         )
 
         real_edges = output_valid.sum()
-        if not self.overflow_to_dummy_only:
-            # Preserve the original Opt3/CAP1 operation order exactly.
-            capacity_excess = torch.clamp_min(
-                included_counts - self.neighbor_capacities, 0
-            )
-            current_excess, overflow_atom = capacity_excess.max(dim=0)
-            overflow = current_excess > 0
         call_step = self.build_calls if step is None else step
         self.current_real_edges.copy_(real_edges)
         self.minimum_real_edges.copy_(
@@ -755,12 +913,6 @@ class FixedShapePBCNeighborBuilder:
                 torch.maximum(self.maximum_padding_edges, padding_edges)
             )
         replace_overflow = current_excess > self.maximum_capacity_excess
-        current_required = included_counts.index_select(
-            0, overflow_atom.reshape(1)
-        ).reshape(())
-        current_capacity = self.neighbor_capacities.index_select(
-            0, overflow_atom.reshape(1)
-        ).reshape(())
         self.maximum_capacity_excess.copy_(
             torch.where(
                 replace_overflow,
@@ -829,6 +981,7 @@ class FixedShapePBCNeighborBuilder:
             min_padding = None
             max_padding = None
         return {
+            "fixed_builder_backend": "dense",
             "fixed_builder_build_calls": calls,
             "fixed_builder_capacity_misses": misses,
             "fixed_builder_first_overflow_step": (
@@ -903,3 +1056,460 @@ class FixedShapePBCNeighborBuilder:
             "fixed_builder_degeneracy_tolerance": self.degeneracy_tolerance,
             "fixed_builder_max_neighbors": self.max_neighbors,
         }
+
+
+class CellListFixedShapePBCNeighborBuilder(FixedShapePBCNeighborBuilder):
+    """Capture-safe GPU cell list feeding the existing fixed edge slots.
+
+    At every build, atoms are wrapped into a fixed fractional grid, sorted by
+    bin, and gathered only from neighboring bins.  A fixed bin capacity keeps
+    every intermediate shape CUDA-Graph safe.  Bin-capacity overflow shares
+    the normal builder overflow path, including dummy-only output for ROB1.
+    """
+
+    def __init__(
+        self,
+        *,
+        reference_positions: Tensor,
+        cell_list_bin_capacity: int = 0,
+        cell_list_bin_margin: float = 0.25,
+        cell_list_bin_step: int = 8,
+        **kwargs: Any,
+    ) -> None:
+        cell = kwargs["cell"]
+        pbc = kwargs["pbc"]
+        cutoff = float(kwargs["cutoff"])
+        super().__init__(**kwargs)
+
+        if reference_positions.shape != (self.num_atoms, 3):
+            raise ValueError(
+                "reference_positions must contain one row per real atom"
+            )
+        if reference_positions.device != self.device:
+            raise ValueError("reference_positions must use the builder device")
+        if cell_list_bin_capacity < 0:
+            raise ValueError("cell-list bin capacity must be non-negative")
+        if cell_list_bin_margin < 0 or cell_list_bin_step < 1:
+            raise ValueError("invalid cell-list bin-capacity parameters")
+
+        self.dense_candidates_per_atom = self.candidates_per_atom
+        self.cell_list_grid_shape = cell_list_grid_shape(cell, pbc, cutoff)
+        plane_distances = _cell_plane_distances(cell)
+        search_radii = tuple(
+            max(
+                1,
+                int(
+                    math.ceil(
+                        cutoff * bins / plane_distance
+                    )
+                ),
+            )
+            for bins, plane_distance in zip(
+                self.cell_list_grid_shape, plane_distances
+            )
+        )
+        self.cell_list_search_radii = search_radii
+        offset_axes = [
+            torch.arange(
+                -radius,
+                radius + 1,
+                device=self.device,
+                dtype=torch.long,
+            )
+            for radius in search_radii
+        ]
+        self.cell_list_neighbor_bin_offsets = torch.cartesian_prod(
+            *offset_axes
+        ).reshape(-1, 3).contiguous()
+        self.cell_list_neighbor_bin_count = int(
+            self.cell_list_neighbor_bin_offsets.shape[0]
+        )
+        self.cell_list_num_bins = math.prod(self.cell_list_grid_shape)
+        self.cell_list_grid = torch.as_tensor(
+            self.cell_list_grid_shape,
+            device=self.device,
+            dtype=torch.long,
+        )
+        self.cell_list_inverse_cell = torch.linalg.inv(
+            self.cell.to(dtype=reference_positions.dtype)
+        )
+        self.cell_list_repetitions = torch.as_tensor(
+            self.repetitions,
+            device=self.device,
+            dtype=torch.long,
+        )
+        self.cell_list_offset_sizes = 2 * self.cell_list_repetitions + 1
+        self.cell_list_atom_ids = torch.arange(
+            self.num_atoms, device=self.device, dtype=torch.long
+        )
+
+        probed_occupancy = int(
+            cell_list_max_occupancy(
+                reference_positions,
+                cell,
+                pbc,
+                cutoff,
+                grid_shape=self.cell_list_grid_shape,
+            ).item()
+        )
+        if cell_list_bin_capacity:
+            bin_capacity = int(cell_list_bin_capacity)
+        else:
+            bin_capacity = cell_list_bin_capacity_from_probe(
+                probed_occupancy,
+                margin=cell_list_bin_margin,
+                slot_step=cell_list_bin_step,
+            )
+        minimum_for_output = math.ceil(
+            self.neighbors_per_atom / self.cell_list_neighbor_bin_count
+        )
+        bin_capacity = max(bin_capacity, minimum_for_output)
+        if bin_capacity > self.num_atoms:
+            bin_capacity = self.num_atoms
+        if bin_capacity < 1:
+            raise ValueError("cell-list bin capacity must be positive")
+        self.cell_list_bin_capacity = int(bin_capacity)
+        self.cell_list_bin_capacity_tensor = torch.as_tensor(
+            self.cell_list_bin_capacity,
+            device=self.device,
+            dtype=torch.long,
+        )
+        self.cell_list_bin_ranks = torch.arange(
+            self.cell_list_bin_capacity,
+            device=self.device,
+            dtype=torch.long,
+        )
+        self.candidates_per_atom = (
+            self.cell_list_neighbor_bin_count * self.cell_list_bin_capacity
+        )
+        if self.candidates_per_atom < self.neighbors_per_atom:
+            raise ValueError(
+                "cell-list candidate slots cannot cover the edge capacity"
+            )
+
+        # Dense candidate tensors were allocated by the compatibility base
+        # initializer.  They are not retained by the cell-list production path.
+        del self.candidate_sources
+        del self.candidate_cell_offsets
+        del self.candidate_ids
+
+        self.cell_list_maximum_bin_occupancy = torch.zeros(
+            (), device=self.device, dtype=torch.long
+        )
+        self.cell_list_bin_overflow_replays = torch.zeros(
+            (), device=self.device, dtype=torch.long
+        )
+        self.window_cell_list_maximum_bin_occupancy = torch.zeros(
+            (), device=self.device, dtype=torch.long
+        )
+        self.window_cell_list_bin_overflow_replays = torch.zeros(
+            (), device=self.device, dtype=torch.long
+        )
+        self.cell_list_probed_maximum_bin_occupancy = probed_occupancy
+
+    def reset_stats(self) -> None:
+        super().reset_stats()
+        self.cell_list_maximum_bin_occupancy.zero_()
+        self.cell_list_bin_overflow_replays.zero_()
+        self.window_cell_list_maximum_bin_occupancy.zero_()
+        self.window_cell_list_bin_overflow_replays.zero_()
+
+    def reset_window_stats(self) -> None:
+        super().reset_window_stats()
+        if hasattr(self, "window_cell_list_maximum_bin_occupancy"):
+            self.window_cell_list_maximum_bin_occupancy.zero_()
+            self.window_cell_list_bin_overflow_replays.zero_()
+
+    def build(
+        self,
+        positions: Tensor,
+        *,
+        step: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        if positions.shape != (self.num_atoms, 3):
+            raise ValueError(
+                f"Expected positions {(self.num_atoms, 3)}, got {positions.shape}"
+            )
+        if positions.device != self.device:
+            raise ValueError(
+                f"Positions must be on {self.device}, got {positions.device}"
+            )
+
+        with torch.no_grad():
+            fractional = torch.mm(positions, self.cell_list_inverse_cell)
+            image_indices = torch.floor(fractional).to(dtype=torch.long)
+            wrapped = fractional - image_indices.to(dtype=fractional.dtype)
+            bin_coordinates = torch.floor(
+                wrapped * self.cell_list_grid.to(dtype=wrapped.dtype)
+            ).to(dtype=torch.long)
+            bin_coordinates = torch.minimum(
+                bin_coordinates, self.cell_list_grid - 1
+            )
+            bin_ids = (
+                (
+                    bin_coordinates[:, 0] * self.cell_list_grid[1]
+                    + bin_coordinates[:, 1]
+                )
+                * self.cell_list_grid[2]
+                + bin_coordinates[:, 2]
+            )
+            sort_keys = bin_ids * (self.num_atoms + 1) + self.cell_list_atom_ids
+            sorted_atoms = self.cell_list_atom_ids.index_select(
+                0, torch.argsort(sort_keys)
+            )
+            bin_counts = torch.zeros(
+                self.cell_list_num_bins,
+                device=self.device,
+                dtype=torch.long,
+            )
+            bin_counts.scatter_add_(
+                0, bin_ids, torch.ones_like(bin_ids)
+            )
+            bin_starts = torch.cumsum(bin_counts, dim=0) - bin_counts
+            maximum_bin_occupancy = bin_counts.max()
+            bin_overflow = (
+                maximum_bin_occupancy > self.cell_list_bin_capacity_tensor
+            )
+            self.cell_list_maximum_bin_occupancy.copy_(
+                torch.maximum(
+                    self.cell_list_maximum_bin_occupancy,
+                    maximum_bin_occupancy,
+                )
+            )
+            self.window_cell_list_maximum_bin_occupancy.copy_(
+                torch.maximum(
+                    self.window_cell_list_maximum_bin_occupancy,
+                    maximum_bin_occupancy,
+                )
+            )
+            self.cell_list_bin_overflow_replays.add_(
+                bin_overflow.to(dtype=torch.long)
+            )
+            self.window_cell_list_bin_overflow_replays.add_(
+                bin_overflow.to(dtype=torch.long)
+            )
+
+            raw_neighbor_coordinates = (
+                bin_coordinates.unsqueeze(1)
+                + self.cell_list_neighbor_bin_offsets.unsqueeze(0)
+            )
+            neighbor_coordinates = torch.remainder(
+                raw_neighbor_coordinates,
+                self.cell_list_grid.reshape(1, 1, 3),
+            )
+            periodic_shifts = torch.div(
+                raw_neighbor_coordinates,
+                self.cell_list_grid.reshape(1, 1, 3),
+                rounding_mode="floor",
+            )
+            neighbor_bin_ids = (
+                (
+                    neighbor_coordinates[:, :, 0] * self.cell_list_grid[1]
+                    + neighbor_coordinates[:, :, 1]
+                )
+                * self.cell_list_grid[2]
+                + neighbor_coordinates[:, :, 2]
+            )
+            neighbor_counts = bin_counts.index_select(
+                0, neighbor_bin_ids.reshape(-1)
+            ).reshape(self.num_atoms, self.cell_list_neighbor_bin_count)
+            neighbor_starts = bin_starts.index_select(
+                0, neighbor_bin_ids.reshape(-1)
+            ).reshape(self.num_atoms, self.cell_list_neighbor_bin_count)
+            lookup = (
+                neighbor_starts.unsqueeze(2)
+                + self.cell_list_bin_ranks.reshape(1, 1, -1)
+            )
+            occupied = self.cell_list_bin_ranks.reshape(1, 1, -1) < (
+                neighbor_counts.unsqueeze(2)
+            )
+            safe_lookup = lookup.clamp_max(self.num_atoms - 1)
+            candidate_sources = sorted_atoms.index_select(
+                0, safe_lookup.reshape(-1)
+            ).reshape(self.num_atoms, -1)
+            candidate_shifts = periodic_shifts.unsqueeze(2).expand(
+                -1, -1, self.cell_list_bin_capacity, -1
+            ).reshape(self.num_atoms, -1, 3)
+            source_images = image_indices.index_select(
+                0, candidate_sources.reshape(-1)
+            ).reshape(self.num_atoms, -1, 3)
+            candidate_offsets = (
+                candidate_shifts
+                - source_images
+                + image_indices.unsqueeze(1)
+            )
+            within_official_images = (
+                candidate_offsets.abs()
+                <= self.cell_list_repetitions.reshape(1, 1, 3)
+            ).all(dim=2)
+            occupied = occupied.reshape(self.num_atoms, -1)
+
+            shifted_sources = positions.index_select(
+                0, candidate_sources.reshape(-1)
+            ).reshape(self.num_atoms, self.candidates_per_atom, 3)
+            shifted_sources = shifted_sources + torch.matmul(
+                candidate_offsets.to(dtype=positions.dtype),
+                self.cell.to(dtype=positions.dtype),
+            )
+            delta = shifted_sources - positions.unsqueeze(1)
+            distance_sqr = delta.square().sum(dim=-1)
+            cutoff_sqr = self.cutoff * self.cutoff
+            valid = (
+                occupied
+                & within_official_images
+                & (distance_sqr <= cutoff_sqr)
+                & (distance_sqr > 0.0001)
+            )
+            raw_counts = valid.sum(dim=1)
+            masked_distance = torch.where(
+                valid,
+                distance_sqr,
+                torch.full_like(distance_sqr, torch.inf),
+            )
+            selection_k = min(
+                self.max_neighbors + 1, self.candidates_per_atom
+            )
+            nearest = torch.topk(
+                masked_distance,
+                k=selection_k,
+                dim=1,
+                largest=False,
+                sorted=True,
+            ).values
+            if self.candidates_per_atom > self.max_neighbors:
+                effective_cutoff = (
+                    nearest[:, self.max_neighbors]
+                    + self.degeneracy_tolerance
+                )
+            else:
+                effective_cutoff = torch.full_like(
+                    raw_counts, cutoff_sqr, dtype=distance_sqr.dtype
+                )
+            effective_cutoff = torch.where(
+                raw_counts > self.max_neighbors,
+                effective_cutoff,
+                torch.full_like(effective_cutoff, cutoff_sqr),
+            )
+            included = valid & (
+                distance_sqr <= effective_cutoff.unsqueeze(1)
+            )
+            included_counts = included.sum(dim=1)
+
+            offset_indices = (
+                candidate_offsets + self.cell_list_repetitions.reshape(1, 1, 3)
+            )
+            cell_offset_ids = (
+                (
+                    offset_indices[:, :, 0] * self.cell_list_offset_sizes[1]
+                    + offset_indices[:, :, 1]
+                )
+                * self.cell_list_offset_sizes[2]
+                + offset_indices[:, :, 2]
+            )
+            official_ids = (
+                candidate_sources * self.num_cells + cell_offset_ids
+            )
+            invalid_id = self.dense_candidates_per_atom
+            candidate_order = torch.where(
+                included,
+                official_ids,
+                torch.full_like(official_ids, invalid_id),
+            )
+            selected = torch.topk(
+                candidate_order,
+                k=self.neighbors_per_atom,
+                dim=1,
+                largest=False,
+                sorted=True,
+            )
+            selected_sources = torch.gather(
+                candidate_sources, 1, selected.indices
+            )
+            selected_offsets = torch.gather(
+                candidate_offsets,
+                1,
+                selected.indices.unsqueeze(2).expand(-1, -1, 3),
+            )
+            selected_valid = selected.values < invalid_id
+            flat_sources = selected_sources.reshape(-1).index_select(
+                0, self.slot_selection_indices
+            )
+            flat_offsets = selected_offsets.reshape(-1, 3).index_select(
+                0, self.slot_selection_indices
+            )
+            flat_valid = selected_valid.reshape(-1).index_select(
+                0, self.slot_selection_indices
+            )
+            self._write_and_update_stats(
+                flat_sources,
+                flat_offsets,
+                flat_valid,
+                raw_counts,
+                included_counts,
+                step=step,
+                extra_overflow=bin_overflow,
+                extra_required=maximum_bin_occupancy,
+                extra_capacity=self.cell_list_bin_capacity_tensor,
+            )
+        return self.edge_index, self.cell_offsets
+
+    def window_stats(self) -> dict[str, Any]:
+        record = super().window_stats()
+        record.update(
+            {
+                "cell_list_window_maximum_bin_occupancy": int(
+                    self.window_cell_list_maximum_bin_occupancy.item()
+                ),
+                "cell_list_window_bin_overflow_replays": int(
+                    self.window_cell_list_bin_overflow_replays.item()
+                ),
+            }
+        )
+        return record
+
+    def stats(self) -> dict[str, Any]:
+        record = super().stats()
+        record.update(
+            {
+                "fixed_builder_backend": "cell-list",
+                "cell_list_grid_shape": list(self.cell_list_grid_shape),
+                "cell_list_num_bins": self.cell_list_num_bins,
+                "cell_list_search_radii": list(self.cell_list_search_radii),
+                "cell_list_neighbor_bin_count": self.cell_list_neighbor_bin_count,
+                "cell_list_bin_capacity": self.cell_list_bin_capacity,
+                "cell_list_probed_maximum_bin_occupancy": (
+                    self.cell_list_probed_maximum_bin_occupancy
+                ),
+                "cell_list_maximum_bin_occupancy": int(
+                    self.cell_list_maximum_bin_occupancy.item()
+                ),
+                "cell_list_bin_overflow_replays": int(
+                    self.cell_list_bin_overflow_replays.item()
+                ),
+                "cell_list_dense_candidates_per_atom": (
+                    self.dense_candidates_per_atom
+                ),
+                "cell_list_candidate_reduction": (
+                    1.0
+                    - self.candidates_per_atom / self.dense_candidates_per_atom
+                ),
+            }
+        )
+        return record
+
+
+def make_fixed_shape_pbc_neighbor_builder(
+    neighbor_builder: str,
+    **kwargs: Any,
+) -> FixedShapePBCNeighborBuilder:
+    """Construct the frozen dense builder or the experimental cell list."""
+
+    if neighbor_builder == "dense":
+        kwargs.pop("reference_positions", None)
+        kwargs.pop("cell_list_bin_capacity", None)
+        kwargs.pop("cell_list_bin_margin", None)
+        kwargs.pop("cell_list_bin_step", None)
+        return FixedShapePBCNeighborBuilder(**kwargs)
+    if neighbor_builder == "cell-list":
+        return CellListFixedShapePBCNeighborBuilder(**kwargs)
+    raise ValueError("neighbor_builder must be dense or cell-list")

@@ -5,6 +5,8 @@ set -euo pipefail
 # remains Opt4 v4-compatible; this wrapper opts into v5 and ROB1.
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 export OPT4_FUSION_STAGE=${OPT4_FUSION_STAGE:-OPT4V5_FP32_ROB1}
+export OPT4_EXECUTION_SCOPE=${OPT4_EXECUTION_SCOPE:-whole-step}
+export OPT4_NEIGHBOR_BUILDER=${OPT4_NEIGHBOR_BUILDER:-dense}
 export OPT4_NEIGHBOR_CAPACITY_POLICY=${OPT4_NEIGHBOR_CAPACITY_POLICY:-auto-safe}
 export ROB1=${ROB1:-1}
 export ROB1_WINDOW_STEPS=${ROB1_WINDOW_STEPS:-0}

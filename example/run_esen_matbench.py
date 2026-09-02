@@ -96,6 +96,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--opt4-fusion-stage", default="OPT4V4_FP32")
     parser.add_argument(
+        "--opt4-execution-scope",
+        choices=("whole-step", "model-only"),
+        default="whole-step",
+        help=(
+            "Opt4 CUDA Graph scope. The default preserves Opt4 v5; "
+            "model-only is available for isolated CELL1 ablation."
+        ),
+    )
+    parser.add_argument(
+        "--opt4-neighbor-builder",
+        choices=("dense", "cell-list"),
+        default="dense",
+        help="Use frozen dense construction or the experimental CELL1 path",
+    )
+    parser.add_argument("--cell-list-bin-capacity", type=int, default=0)
+    parser.add_argument("--cell-list-bin-margin", type=float, default=0.25)
+    parser.add_argument("--cell-list-bin-step", type=int, default=8)
+    parser.add_argument(
         "--opt4-neighbor-capacity-policy",
         choices=("uniform", "auto-safe", "elastic"),
         default="auto-safe",
@@ -160,6 +178,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("probe steps and neighbor margin must be non-negative")
     if args.neighbor_slot_step < 1 or args.edge_step < 1 or args.dummy_atoms < 1:
         parser.error("neighbor and dummy parameters must be positive")
+    if (
+        args.cell_list_bin_capacity < 0
+        or args.cell_list_bin_margin < 0
+        or args.cell_list_bin_step < 1
+    ):
+        parser.error("invalid cell-list bin-capacity parameters")
     if args.capture_warmup < 0 or args.max_neighbors < 1:
         parser.error("capture warmup and max neighbors must be valid")
     if not 0.0 <= args.neighbor_auto_min_reduction <= 1.0:
@@ -190,6 +214,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "elastic",
     }:
         parser.error("--rob1 requires Opt4 auto-safe or elastic capacity")
+    if args.rob1 and args.opt4_execution_scope != "whole-step":
+        parser.error("--rob1 is only supported by Opt4 whole-step")
     if "opt4" in args.backend and (
         not args.opt4_model_fusions.strip() or not args.opt4_fusion_stage.strip()
     ):
@@ -408,6 +434,9 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
     import torch
     from fairchem.core.applications.esen_fixed_neighbor import (
         auto_neighbor_capacities_from_probe,
+        cell_list_bin_capacity_from_probe,
+        cell_list_grid_shape,
+        cell_list_max_occupancy,
         elastic_neighbor_capacities_from_probe,
         neighbor_counts_in_graph,
         neighbor_capacity_from_probe,
@@ -428,6 +457,7 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         initialize_matbench_atoms,
     )
     from fairchem.core.applications.esen_whole_step_cuda_graph import (
+        ESENFixedBuilderModelCUDAGraphEvaluator,
         TransactionalWholeStepCUDAGraphController,
     )
 
@@ -438,6 +468,12 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         atoms, checkpoint, device=device, seed=args.seed, disable_amp=True
     )
     fusion_metadata: dict[str, Any] = {}
+    opt4_model_only = bool(
+        backend == "opt4" and args.opt4_execution_scope == "model-only"
+    )
+    effective_neighbor_builder = (
+        args.opt4_neighbor_builder if backend == "opt4" else "dense"
+    )
     if backend == "opt4":
         from fairchem.core.applications.esen_opt4_model_fusion import (
             configure_esen_30m_model_fusions,
@@ -451,7 +487,11 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
             {
                 "kernel_fusion": True,
                 "kernel_fusion_stage": args.opt4_fusion_stage,
-                "opt4_scope": "matbench-nhc-whole-step",
+                "opt4_scope": (
+                    "matbench-nhc-model-only"
+                    if opt4_model_only
+                    else "matbench-nhc-whole-step"
+                ),
             }
         )
     state = _make_gpu_state(torch, atoms, device)
@@ -469,6 +509,7 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
     graph_stats: dict[str, Any] = {}
     graph_metadata: dict[str, Any] = {}
     graph = None
+    fixed_graph = None
     dynamics = None
     whole = None
     eager_initial_forces, eager_initial_energy = evaluator(state.positions)
@@ -525,6 +566,27 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         probe_max_degrees = neighbor_counts_in_graph(
             initial_graph["edge_index"], len(atoms)
         )
+        cell_list_cell = evaluator.batch.cell.reshape(-1, 3, 3)[0]
+        cell_list_pbc = evaluator.batch.pbc.reshape(-1, 3)[0]
+        cell_list_cutoff = float(evaluator.model.backbone.cutoff)
+        probed_grid_shape = (
+            cell_list_grid_shape(
+                cell_list_cell, cell_list_pbc, cell_list_cutoff
+            )
+            if effective_neighbor_builder == "cell-list"
+            else None
+        )
+        probe_max_bin_occupancy = (
+            cell_list_max_occupancy(
+                state.positions,
+                cell_list_cell,
+                cell_list_pbc,
+                cell_list_cutoff,
+                grid_shape=probed_grid_shape,
+            )
+            if probed_grid_shape is not None
+            else None
+        )
         probe_dynamics = GPUResidentMD(state, evaluator, integrator)
         for _ in range(args.probe_steps):
             probe_dynamics.run(1)
@@ -533,12 +595,41 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
                 probe_max_degrees,
                 neighbor_counts_in_graph(probe_graph["edge_index"], len(atoms)),
             )
+            if probe_max_bin_occupancy is not None:
+                probe_max_bin_occupancy = torch.maximum(
+                    probe_max_bin_occupancy,
+                    cell_list_max_occupancy(
+                        state.positions,
+                        cell_list_cell,
+                        cell_list_pbc,
+                        cell_list_cutoff,
+                        grid_shape=probed_grid_shape,
+                    ),
+                )
         torch.cuda.synchronize()
         probe_elapsed = time.perf_counter() - probe_started
         state.restore_(initial_state)
         integrator.restore_thermostat_state_(*initial_thermostat)
         _restore_torch_rng(torch, setup_rng)
         probe_max_neighbors = int(probe_max_degrees.max().item())
+        probed_cell_list_bin_occupancy = (
+            0
+            if probe_max_bin_occupancy is None
+            else int(probe_max_bin_occupancy.item())
+        )
+        effective_cell_list_bin_capacity = (
+            args.cell_list_bin_capacity
+            if args.cell_list_bin_capacity
+            else (
+                cell_list_bin_capacity_from_probe(
+                    probed_cell_list_bin_occupancy,
+                    margin=args.cell_list_bin_margin,
+                    slot_step=args.cell_list_bin_step,
+                )
+                if effective_neighbor_builder == "cell-list"
+                else 0
+            )
+        )
         uniform_capacity = neighbor_capacity_from_probe(
             probe_max_neighbors,
             margin=args.neighbor_margin,
@@ -602,8 +693,24 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
             "capture_warmup": args.capture_warmup,
             "max_neighbors": args.max_neighbors,
             "degeneracy_tolerance": args.degeneracy_tolerance,
+            "neighbor_builder": effective_neighbor_builder,
+            "cell_list_bin_capacity": effective_cell_list_bin_capacity,
+            "cell_list_bin_margin": args.cell_list_bin_margin,
+            "cell_list_bin_step": args.cell_list_bin_step,
         }
-        if backend == "opt4" and args.rob1:
+        if opt4_model_only:
+            fixed_graph = ESENFixedBuilderModelCUDAGraphEvaluator(
+                evaluator,
+                neighbors_per_atom=neighbors_per_atom,
+                neighbor_capacities=neighbor_capacities,
+                neighbor_capacity_policy=effective_capacity_policy,
+                **whole_kwargs,
+            )
+            fixed_graph.capture(state.positions)
+            fixed_graph.reset_production_stats()
+            dynamics = GPUResidentMD(state, fixed_graph, integrator)
+            graph_stats = fixed_graph.stats()
+        elif backend == "opt4" and args.rob1:
             whole = TransactionalWholeStepCUDAGraphController(
                 state,
                 evaluator,
@@ -625,9 +732,11 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
                 neighbor_capacity_policy=effective_capacity_policy,
                 **whole_kwargs,
             )
-        whole.capture(initial_state)
-        whole.reset_production(initial_state)
-        graph_stats = whole.stats()
+        if not opt4_model_only:
+            assert whole is not None
+            whole.capture(initial_state)
+            whole.reset_production(initial_state)
+            graph_stats = whole.stats()
         graph_metadata = {
                 "matbench_probe_max_neighbors_per_atom": probe_max_neighbors,
                 "matbench_neighbors_per_atom": neighbors_per_atom,
@@ -668,6 +777,25 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
                 "rob1_enabled": bool(backend == "opt4" and args.rob1),
                 "rob1_window_steps": args.rob1_window_steps_effective,
                 "rob1_max_retries": args.rob1_max_retries,
+                "opt4_execution_scope": (
+                    args.opt4_execution_scope if backend == "opt4" else "whole-step"
+                ),
+                "fixed_builder_backend_requested": effective_neighbor_builder,
+                "cell_list_probed_grid_shape": (
+                    None
+                    if probed_grid_shape is None
+                    else list(probed_grid_shape)
+                ),
+                "cell_list_probed_maximum_bin_occupancy": (
+                    probed_cell_list_bin_occupancy
+                    if effective_neighbor_builder == "cell-list"
+                    else None
+                ),
+                "cell_list_initial_bin_capacity": (
+                    effective_cell_list_bin_capacity
+                    if effective_neighbor_builder == "cell-list"
+                    else None
+                ),
                 **fusion_metadata,
         }
         graph_stats.update(graph_metadata)
@@ -675,12 +803,13 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
     # One un-timed initial graph replay supplies the numerical audit values.
     # Resetting production state afterwards keeps the measured sequence at one
     # initial replay plus exactly ``steps`` production steps.
-    if backend == "opt2":
-        assert graph is not None
-        cg_initial_forces, cg_initial_energy = graph(state.positions)
+    if backend == "opt2" or opt4_model_only:
+        active_graph = graph if backend == "opt2" else fixed_graph
+        assert active_graph is not None
+        cg_initial_forces, cg_initial_energy = active_graph(state.positions)
         cg_initial_forces = cg_initial_forces.detach().clone()
         cg_initial_energy = cg_initial_energy.detach().clone()
-        graph.reset_production_stats()
+        active_graph.reset_production_stats()
     elif backend in {"opt3", "opt4"}:
         assert whole is not None
         transactional = bool(backend == "opt4" and args.rob1)
@@ -704,7 +833,7 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         dynamics = GPUResidentMD(state, evaluator, integrator)
 
     start = time.perf_counter()
-    if backend in {"opt1", "opt2"}:
+    if backend in {"opt1", "opt2"} or opt4_model_only:
         assert dynamics is not None
         dynamics.evaluate()
         _record_gpu(recorder, 0, state, as_numpy_state)
@@ -712,9 +841,10 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
             dynamics.run(1)
             if step % args.record_interval == 0:
                 _record_gpu(recorder, step, state, as_numpy_state)
-        if backend == "opt2":
-            assert graph is not None
-            graph_stats = graph.stats()
+        if backend == "opt2" or opt4_model_only:
+            active_graph = graph if backend == "opt2" else fixed_graph
+            assert active_graph is not None
+            graph_stats = active_graph.stats()
     else:
         assert whole is not None
         timed_initial_forces, timed_initial_energy = whole.evaluate_initial()
@@ -1365,9 +1495,14 @@ def main(argv: list[str] | None = None) -> int:
             "opt4": {
                 "fusion_stage": args.opt4_fusion_stage,
                 "model_fusions": args.opt4_model_fusions,
+                "execution_scope": args.opt4_execution_scope,
+                "neighbor_builder": args.opt4_neighbor_builder,
                 "neighbor_capacity_policy": (
                     args.opt4_neighbor_capacity_policy
                 ),
+                "cell_list_bin_capacity": args.cell_list_bin_capacity,
+                "cell_list_bin_margin": args.cell_list_bin_margin,
+                "cell_list_bin_step": args.cell_list_bin_step,
                 "rob1": args.rob1,
                 "rob1_window_steps": args.rob1_window_steps_effective,
                 "rob1_max_retries": args.rob1_max_retries,
@@ -1453,6 +1588,16 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                         "opt4_neighbor_capacity_policy": (
                             args.opt4_neighbor_capacity_policy
+                            if backend == "opt4"
+                            else ""
+                        ),
+                        "opt4_execution_scope": (
+                            args.opt4_execution_scope
+                            if backend == "opt4"
+                            else ""
+                        ),
+                        "opt4_neighbor_builder": (
+                            args.opt4_neighbor_builder
                             if backend == "opt4"
                             else ""
                         ),
@@ -1669,7 +1814,12 @@ def main(argv: list[str] | None = None) -> int:
         "opt4": {
             "fusion_stage": args.opt4_fusion_stage,
             "model_fusions": args.opt4_model_fusions,
+            "execution_scope": args.opt4_execution_scope,
+            "neighbor_builder": args.opt4_neighbor_builder,
             "neighbor_capacity_policy": args.opt4_neighbor_capacity_policy,
+            "cell_list_bin_capacity": args.cell_list_bin_capacity,
+            "cell_list_bin_margin": args.cell_list_bin_margin,
+            "cell_list_bin_step": args.cell_list_bin_step,
             "rob1": args.rob1,
             "rob1_window_steps": args.rob1_window_steps_effective,
             "rob1_max_retries": args.rob1_max_retries,
