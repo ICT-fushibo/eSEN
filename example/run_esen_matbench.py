@@ -17,6 +17,7 @@ import gc
 import hashlib
 import importlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -24,6 +25,7 @@ import re
 import sys
 import time
 import types
+from fractions import Fraction
 from typing import Any
 
 import numpy as np
@@ -945,6 +947,28 @@ def _load_public_metric_functions(matbench_repo: Path):
             "Public metric evaluation requires matbench-discovery on PYTHONPATH"
         ) from normal_import_error
 
+    # Python 3.9 cannot import the current matbench-discovery package
+    # initializer because it uses ``datetime.UTC``.  The metric modules only
+    # need a few package-level helpers, so install a minimal package shell
+    # before loading the compatibility sources.  Without this shell,
+    # ``trajectory.py``/``metrics/md.py`` trigger the incompatible initializer
+    # before the substitutions below can run.
+    package_module = sys.modules.get("matbench_discovery")
+    if package_module is None or not hasattr(package_module, "repo_relative_path"):
+        package_module = types.ModuleType("matbench_discovery")
+        package_module.__file__ = str(package_root / "__init__.py")
+        package_module.__path__ = [str(package_root)]
+        package_module.__package__ = "matbench_discovery"
+
+        def repo_relative_path(file_path: str, root: str = str(matbench_repo)):
+            return os.path.relpath(os.path.abspath(file_path), os.path.abspath(root)).replace(
+                os.sep, "/"
+            )
+
+        package_module.repo_relative_path = repo_relative_path
+        package_module.today = time.strftime("%Y-%m-%d")
+        sys.modules["matbench_discovery"] = package_module
+
     def load_compat_source(module_name: str, source_path: Path):
         source = source_path.read_text(encoding="utf-8")
         # The public repository currently targets newer Python/NumPy versions
@@ -1029,6 +1053,92 @@ def _load_public_metric_functions(matbench_repo: Path):
             )
 
     return read_reference_trajectory, metric_module.evaluate_md_system
+
+
+def _read_matbench_systems_for_metrics(
+    path: Path, requested: list[str] | None
+) -> list[Any]:
+    """Read only metadata needed by metrics-only mode.
+
+    This deliberately avoids ``fairchem.core.applications.esen_matbench`` so
+    a CPU-only Python 3.9 environment can recompute public metrics without
+    importing torch-geometric or the CUDA rollout stack.
+    """
+
+    import h5py
+
+    requested_set = None if requested is None else set(requested)
+    systems: list[Any] = []
+    with h5py.File(path, "r") as handle:
+        names = sorted(
+            name for name, value in handle.items() if isinstance(value, h5py.Group)
+        )
+        if requested_set is not None:
+            missing = requested_set - set(names)
+            if missing:
+                raise KeyError(
+                    f"Unknown Matbench systems {sorted(missing)}; available systems are {names}"
+                )
+            names = [name for name in names if name in requested_set]
+        for name in names:
+            group = handle[name]
+            if "atomic_numbers" not in group or "positions" not in group:
+                raise ValueError(f"{name}: reference HDF5 lacks required datasets")
+            systems.append(
+                types.SimpleNamespace(
+                    name=name,
+                    atomic_numbers=np.asarray(group["atomic_numbers"][:], dtype=np.int64),
+                    reference_frames=int(group["positions"].shape[0]),
+                    reference_dt_fs=float(group.attrs["dt_fs"]),
+                    temperature_kelvin=float(group.attrs["temperature_kelvin"]),
+                    reference_has_stress="stress" in group,
+                )
+            )
+    if not systems:
+        raise ValueError(f"No Matbench systems found in {path}")
+    return systems
+
+
+def _matched_trajectory_window(
+    *,
+    reference_frames: int,
+    prediction_frames: int,
+    reference_dt_fs: float,
+    prediction_dt_fs: float,
+) -> dict[str, int | float]:
+    """Return the common physical-time window without importing Fairchem."""
+
+    if min(reference_frames, prediction_frames) < 1:
+        raise ValueError("trajectory frame counts must be positive")
+    if reference_dt_fs <= 0 or prediction_dt_fs <= 0:
+        raise ValueError("trajectory frame time steps must be positive")
+    reference_dt = Fraction(str(reference_dt_fs))
+    prediction_dt = Fraction(str(prediction_dt_fs))
+    denominator = math.lcm(reference_dt.denominator, prediction_dt.denominator)
+    reference_ticks = reference_dt.numerator * (
+        denominator // reference_dt.denominator
+    )
+    prediction_ticks = prediction_dt.numerator * (
+        denominator // prediction_dt.denominator
+    )
+    common_ticks = math.lcm(reference_ticks, prediction_ticks)
+    reference_stride = common_ticks // reference_ticks
+    prediction_stride = common_ticks // prediction_ticks
+    common_intervals = min(
+        (reference_frames - 1) // reference_stride,
+        (prediction_frames - 1) // prediction_stride,
+    )
+    return {
+        "reference_frames_available": int(reference_frames),
+        "prediction_frames_available": int(prediction_frames),
+        "reference_frames_used": int(common_intervals * reference_stride + 1),
+        "prediction_frames_used": int(common_intervals * prediction_stride + 1),
+        "reference_stride": int(reference_stride),
+        "prediction_stride": int(prediction_stride),
+        "matched_duration_fs": float(
+            Fraction(common_intervals * common_ticks, denominator)
+        ),
+    }
 
 
 def _read_prediction(path: Path):
@@ -1169,10 +1279,6 @@ def _evaluate_public_metrics(args, systems, result_rows, output_dir):
         return unavailable
     metrics_root = output_dir / "metrics"
     metrics_root.mkdir(parents=True, exist_ok=True)
-    from fairchem.core.applications.esen_matbench import (
-        matched_trajectory_window,
-    )
-
     aggregate: dict[str, Any] = {"status": "computed"}
     all_metric_rows: list[dict[str, Any]] = []
     for backend in args.backend:
@@ -1196,7 +1302,7 @@ def _evaluate_public_metrics(args, systems, result_rows, output_dir):
                     str(args.reference_h5), system.name
                 )
                 prediction = _read_prediction(prediction_path)
-                metric_window = matched_trajectory_window(
+                metric_window = _matched_trajectory_window(
                     reference_frames=reference.n_frames,
                     prediction_frames=prediction.n_frames,
                     reference_dt_fs=reference_dt,
@@ -1378,11 +1484,9 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
 def _run_metrics_only(args: argparse.Namespace) -> int:
     """Recompute public metrics from completed trajectories in-place."""
 
-    from fairchem.core.applications.esen_matbench import read_matbench_systems
-
     if not args.output_dir.is_dir():
         raise FileNotFoundError(args.output_dir)
-    systems = read_matbench_systems(args.reference_h5, args.systems)
+    systems = _read_matbench_systems_for_metrics(args.reference_h5, args.systems)
     rows: list[dict[str, Any]] = []
     for backend in args.backend:
         for system in systems:
@@ -1426,6 +1530,8 @@ def _run_metrics_only(args: argparse.Namespace) -> int:
         for summary in public_metrics.values()
         if isinstance(summary, dict)
     )
+    if public_metrics.get("status") != "computed":
+        errors = max(errors, 1)
     print(f"Metrics-only results: {args.output_dir.resolve()}")
     print(f"metric_errors={errors}")
     return 1 if errors else 0
