@@ -324,6 +324,29 @@ def test_cell_list_bin_overflow_uses_dummy_only_and_reports_demand():
     assert window["cell_list_window_bin_overflow_replays"] == 1
 
 
+def test_cell_list_builder_accepts_position_dtype_different_from_cell_dtype():
+    # Whole-step uses FP64 MD state but its model/static position buffer is
+    # FP32.  The cached inverse cell must be cast to the actual build dtype.
+    positions = torch.tensor(
+        [[0.1, 0.2, 0.3], [1.0, 0.2, 0.3], [2.2, 2.4, 2.7]],
+        dtype=torch.float64,
+    )
+    cell = torch.diag(torch.tensor([3.0, 3.5, 4.0], dtype=torch.float32))
+    pbc = torch.tensor([True, True, True])
+    builder = CellListFixedShapePBCNeighborBuilder(
+        reference_positions=positions,
+        cell_list_bin_capacity=3,
+        num_atoms=3,
+        cell=cell,
+        pbc=pbc,
+        cutoff=1.25,
+        neighbors_per_atom=4,
+        dummy_atoms=2,
+    )
+    builder.build(positions)
+    assert builder.stats()["fixed_builder_capacity_misses"] == 0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cell_list_builder_cuda_graph_replays_at_fixed_addresses():
     device = torch.device("cuda")

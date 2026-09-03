@@ -1130,8 +1130,13 @@ class CellListFixedShapePBCNeighborBuilder(FixedShapePBCNeighborBuilder):
             device=self.device,
             dtype=torch.long,
         )
+        # The whole-step graph keeps the MD state in FP64 but writes model
+        # positions (and therefore invokes this builder) in the model's FP32
+        # dtype.  Cache the inverse in the cell's native production dtype and
+        # cast only when a caller uses a different position dtype.  Without
+        # this, ``float32 @ float64`` fails during whole-step graph capture.
         self.cell_list_inverse_cell = torch.linalg.inv(
-            self.cell.to(dtype=reference_positions.dtype)
+            self.cell.to(dtype=self.position_dtype)
         )
         self.cell_list_repetitions = torch.as_tensor(
             self.repetitions,
@@ -1236,7 +1241,8 @@ class CellListFixedShapePBCNeighborBuilder(FixedShapePBCNeighborBuilder):
             )
 
         with torch.no_grad():
-            fractional = torch.mm(positions, self.cell_list_inverse_cell)
+            inverse_cell = self.cell_list_inverse_cell.to(dtype=positions.dtype)
+            fractional = torch.mm(positions, inverse_cell)
             image_indices = torch.floor(fractional).to(dtype=torch.long)
             wrapped = fractional - image_indices.to(dtype=fractional.dtype)
             bin_coordinates = torch.floor(
