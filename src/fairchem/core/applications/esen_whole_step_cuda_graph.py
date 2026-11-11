@@ -681,6 +681,7 @@ class TransactionalWholeStepCUDAGraphController:
         initial_capacity_policy: str = "elastic",
         max_promotions: int = 2,
         whole_kwargs: dict[str, Any] | None = None,
+        compact_window_status: bool = False,
     ) -> None:
         if max_promotions < 0 or max_promotions > 2:
             raise ValueError("CAP2 max_promotions must be between zero and two")
@@ -716,6 +717,7 @@ class TransactionalWholeStepCUDAGraphController:
         self.initial_capacities = capacities
         self.initial_capacity_policy = str(initial_capacity_policy)
         self.max_promotions = int(max_promotions)
+        self.compact_window_status = bool(compact_window_status)
         self.whole_kwargs = dict(whole_kwargs or {})
         self.current_cell_list_bin_capacity = int(
             self.whole_kwargs.get("cell_list_bin_capacity", 0)
@@ -922,6 +924,16 @@ class TransactionalWholeStepCUDAGraphController:
         self.recovery_capture_count += 1
         self.recovery_capture_wall_time_s += capture_elapsed
 
+    def _read_transaction_status(self, builder) -> dict[str, Any]:
+        # The caller has synchronized the completed window. Normal windows need
+        # only the failure flag; per-atom demand remains on device until failure.
+        # Keep the full overflow path (including CELL1 telemetry) unchanged.
+        if getattr(self, "compact_window_status", False):
+            misses = int(builder.window_capacity_misses.item())
+            if misses == 0:
+                return {"fixed_builder_window_capacity_misses": 0}
+        return builder.window_stats()
+
     def _run_transaction(
         self,
         steps: int,
@@ -956,7 +968,7 @@ class TransactionalWholeStepCUDAGraphController:
             if initial:
                 pending_checkpoints = {}
             self._synchronize(whole)
-            window = whole.fixed_builder.window_stats()
+            window = self._read_transaction_status(whole.fixed_builder)
             self.attempted_replays += replay_count
             misses = int(window["fixed_builder_window_capacity_misses"])
             if misses == 0:
@@ -1098,6 +1110,9 @@ class TransactionalWholeStepCUDAGraphController:
                 ),
                 "cuda_graph_replay_output_addresses_stable": addresses_stable,
                 "rob1_enabled": True,
+                "rob1_window_status_mode": (
+                    "compact" if getattr(self, "compact_window_status", False) else "full"
+                ),
                 "rob1_attempted_replays": self.attempted_replays,
                 "rob1_committed_replays": self.committed_replays,
                 "rob1_discarded_replays": self.discarded_replays,

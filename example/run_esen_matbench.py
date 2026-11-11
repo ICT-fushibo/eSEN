@@ -98,6 +98,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--opt4-fusion-stage", default="OPT4V4_FP32")
     parser.add_argument(
+        "--opt4-runtime-experiment",
+        choices=("none", "nhc", "rob-compact", "shared-geometry"), default="none",
+        help="Single isolated Opt4 v5 experiment; frozen defaults remain unchanged",
+    )
+    parser.add_argument(
         "--opt4-execution-scope",
         choices=("whole-step", "model-only"),
         default="whole-step",
@@ -168,6 +173,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Reuse completed trajectories in --output-dir without rerunning MD",
     )
     args = parser.parse_args(argv)
+    if args.opt4_runtime_experiment != "none":
+        if (args.backend != ["opt4"] or not args.rob1
+                or args.opt4_execution_scope != "whole-step"
+                or args.opt4_neighbor_builder != "dense"
+                or args.opt4_neighbor_capacity_policy != "auto-safe"
+                or args.opt4_model_fusions != OPT4_V4_MODEL_FUSIONS
+                or args.cap2_test_capacity_limit != 0):
+            parser.error("Runtime experiments require ONLY Opt4 v5 whole-step, dense, auto-safe, --rob1, frozen fusions")
     if args.steps < 1 or args.record_interval < 1:
         parser.error("--steps and --record-interval must be positive")
     if args.steps % args.record_interval:
@@ -496,8 +509,19 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
                 ),
             }
         )
+    runtime_experiment = args.opt4_runtime_experiment if backend == "opt4" else "none"
+    integrator_class = MatbenchNHCIntegrator
+    if runtime_experiment == "nhc":
+        from fairchem.core.applications.esen_nhc_fusion import FusedMatbenchNHCIntegrator
+
+        integrator_class = FusedMatbenchNHCIntegrator
+    if runtime_experiment == "shared-geometry":
+        from fairchem.core.models.esen.shared_geometry import configure_shared_geometry
+
+        fusion_metadata["shared_geometry_blocks"] = configure_shared_geometry(evaluator.model)
+    fusion_metadata["opt4_runtime_experiment"] = runtime_experiment
     state = _make_gpu_state(torch, atoms, device)
-    integrator = MatbenchNHCIntegrator(
+    integrator = integrator_class(
         torch.as_tensor(atoms.get_masses(), dtype=torch.float64, device=device),
         timestep_fs=args.timestep_fs,
         temperature_K=system.temperature_kelvin,
@@ -723,6 +747,7 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
                 initial_capacity_policy=args.opt4_neighbor_capacity_policy,
                 max_promotions=args.rob1_max_retries,
                 whole_kwargs=whole_kwargs,
+                compact_window_status=(runtime_experiment == "rob-compact"),
             )
         else:
             whole = MatbenchNHCWholeStepCUDAGraphMD(
@@ -907,6 +932,8 @@ def _run_gpu(system, args, checkpoint, recorder, backend):
         "probe_wall_time_s": probe_elapsed,
         "graph_stats": graph_stats,
         "matbench_nhc_algorithm": MATBENCH_NHC_ALGORITHM,
+        "opt4_runtime_experiment": runtime_experiment,
+        "nhc_implementation": type(integrator).__name__,
         "peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
         "peak_reserved_gib": torch.cuda.max_memory_reserved() / 1024**3,
         "device_used_after_setup_gib": (

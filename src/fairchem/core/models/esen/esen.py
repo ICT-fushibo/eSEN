@@ -336,6 +336,14 @@ class eSEN_Backbone(nn.Module, GraphModelMixin):
         ###############################################################
         # Update spherical node embeddings
         ###############################################################
+        geometry_kwargs = {}
+        if getattr(self, "_opt4_shared_geometry", False):
+            from .shared_geometry import make_shared_geometry
+
+            geometry_kwargs["shared_geometry"] = make_shared_geometry(
+                wigner, wigner_inv, graph_dict["edge_distance"],
+                self.blocks[0].edge_wise,
+            )
         if graph_dict["edge_index"].shape[1] != 0:
             for i in range(self.num_layers):
                 if self.activation_checkpointing:
@@ -359,6 +367,7 @@ class eSEN_Backbone(nn.Module, GraphModelMixin):
                         wigner,
                         wigner_inv,
                         node_offset=graph_dict["node_offset"],
+                        **geometry_kwargs,
                     )
 
         # Final layer norm

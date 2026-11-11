@@ -289,7 +289,8 @@ def test_rob1_snapshot_restores_complete_md_and_nhc_state():
     assert snapshot.addresses_stable
 
 
-def test_rob1_third_step_overflow_rolls_back_and_replays_transaction():
+@pytest.mark.parametrize("compact", [False, True])
+def test_rob1_third_step_overflow_rolls_back_and_replays_transaction(compact):
     class FakeIntegrator:
         def __init__(self):
             self.eta = torch.zeros(2, dtype=torch.float64)
@@ -318,6 +319,10 @@ def test_rob1_third_step_overflow_rolls_back_and_replays_transaction():
                 "fixed_builder_window_maximum_included_neighbors_by_atom": [5],
             }
 
+        @property
+        def window_capacity_misses(self):
+            return torch.tensor(self.misses)
+
     class FakeWhole:
         device = torch.device("cpu")
 
@@ -345,6 +350,7 @@ def test_rob1_third_step_overflow_rolls_back_and_replays_transaction():
     whole = FakeWhole()
     controller = object.__new__(ElasticWholeStepCUDAGraphController)
     controller.whole = whole
+    controller.compact_window_status = compact
     controller.snapshot = WholeStepTransactionSnapshot(whole)
     controller.attempted_replays = 0
     controller.committed_replays = 0

@@ -5144,7 +5144,7 @@ class FusedEdgewise(nn.Module):
         else:
             self.so2_gate_bridge = None
 
-    def forward(self, x, x_edge, edge_distance, edge_index, wigner, wigner_inv, node_offset: int = 0):
+    def forward(self, x, x_edge, edge_distance, edge_index, wigner, wigner_inv, node_offset: int = 0, shared_geometry=None):
         out_mask = self.out_mask.to(device=x.device)
         if self.fuse_so2_gate_bridge:
             if (
@@ -5172,7 +5172,8 @@ class FusedEdgewise(nn.Module):
                     x_message = gather_cat_wigner(x, edge_index, wigner, out_mask)
                 else:
                     x_message = torch.cat((x[edge_index[0]], x[edge_index[1]]), dim=2)
-                    x_message = torch.bmm(wigner[:, out_mask, :], x_message)
+                    reduced = wigner[:, out_mask, :] if shared_geometry is None else shared_geometry.wigner
+                    x_message = torch.bmm(reduced, x_message)
                 m0, m1, m2 = self.so2_conv_1.prepare_and_linear(x_message, x_edge)
             x0, x1, x2 = self.so2_gate_bridge(m0, m1, m2)
             x_message = self.so2_conv_2.epilogue(
@@ -5183,7 +5184,8 @@ class FusedEdgewise(nn.Module):
                 x_message = gather_cat_wigner(x, edge_index, wigner, out_mask)
             else:
                 x_message = torch.cat((x[edge_index[0]], x[edge_index[1]]), dim=2)
-                x_message = torch.bmm(wigner[:, out_mask, :], x_message)
+                reduced = wigner[:, out_mask, :] if shared_geometry is None else shared_geometry.wigner
+                x_message = torch.bmm(reduced, x_message)
             x_message, x_0_gating = self.so2_conv_1(x_message, x_edge)
             x_message = self.act(x_0_gating, x_message)
             x_message = self.so2_conv_2(x_message, x_edge)
@@ -5193,8 +5195,11 @@ class FusedEdgewise(nn.Module):
                 edge_index[1], x, self.cutoff, 1.0, node_offset, False,
             )
         if self.use_envelope:
-            x_message = x_message * self.envelope(edge_distance / self.cutoff).view(-1, 1, 1)
-        x_message = torch.bmm(wigner_inv[:, :, out_mask], x_message)
+            envelope = (self.envelope(edge_distance / self.cutoff).view(-1, 1, 1)
+                        if shared_geometry is None else shared_geometry.envelope)
+            x_message = x_message * envelope
+        inverse = wigner_inv[:, :, out_mask] if shared_geometry is None else shared_geometry.wigner_inv
+        x_message = torch.bmm(inverse, x_message)
         new_embedding = torch.zeros(
             (x.shape[0],) + x_message.shape[1:], dtype=x_message.dtype,
             device=x_message.device,

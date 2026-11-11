@@ -280,6 +280,7 @@ class eSEN_Block(torch.nn.Module):
         wigner,
         wigner_inv,
         node_offset: int = 0,
+        shared_geometry=None,
     ):
         x_res = x
         x = self.norm_1(x)
@@ -292,6 +293,7 @@ class eSEN_Block(torch.nn.Module):
             wigner,
             wigner_inv,
             node_offset,
+            **({"shared_geometry": shared_geometry} if shared_geometry is not None else {}),
         )
         x = x + x_res
 
